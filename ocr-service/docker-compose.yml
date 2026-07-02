@@ -1,0 +1,54 @@
+# ============================================================
+# Docker Compose — Banca OCR Service
+# ============================================================
+#
+# Usage:
+#   docker-compose up -d          # Start service
+#   docker-compose logs -f ocr    # View logs
+#   docker-compose down           # Stop service
+#
+# For GPU support, uncomment the deploy section below.
+# ============================================================
+
+services:
+  ocr:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: banca-ocr-service
+    ports:
+      - "8100:8100"
+    environment:
+      - HOST=0.0.0.0
+      - PORT=8100
+      - STORAGE_DIR=/app/storage
+      - OCR_ENGINE=paddle_vietocr
+      - PADDLE_USE_GPU=false
+      - PADDLE_LANG=vi
+      - VIETOCR_MODEL=vgg_transformer
+      - PDF_DPI=300
+      - OCR_CONFIDENCE_THRESHOLD=0.85
+      - CORS_ORIGINS=http://localhost:5173,http://localhost:3000
+      - LOG_LEVEL=INFO
+    volumes:
+      - ocr-storage:/app/storage
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8100/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s  # Models take time to load
+
+    # ── GPU Support (uncomment for NVIDIA GPU) ──
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+
+volumes:
+  ocr-storage:
+    driver: local
