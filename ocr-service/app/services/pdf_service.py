@@ -8,6 +8,8 @@ at high DPI for OCR processing.
 from __future__ import annotations
 
 import logging
+import platform
+import shutil
 from pathlib import Path
 
 from PIL import Image
@@ -18,13 +20,34 @@ from app.config import settings
 logger = logging.getLogger(__name__)
 
 
+def _configured_poppler_path() -> str:
+    """POPPLER_PATH from env — empty/whitespace means use system PATH."""
+    return (settings.poppler_path or "").strip()
+
+
 def _get_poppler_path() -> str | None:
-    """Get poppler path from configuration or auto-detect in project directory."""
-    if settings.poppler_path:
-        path = Path(settings.poppler_path)
+    """Get poppler path from configuration or auto-detect."""
+    configured = _configured_poppler_path()
+    if configured:
+        path = Path(configured)
         if path.exists():
             return str(path.resolve())
-            
+        logger.warning("POPPLER_PATH configured but not found: %s", path)
+
+    # Linux/macOS Colab/Docker: dùng poppler-utils trong PATH
+    if platform.system() != "Windows":
+        if shutil.which("pdftoppm"):
+            logger.info("Using system Poppler from PATH")
+            return None
+        for candidate in ("/usr/bin", "/usr/local/bin"):
+            if (Path(candidate) / "pdftoppm").exists():
+                logger.info("Using Poppler at %s", candidate)
+                return candidate
+        logger.error(
+            "Poppler not found. Install: apt-get install poppler-utils (Linux)"
+        )
+        return None
+
     project_root = Path(__file__).resolve().parents[2]
     bin_dir = project_root / "bin"
     
@@ -57,6 +80,32 @@ def _get_poppler_path() -> str | None:
             logger.debug("Failed to dynamically scan bin directory: %s", e)
             
     return None
+
+
+def _poppler_convert_kwargs() -> dict:
+    """pdf2image kwargs — omit poppler_path when using system PATH."""
+    poppler_path = _get_poppler_path()
+    if poppler_path:
+        return {"poppler_path": poppler_path}
+    return {}
+
+
+def check_poppler_available() -> tuple[bool, str]:
+    """Verify Poppler binaries are reachable (for health checks)."""
+    poppler_path = _get_poppler_path()
+    if poppler_path:
+        pdfinfo = Path(poppler_path) / (
+            "pdfinfo.exe" if platform.system() == "Windows" else "pdfinfo"
+        )
+        if pdfinfo.exists():
+            return True, str(poppler_path)
+        return False, f"POPPLER_PATH không có pdfinfo: {poppler_path}"
+
+    for tool in ("pdfinfo", "pdftoppm"):
+        found = shutil.which(tool)
+        if found:
+            return True, f"PATH:{found}"
+    return False, "poppler-utils chưa cài (apt-get install poppler-utils)"
 
 
 def convert_pdf_to_images(
@@ -98,9 +147,12 @@ def convert_pdf_to_images(
         "Converting PDF to images: %s (DPI: %d)", pdf_path.name, dpi
     )
 
-    poppler_path = _get_poppler_path()
-    if poppler_path:
-        logger.info("Using Poppler path: %s", poppler_path)
+    ok, poppler_info = check_poppler_available()
+    if not ok:
+        raise RuntimeError(
+            f"{poppler_info}. Linux/Colab: `apt-get install -y poppler-utils`"
+        )
+    logger.info("Using Poppler: %s", poppler_info)
 
     try:
         # Convert all pages
@@ -109,7 +161,7 @@ def convert_pdf_to_images(
             dpi=dpi,
             fmt="png",
             thread_count=2,
-            poppler_path=poppler_path,
+            **_poppler_convert_kwargs(),
         )
 
         image_paths: list[Path] = []
@@ -148,10 +200,8 @@ def get_page_count(pdf_path: str | Path) -> int:
     if not pdf_path.exists():
         raise FileNotFoundError(f"PDF file not found: {pdf_path}")
 
-    poppler_path = _get_poppler_path()
-
     try:
-        info = pdfinfo_from_path(str(pdf_path), poppler_path=poppler_path)
+        info = pdfinfo_from_path(str(pdf_path), **_poppler_convert_kwargs())
         return info.get("Pages", 0)
     except Exception as e:
         logger.warning("Could not get page count: %s", e)

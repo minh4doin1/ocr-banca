@@ -42,6 +42,13 @@ class Settings(BaseSettings):
     # --- CORS ---
     cors_origins: str = "http://localhost:5173,http://localhost:3000"
 
+    # --- Remote OCR worker (internal GPU server / Colab tunnel) ---
+    internal_gpu_url: str = ""
+    internal_gpu_token: str = ""
+    remote_worker_token: str = ""
+    remote_poll_interval_seconds: float = 1.5
+    remote_request_timeout_seconds: int = 120
+
     # --- Logging ---
     log_level: str = "INFO"
 

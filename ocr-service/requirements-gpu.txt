@@ -1,0 +1,19 @@
+# GPU runtime dependencies (Windows host: RTX 2070 / GTX 1060+)
+# Cài sau requirements.txt khi chạy máy host GPU:
+#   pip install -r requirements-gpu.txt
+#
+# cuDNN cho PaddlePaddle-GPU (CUDA 11.8)
+nvidia-cuda-runtime-cu11==11.8.89
+nvidia-cublas-cu11==11.11.3.6
+nvidia-cudnn-cu11==8.9.5.29
+
+# torch cho VietOCR — DÙNG BẢN CPU (không phải cu118!).
+# paddlepaddle-gpu và torch-cuda KHÔNG thể ở chung 1 process (xung đột
+# pybind "_gpuDeviceProperties" / lỗi DLL WinError 127). Vì vậy Paddle chạy
+# GPU, còn VietOCR chạy torch CPU. torch +cpu cần index riêng nên KHÔNG để ở
+# đây (sẽ lỗi khi pip -r). Cài riêng bằng lệnh (đã có trong setup_gpu_windows.ps1):
+#   pip install torch==2.4.1+cpu torchvision==0.19.1+cpu \
+#       --index-url https://download.pytorch.org/whl/cpu
+
+# setuptools <81 để giữ pkg_resources (gdown/vietocr cần)
+setuptools<81

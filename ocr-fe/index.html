@@ -3,221 +3,301 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Hệ thống OCR & Tạo lô User — Agribank Banca</title>
+    <title>OCR & Tạo lô User — Agribank Banca</title>
     <link rel="stylesheet" href="styles.css">
 </head>
 <body>
 
-    <!-- App Header -->
     <header class="app-header">
-        <div class="logo-section">
-            <div class="logo-icon">B</div>
-            <div class="logo-text">
+        <div class="header-brand">
+            <div class="brand-logo">
+                <svg viewBox="0 0 32 32" width="32" height="32" fill="none">
+                    <rect width="32" height="32" rx="6" fill="#fff"/>
+                    <path d="M8 22V10h4.2c2.8 0 4.6 1.4 4.6 3.6 0 1.5-.8 2.6-2.1 3.1 1.8.5 2.9 1.8 2.9 3.7 0 2.5-2 4.1-5.1 4.1H8zm2.2-7.8h2c1.3 0 2-.6 2-1.6s-.7-1.5-2-1.5h-2v3.1zm0 6.2h2.3c1.4 0 2.2-.7 2.2-1.8 0-1.1-.8-1.7-2.3-1.7h-2.2v3.5z" fill="#AE1C3F"/>
+                </svg>
+            </div>
+            <div class="brand-text">
                 <h1>AGRIBANK BANCASSURANCE</h1>
-                <p>Hệ thống Đọc và Kiểm soát OCR Danh sách User</p>
+                <p>Hệ thống OCR & Kiểm soát Danh sách User</p>
             </div>
         </div>
-        <div class="system-tag">Chi nhánh / Seller</div>
+        <div class="header-meta">
+            <span class="badge-env" id="device-badge">CPU</span>
+            <span class="badge-branch">Chi nhánh / Seller</span>
+        </div>
     </header>
 
-    <!-- Main App Container -->
-    <main class="app-container">
+    <main class="app-main">
 
-        <!-- Stepper Component -->
-        <section class="stepper">
-            <div class="step active" id="step-0-indicator">
-                <span class="step-num">1</span> Upload PDF
+        <!-- Stepper -->
+        <nav class="stepper" aria-label="Tiến trình">
+            <div class="step-item active" data-step="0">
+                <span class="step-dot">1</span>
+                <span class="step-label">Upload PDF</span>
             </div>
-            <div class="step" id="step-1-indicator">
-                <span class="step-num">2</span> Xử lý OCR
+            <div class="step-line"></div>
+            <div class="step-item" data-step="1">
+                <span class="step-dot">2</span>
+                <span class="step-label">Xử lý OCR</span>
             </div>
-            <div class="step" id="step-2-indicator">
-                <span class="step-num">3</span> Đối chiếu & Sửa
+            <div class="step-line"></div>
+            <div class="step-item" data-step="2">
+                <span class="step-dot">3</span>
+                <span class="step-label">Đối chiếu & Sửa</span>
             </div>
-            <div class="step" id="step-3-indicator">
-                <span class="step-num">4</span> Tạo lô thành công
+            <div class="step-line"></div>
+            <div class="step-item" data-step="3">
+                <span class="step-dot">4</span>
+                <span class="step-label">Hoàn tất</span>
+            </div>
+        </nav>
+
+        <!-- VIEW: Upload -->
+        <section class="view active" id="view-upload">
+            <div class="upload-layout">
+                <div class="card upload-panel">
+                    <input type="file" id="file-input" accept=".pdf" hidden>
+
+                    <div class="upload-file-row">
+                        <button type="button" class="btn btn-primary btn-sm" id="select-btn">Chọn PDF</button>
+                        <button type="button" class="btn btn-outline btn-sm" id="select-excel-btn">Nạp Excel</button>
+                        <span class="file-name" id="file-name-label">Chưa chọn file</span>
+                        <div class="drop-hint" id="drop-zone">Kéo thả PDF vào đây</div>
+                    </div>
+                    <input type="file" id="excel-input" accept=".xlsx,.xlsm" hidden>
+
+                    <div class="upload-settings">
+                        <div class="option-group">
+                            <span class="option-label">Chế độ OCR</span>
+                            <div class="radio-group mode-grid">
+                                <label class="radio-chip">
+                                    <input type="radio" name="processing-mode" value="local" checked>
+                                    <span>Local CPU/GPU</span>
+                                </label>
+                                <label class="radio-chip" id="chip-internal-gpu">
+                                    <input type="radio" name="processing-mode" value="remote-internal">
+                                    <span>GPU nội bộ</span>
+                                </label>
+                                <label class="radio-chip">
+                                    <input type="radio" name="processing-mode" value="remote-colab">
+                                    <span>Google Colab</span>
+                                </label>
+                                <label class="radio-chip">
+                                    <input type="radio" name="processing-mode" value="auto">
+                                    <span>Auto</span>
+                                </label>
+                                <label class="radio-chip">
+                                    <input type="radio" name="processing-mode" value="api">
+                                    <span>API Cloud</span>
+                                </label>
+                            </div>
+                        </div>
+
+                        <div class="option-group" id="device-selector">
+                            <span class="option-label">Thiết bị (chỉ Local)</span>
+                            <div class="radio-group">
+                                <label class="radio-chip">
+                                    <input type="radio" name="use-gpu" value="false" checked>
+                                    <span>CPU (ổn định)</span>
+                                </label>
+                                <label class="radio-chip">
+                                    <input type="radio" name="use-gpu" value="true">
+                                    <span>GPU máy này</span>
+                                </label>
+                            </div>
+                        </div>
+
+                        <div class="option-group hidden" id="internal-gpu-info">
+                            <span class="option-label">Server GPU nội bộ</span>
+                            <div class="info-box" id="internal-gpu-label">Chưa cấu hình INTERNAL_GPU_URL</div>
+                            <button type="button" class="btn btn-sm btn-outline" id="btn-test-internal">Kiểm tra kết nối</button>
+                            <div class="health-result hidden" id="internal-health-result"></div>
+                        </div>
+
+                        <div class="option-group hidden" id="colab-selector">
+                            <span class="option-label">Google Colab Worker</span>
+                            <input type="url" id="colab-url" class="text-input" placeholder="https://xxxx.trycloudflare.com">
+                            <input type="password" id="colab-token" class="text-input" placeholder="Token worker (nếu có)">
+                            <button type="button" class="btn btn-sm btn-outline" id="btn-test-colab">Kiểm tra Colab</button>
+                            <div class="health-result hidden" id="colab-health-result"></div>
+                            <p class="hint-text">Chạy notebook <code>colab/OcrWorker.ipynb</code> trên Colab, copy URL tunnel vào đây.</p>
+                        </div>
+
+                        <div class="option-group hidden" id="provider-selector">
+                            <span class="option-label">Nhà cung cấp API</span>
+                            <select id="api-provider" class="select-input">
+                                <option value="ocrspace">OCR.space</option>
+                            </select>
+                        </div>
+                    </div>
+                </div>
+
+                <aside class="card guide-panel">
+                    <h3>Hướng dẫn sử dụng</h3>
+                    <ul class="guide-steps">
+                        <li>
+                            <strong>Upload PDF</strong>
+                            <span>Tải lên bảng danh sách user cần cấp quyền. Hỗ trợ bản scan.</span>
+                        </li>
+                        <li>
+                            <strong>GPU tập trung</strong>
+                            <span>Chọn GPU nội bộ hoặc Colab — máy yếu vẫn nhanh như nhau vì OCR chạy trên worker GPU.</span>
+                        </li>
+                        <li>
+                            <strong>Đối chiếu & sửa</strong>
+                            <span>Ô vàng = AI không chắc chắn. Ô đỏ = sai định dạng. Click để kiểm tra ảnh gốc.</span>
+                        </li>
+                        <li>
+                            <strong>Xuất & đồng bộ</strong>
+                            <span>Xuất Excel hoặc xác nhận tạo lô user sang Banca Core.</span>
+                        </li>
+                    </ul>
+                </aside>
             </div>
         </section>
 
-        <!-- View 0: Upload & Welcome -->
-        <div class="view-panel" id="view-upload">
-            <div class="upload-grid">
-                <!-- Dropzone -->
-                <div class="upload-card" id="drop-zone">
-                    <input type="file" id="file-input" class="hidden" accept=".pdf">
-                    <div class="upload-icon-container">
-                        <svg class="svg-icon" viewBox="0 0 24 24" style="width: 40px; height: 40px;">
-                            <path d="M14 2H6c-1.1 0-1.99.9-1.99 2L4 20c0 1.1.89 2 1.99 2H18c1.1 0 2-.9 2-2V8l-6-6zm2 16H8v-2h8v2zm0-4H8v-2h8v2zm-3-5V3.5L18.5 9H13z"/>
-                        </svg>
-                    </div>
-                    <h2>Kéo thả file PDF danh sách nhân viên vào đây</h2>
-                    <p>Hoặc click để chọn file từ máy tính (Tối đa 50MB)</p>
-                    <div class="mode-selector" id="mode-selector">
-                        <span class="mode-label">Chế độ OCR:</span>
-                        <label class="mode-option">
-                            <input type="radio" name="processing-mode" value="local" checked>
-                            <span>Local (GPU máy nội bộ)</span>
-                        </label>
-                        <label class="mode-option">
-                            <input type="radio" name="processing-mode" value="api">
-                            <span>API (dịch vụ cloud)</span>
-                        </label>
-                    </div>
-                    <div class="provider-selector hidden" id="provider-selector">
-                        <label for="api-provider">Nhà cung cấp API:</label>
-                        <select id="api-provider">
-                            <option value="ocrspace">OCR.space</option>
-                        </select>
-                    </div>
-                    <button class="btn" id="select-btn">Chọn File PDF</button>
-                </div>
-
-                <!-- Guidelines -->
-                <div class="guide-card">
-                    <h3>Hướng dẫn đối chiếu OCR cho Kiểm soát viên</h3>
-                    <div class="guide-list">
-                        <div class="guide-step-item">
-                            <span class="guide-num">1</span>
-                            <div class="guide-content">
-                                <h4>Tải file danh sách chi nhánh</h4>
-                                <p>Tải lên PDF chứa bảng danh sách user cần cấp quyền tạo đơn. Hỗ trợ cả bản in scan.</p>
-                            </div>
-                        </div>
-                        <div class="guide-step-item">
-                            <span class="guide-num">2</span>
-                            <div class="guide-content">
-                                <h4>Đối chiếu trực quan cận cảnh</h4>
-                                <p>Hệ thống tự động phát hiện cột và dòng. Các ô màu vàng (AI không chắc chắn) hoặc đỏ (sai định dạng) cần được click kiểm tra.</p>
-                            </div>
-                        </div>
-                        <div class="guide-step-item">
-                            <span class="guide-num">3</span>
-                            <div class="guide-content">
-                                <h4>Duyệt và đồng bộ</h4>
-                                <p>Nhấn "Xuất Excel" để lưu trữ bản đối chiếu, hoặc click "Xác nhận & Tạo lô" để đẩy thông tin đồng bộ sang Banca Core.</p>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-            </div>
-        </div>
-
-        <!-- View 1: Processing Loader -->
-        <div class="view-panel hidden" id="view-processing">
-            <div class="loading-card">
-                <div class="spinner"></div>
-                <h2>Hệ thống đang quét và xử lý cấu trúc tài liệu...</h2>
-                <p>Quá trình này chạy OCR nhận dạng tiếng Việt nâng cao và tái dựng cấu trúc bảng. Vui lòng đợi trong giây lát.</p>
-                <div class="progress-container">
-                    <div class="progress-bar" id="progress-bar-fill"></div>
-                </div>
-                <div style="font-size: 14px; color: var(--primary-color); font-weight: 500;" id="progress-status-text">
-                    Đang chuẩn bị phân tích trang...
-                </div>
-            </div>
-        </div>
-
-        <!-- View 2: Split Review Workspace -->
-        <div class="view-panel hidden" id="view-workspace">
-            <div class="workspace-split">
-                <!-- Left Pane: PDF page image viewer -->
-                <div class="pane">
-                    <div class="pane-header">
-                        <span class="pane-title" id="pdf-pane-title">Tài liệu gốc (Trang 1/1)</span>
-                        <div style="display: flex; gap: 8px;">
-                            <button class="btn btn-secondary" id="btn-prev-page" style="padding: 6px 12px; font-size: 12px;">
-                                Trang trước
-                            </button>
-                            <button class="btn btn-secondary" id="btn-next-page" style="padding: 6px 12px; font-size: 12px;">
-                                Trang sau
-                            </button>
-                        </div>
-                    </div>
-                    <div class="pane-content pdf-viewer">
-                        <div class="pdf-image-wrapper" id="pdf-image-wrapper">
-                            <!-- Converted image will be loaded here -->
-                            <img src="" id="pdf-page-image" class="pdf-page-img" alt="PDF Page">
-                            <!-- Bounding box overlays will be dynamically inserted here -->
-                            <div id="bbox-container"></div>
-                        </div>
-                    </div>
-                </div>
-
-                <!-- Right Pane: Table data editor -->
-                <div class="pane">
-                    <div class="pane-header">
-                        <span class="pane-title">Bảng đối chiếu & Hiệu chỉnh dữ liệu</span>
-                        <div style="display: flex; gap: 8px;">
-                            <button class="btn btn-secondary" id="btn-export-excel" style="padding: 6px 12px; font-size: 12px;">
-                                Xuất File Excel
-                            </button>
-                            <button class="btn btn-danger" id="btn-restart" style="padding: 6px 12px; font-size: 12px;">
-                                Làm lại
-                            </button>
-                        </div>
-                    </div>
-                    <div class="pane-content table-viewer">
-                        <!-- Validation warning summary -->
-                        <div class="workspace-alerts" id="alerts-summary">
-                            <div class="alert-bar">
-                                <svg class="svg-icon" viewBox="0 0 24 24" style="color: var(--warning-color); width: 18px; height: 18px;">
-                                    <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z"/>
-                                </svg>
-                                <span id="alert-summary-text">Phát hiện 0 lỗi dữ liệu. Vui lòng kiểm tra lại.</span>
-                            </div>
-                        </div>
-
-                        <!-- Dynamic Excel-like table scrollable zone -->
-                        <div class="table-scroller" id="table-scroller-zone">
-                            <!-- Tables will be dynamically rendered here -->
-                        </div>
-                    </div>
-                    
-                    <!-- Footer Actions -->
-                    <div class="pane-footer">
-                        <div class="tips-bar">
-                            <span class="tips-tag">Mẹo thao tác:</span>
-                            <span class="tips-text">Dùng phím mũi tên hoặc nhấn Enter/Tab để sửa các ô cực nhanh.</span>
-                        </div>
+        <!-- VIEW: Processing -->
+        <section class="view" id="view-processing">
+            <div class="processing-layout">
+                <div class="card processing-main">
+                    <div class="processing-header">
+                        <div class="spinner"></div>
                         <div>
-                            <button class="btn btn-success" id="btn-confirm-batch">
-                                Xác nhận & Tạo lô User
-                            </button>
+                            <h2 id="processing-title">Đang xử lý tài liệu...</h2>
+                            <p class="text-muted" id="processing-subtitle">Khởi tạo OCR engine</p>
+                        </div>
+                    </div>
+                    <div class="progress-track">
+                        <div class="progress-fill" id="progress-fill"></div>
+                    </div>
+                    <div class="progress-meta">
+                        <span id="progress-text">0%</span>
+                        <span id="progress-pages">0 / 0 trang</span>
+                    </div>
+
+                    <div class="page-grid" id="page-status-grid"></div>
+
+                    <div class="processing-actions">
+                        <button class="btn btn-outline hidden" id="btn-go-review-early">
+                            Vào đối chiếu ngay (trang đã sẵn sàng)
+                        </button>
+                    </div>
+                </div>
+
+                <div class="card log-panel">
+                    <div class="log-header">
+                        <h3>Nhật ký xử lý</h3>
+                        <span class="log-live-dot"></span>
+                    </div>
+                    <div class="log-console" id="log-console"></div>
+                </div>
+            </div>
+        </section>
+
+        <!-- VIEW: Workspace -->
+        <section class="view" id="view-workspace">
+            <div class="processing-banner hidden" id="processing-banner">
+                <div class="banner-spinner"></div>
+                <span id="banner-text">Đang OCR trang 2/5 — bạn có thể sửa các trang đã hoàn tất</span>
+            </div>
+
+            <div class="workspace-layout">
+                <!-- Page sidebar -->
+                <aside class="page-sidebar card">
+                    <div class="sidebar-header">
+                        <h3>Danh sách trang</h3>
+                        <span class="sidebar-count" id="sidebar-count">0/0</span>
+                    </div>
+                    <ul class="page-list" id="page-list"></ul>
+                </aside>
+
+                <!-- Split panes -->
+                <div class="workspace-split" id="workspace-split">
+                    <div class="pane-wrapper pane-pdf-wrapper" id="pane-pdf-wrapper">
+                        <div class="pane card" id="pane-pdf">
+                            <div class="pane-toolbar">
+                                <span id="pdf-pane-title">Tài liệu gốc</span>
+                                <div class="toolbar-actions">
+                                    <button class="btn btn-sm btn-outline" id="btn-prev-page" type="button">← Trước</button>
+                                    <button class="btn btn-sm btn-outline" id="btn-next-page" type="button">Sau →</button>
+                                    <button class="btn btn-sm btn-ghost" id="btn-toggle-pdf" type="button" title="Ẩn ảnh gốc để mở rộng bảng">Ẩn ảnh</button>
+                                </div>
+                            </div>
+                            <div class="pane-body pdf-body">
+                                <div class="page-pending-overlay hidden" id="page-pending-overlay">
+                                    <div class="overlay-spinner"></div>
+                                    <p>Trang này đang được OCR...</p>
+                                </div>
+                                <div class="pdf-image-wrapper" id="pdf-image-wrapper">
+                                    <img id="pdf-page-image" class="pdf-page-img" alt="PDF Page">
+                                    <div id="bbox-container"></div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="split-resizer" id="split-resizer" role="separator"
+                         aria-orientation="vertical" aria-label="Kéo để đổi kích thước" tabindex="0"></div>
+
+                    <div class="pane-wrapper pane-table-wrapper" id="pane-table-wrapper">
+                        <div class="pane card" id="pane-table">
+                            <div class="pane-toolbar">
+                                <span>Bảng đối chiếu</span>
+                                <div class="toolbar-actions">
+                                    <button class="btn btn-sm btn-outline hidden" id="btn-show-pdf" type="button">Hiện ảnh gốc</button>
+                                    <button class="btn btn-sm btn-outline" id="btn-import-excel" type="button">Nạp Excel đã chỉnh</button>
+                                    <button class="btn btn-sm btn-outline" id="btn-export-excel" type="button">Xuất Excel</button>
+                                    <button class="btn btn-sm btn-ghost" id="btn-restart" type="button">Làm lại</button>
+                                </div>
+                            </div>
+                            <div class="pane-body pane-body-table">
+                                <div class="alert-bar hidden" id="alerts-summary">
+                                    <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor">
+                                        <path d="M1 21h22L12 2 1 21zm12-3h-2v-2h2v2zm0-4h-2v-4h2v4z"/>
+                                    </svg>
+                                    <span id="alert-summary-text"></span>
+                                </div>
+                                <div class="table-scroller" id="table-scroller-zone"></div>
+                            </div>
+                            <div class="pane-footer">
+                                <span class="tip-text">Mẹo: Kéo thanh giữa hai cửa sổ để resize · Tab/↑↓ để di chuyển giữa các ô</span>
+                                <button class="btn btn-primary" id="btn-confirm-batch" type="button">Xác nhận & Tạo lô User</button>
+                            </div>
                         </div>
                     </div>
                 </div>
             </div>
-        </div>
+        </section>
 
-        <!-- View 3: Completed Batch Success Screen -->
-        <div class="view-panel hidden" id="view-success">
-            <div class="success-card">
+        <!-- VIEW: Success -->
+        <section class="view" id="view-success">
+            <div class="card success-card">
                 <div class="success-icon">✓</div>
                 <h2>Gửi thông tin tạo lô User thành công!</h2>
-                <p>Danh sách thông tin nhân sự đã được kiểm soát OCR đối chiếu, và gửi trực tiếp sang Banca Core để phê duyệt cấp quyền.</p>
+                <p class="text-muted">Danh sách đã được kiểm soát OCR và gửi sang Banca Core để phê duyệt.</p>
                 <div class="success-details">
-                    <div class="success-row">
-                        <span class="label">Mã số lô tạo:</span>
-                        <span class="value font-mono" id="success-batch-code">BATCH-8A7B6C</span>
+                    <div class="detail-row">
+                        <span>Mã lô</span>
+                        <strong class="mono" id="success-batch-code">—</strong>
                     </div>
-                    <div class="success-row">
-                        <span class="label">Tổng số cán bộ:</span>
-                        <span class="value" id="success-total-records">12 nhân sự</span>
+                    <div class="detail-row">
+                        <span>Tổng cán bộ</span>
+                        <strong id="success-total-records">—</strong>
                     </div>
-                    <div class="success-row">
-                        <span class="label">Hình thức duyệt:</span>
-                        <span class="value text-orange">Chờ TSC phê duyệt lô</span>
+                    <div class="detail-row">
+                        <span>Trạng thái</span>
+                        <strong class="text-warn">Chờ TSC phê duyệt</strong>
                     </div>
                 </div>
-                <div style="display: flex; gap: 12px; justify-content: center;">
-                    <button class="btn" id="btn-success-new">Tải file PDF khác</button>
-                    <button class="btn btn-secondary" id="btn-success-home">Quay lại trang chủ</button>
+                <div class="success-actions">
+                    <button class="btn btn-primary" id="btn-success-new">Tải PDF khác</button>
+                    <button class="btn btn-outline" id="btn-success-home">Quay lại</button>
                 </div>
             </div>
-        </div>
+        </section>
 
     </main>
 
-    <script src="app.js"></script>
+    <script src="app.js?v=7"></script>
 </body>
 </html>

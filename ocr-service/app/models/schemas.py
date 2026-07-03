@@ -17,12 +17,73 @@ class JobStatus(str, enum.Enum):
     FAILED = "failed"
 
 
+class PageStatus(str, enum.Enum):
+    """Per-page OCR processing status."""
+
+    PENDING = "pending"
+    PROCESSING = "processing"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+class LogLevel(str, enum.Enum):
+    """Job log entry severity."""
+
+    INFO = "info"
+    WARNING = "warning"
+    ERROR = "error"
+    SUCCESS = "success"
+
+
+class JobLogEntry(BaseModel):
+    """Single log line streamed to the client during processing."""
+
+    timestamp: datetime = Field(default_factory=datetime.now)
+    level: LogLevel = LogLevel.INFO
+    message: str
+
+
+class PageStatusInfo(BaseModel):
+    """Status of a single PDF page within a job."""
+
+    page_number: int
+    status: PageStatus = PageStatus.PENDING
+    error_message: str = ""
+
+
 class ProcessingMode(str, enum.Enum):
     """OCR processing mode chosen at upload time."""
 
     LOCAL = "local"
+    REMOTE = "remote"
     API = "api"
     AUTO = "auto"
+
+
+class RemoteProvider(str, enum.Enum):
+    """Remote OCR worker provider."""
+
+    INTERNAL = "internal"
+    COLAB = "colab"
+    CUSTOM = "custom"
+
+
+class OcrRuntimeConfig(BaseModel):
+    """Runtime options exposed to the frontend."""
+
+    internal_gpu_configured: bool = False
+    internal_gpu_label: str = ""
+    worker_token_required: bool = False
+    local_gpu_available: bool = False
+    local_gpu_name: str = ""
+    local_gpu_detail: str = ""
+    paddle_use_gpu: bool = False
+    processing_modes: list[str] = Field(
+        default_factory=lambda: ["local", "remote", "auto", "api"]
+    )
+    remote_providers: list[str] = Field(
+        default_factory=lambda: ["internal", "colab", "custom"]
+    )
 
 
 class CellData(BaseModel):
@@ -68,6 +129,7 @@ class OcrResult(BaseModel):
     filename: str
     total_pages: int = 0
     pages: list[PageResult] = Field(default_factory=list)
+    is_complete: bool = True
     created_at: datetime = Field(default_factory=datetime.now)
     updated_at: datetime = Field(default_factory=datetime.now)
 
@@ -79,9 +141,15 @@ class JobInfo(BaseModel):
     filename: str
     processing_mode: ProcessingMode = ProcessingMode.LOCAL
     api_provider: str = ""
+    use_gpu: bool = False
+    remote_provider: RemoteProvider | None = None
+    remote_url: str = ""
+    remote_job_id: str = ""
     status: JobStatus
     total_pages: int = 0
     progress: int = Field(0, description="Number of pages processed")
+    page_statuses: list[PageStatusInfo] = Field(default_factory=list)
+    logs: list[JobLogEntry] = Field(default_factory=list)
     error_message: str = ""
     created_at: datetime = Field(default_factory=datetime.now)
     updated_at: datetime = Field(default_factory=datetime.now)
@@ -94,7 +162,20 @@ class UploadResponse(BaseModel):
     filename: str
     processing_mode: ProcessingMode = ProcessingMode.LOCAL
     api_provider: str = ""
+    use_gpu: bool = False
+    remote_provider: RemoteProvider | None = None
+    remote_url: str = ""
     message: str = "PDF uploaded successfully. Processing started."
+
+
+class RemoteWorkerHealth(BaseModel):
+    """Health check result for a remote OCR worker."""
+
+    url: str
+    reachable: bool
+    status: str = ""
+    detail: str = ""
+    use_gpu: bool | None = None
 
 
 class UpdateCellRequest(BaseModel):

@@ -57,6 +57,26 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8100
 docker-compose up -d
 ```
 
+## Triển khai GPU nội bộ (RTX 2070) cho cả team
+
+Xem hướng dẫn chi tiết:
+
+- `DEPLOY_INTERNAL_GPU.md`
+
+Script 1 lệnh:
+
+- Host GPU:
+  - `scripts/bootstrap_host_2070.ps1`
+  - One-link Tailscale: thêm `-EnableTailscaleServe` (hoặc `-EnableTailscaleFunnel`)
+- Client trỏ về host:
+  - `scripts/bootstrap_client_remote.ps1`
+
+Script vận hành host:
+
+- `scripts/run_host_service.ps1`
+- `scripts/publish_tailscale_link.ps1`
+- `scripts/install_host_autostart.ps1`
+
 ## API Endpoints
 
 | Method | Endpoint | Mô tả |

@@ -1,21 +1,19 @@
 """
-Excel Service — Export OCR results to Excel files.
-
-Creates well-formatted Excel workbooks from OCR table data,
-with separate sheets per page and highlighting for low-confidence cells.
+Excel Service — Export/import OCR results as Excel files.
 """
 
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 from pathlib import Path
 
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
 from app.config import settings
-from app.models.schemas import OcrResult
+from app.models.schemas import CellData, OcrResult, PageResult, TableData
 
 logger = logging.getLogger(__name__)
 
@@ -132,6 +130,148 @@ def export_to_excel(result: OcrResult) -> Path:
     logger.info("Excel exported: %s", export_file)
 
     return export_file
+
+
+def import_from_excel(
+    excel_path: str | Path,
+    job_id: str,
+    filename: str,
+) -> OcrResult:
+    """
+    Import data from Excel into OcrResult structure.
+
+    Supported formats:
+    - Any sheet with a plain rectangular table (non-empty used range)
+    - Exported OCR workbook format where each table starts with:
+      "Bảng X — ...", followed by the table grid, with blank rows between tables
+    """
+    excel_path = Path(excel_path)
+    wb = load_workbook(filename=str(excel_path), data_only=True)
+    pages: list[PageResult] = []
+
+    page_number = 1
+    for ws in wb.worksheets:
+        if ws.title.strip().lower() == "chú thích":
+            continue
+
+        tables = _extract_tables_from_sheet(ws)
+        if not tables:
+            continue
+
+        pages.append(
+            PageResult(
+                page_number=page_number,
+                image_path="",
+                tables=tables,
+                raw_text="",
+            )
+        )
+        page_number += 1
+
+    if not pages:
+        raise ValueError("Không tìm thấy dữ liệu bảng trong file Excel")
+
+    now = datetime.now()
+    return OcrResult(
+        job_id=job_id,
+        filename=filename,
+        total_pages=len(pages),
+        pages=pages,
+        is_complete=True,
+        created_at=now,
+        updated_at=now,
+    )
+
+
+def _extract_tables_from_sheet(ws) -> list[TableData]:
+    """Extract one or many tables from a worksheet."""
+    title_rows = _find_table_title_rows(ws)
+    tables: list[TableData] = []
+
+    if title_rows:
+        for idx, title_row in enumerate(title_rows):
+            start_row = title_row + 1
+            end_row = (
+                title_rows[idx + 1] - 2
+                if idx + 1 < len(title_rows)
+                else ws.max_row
+            )
+            matrix = _read_matrix(ws, start_row, end_row)
+            if not matrix:
+                continue
+            tables.append(_matrix_to_table(matrix, len(tables)))
+        return tables
+
+    # Fallback: parse whole used range as one table
+    matrix = _read_matrix(ws, 1, ws.max_row)
+    if matrix:
+        tables.append(_matrix_to_table(matrix, 0))
+    return tables
+
+
+def _find_table_title_rows(ws) -> list[int]:
+    """Find rows that look like exported table titles: 'Bảng X — ...'."""
+    import re
+
+    rows: list[int] = []
+    for r in range(1, ws.max_row + 1):
+        v = ws.cell(row=r, column=1).value
+        if isinstance(v, str) and re.match(r"^\s*Bảng\s+\d+", v.strip(), re.IGNORECASE):
+            rows.append(r)
+    return rows
+
+
+def _read_matrix(ws, start_row: int, end_row: int) -> list[list[str]]:
+    """Read non-empty rectangular matrix from row range."""
+    rows: list[list[str]] = []
+    max_col = 0
+
+    for r in range(start_row, end_row + 1):
+        vals: list[str] = []
+        row_non_empty = False
+        for c in range(1, ws.max_column + 1):
+            v = ws.cell(row=r, column=c).value
+            txt = "" if v is None else str(v).strip()
+            vals.append(txt)
+            if txt:
+                row_non_empty = True
+                max_col = max(max_col, c)
+        if row_non_empty:
+            rows.append(vals)
+
+    if not rows or max_col == 0:
+        return []
+
+    matrix = [r[:max_col] for r in rows]
+    return matrix
+
+
+def _matrix_to_table(matrix: list[list[str]], table_index: int) -> TableData:
+    """Convert 2D string matrix to TableData."""
+    num_rows = len(matrix)
+    num_cols = max((len(r) for r in matrix), default=0)
+    cells: list[CellData] = []
+
+    for r, row_vals in enumerate(matrix):
+        padded = row_vals + [""] * (num_cols - len(row_vals))
+        for c, txt in enumerate(padded):
+            cells.append(
+                CellData(
+                    row=r,
+                    col=c,
+                    text=txt,
+                    confidence=1.0,
+                    bbox=[],
+                )
+            )
+
+    return TableData(
+        table_index=table_index,
+        num_rows=num_rows,
+        num_cols=num_cols,
+        cells=cells,
+        html="",
+    )
 
 
 def _auto_adjust_column_widths(ws) -> None:

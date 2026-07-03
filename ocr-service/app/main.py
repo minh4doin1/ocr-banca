@@ -14,6 +14,8 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
 from app.routers.ocr import router as ocr_router
+from app.services.gpu_runtime import probe_gpu_runtime
+from app.services.pdf_service import check_poppler_available
 
 # ──────────────────────────────────────────────────────────────
 # Logging
@@ -67,12 +69,25 @@ app.include_router(ocr_router)
 @app.get("/health", tags=["Health"])
 async def health_check():
     """Detailed health check."""
+    poppler_ok, poppler_info = check_poppler_available()
+    gpu_status = probe_gpu_runtime()
+    healthy = poppler_ok and (
+        not settings.paddle_use_gpu or gpu_status.paddle_gpu_ok
+    )
     return {
-        "status": "healthy",
+        "status": "healthy" if healthy else "degraded",
+        "poppler_ok": poppler_ok,
+        "poppler": poppler_info,
+        "gpu": gpu_status.to_dict(),
         "engine": settings.ocr_engine,
         "vietocr_model": settings.vietocr_model,
         "pdf_dpi": settings.pdf_dpi,
         "confidence_threshold": settings.ocr_confidence_threshold,
+        "gpu_enabled": settings.paddle_use_gpu,
+        "gpu_available": gpu_status.paddle_gpu_ok,
+        "internal_gpu_configured": bool(settings.internal_gpu_url.strip()),
+        "worker_token_required": bool(settings.remote_worker_token.strip()),
+        "role": "worker" if settings.paddle_use_gpu else "client-or-cpu",
     }
 
 
@@ -97,6 +112,11 @@ async def startup_event():
     logger.info("Banca OCR Service starting up")
     logger.info("Engine: %s", settings.ocr_engine)
     logger.info("GPU: %s", settings.paddle_use_gpu)
+    gpu = probe_gpu_runtime()
+    if gpu.nvidia_detected:
+        logger.info("GPU card: %s | Paddle GPU OK: %s", gpu.gpu_name, gpu.paddle_gpu_ok)
+        if settings.paddle_use_gpu and not gpu.paddle_gpu_ok:
+            logger.warning("PADDLE_USE_GPU=true nhưng GPU chưa sẵn sàng: %s", gpu.detail)
     logger.info("DPI: %d", settings.pdf_dpi)
     logger.info("Storage: %s", settings.storage_path)
     logger.info("CORS: %s", settings.cors_origins_list)
