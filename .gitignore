@@ -20,3 +20,9 @@ dist/
 Thumbs.db
 .idea/
 .vscode/
+
+# Virtual environments
+venv/
+venv-*/
+**/venv*/
+ocr-service/venv-vietocr-gpu/

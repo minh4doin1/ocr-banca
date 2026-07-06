@@ -120,11 +120,11 @@ def resolve_remote_target(
         (url, token)
     """
     if provider == RemoteProvider.INTERNAL:
-        url = remote_url or settings.internal_gpu_url
-        token = settings.internal_gpu_token
+        url = remote_url.strip() or settings.resolve_internal_gpu_url()
+        token = settings.internal_gpu_token or settings.remote_worker_token
         if not url:
             raise ValueError(
-                "Chưa cấu hình INTERNAL_GPU_URL trong .env cho worker GPU nội bộ"
+                "Chưa cấu hình worker GPU nội bộ (INTERNAL_GPU_URL hoặc PADDLE_USE_GPU=true)"
             )
         return _normalize_url(url), token
 
@@ -137,10 +137,14 @@ def resolve_remote_target(
 def check_worker_health(
     url: str,
     token: str = "",
-    timeout: int = 10,
+    timeout: int = 30,
 ) -> RemoteWorkerHealth:
     """Ping remote worker /health endpoint."""
     url = _normalize_url(url)
+
+    if settings.is_local_worker_url(url):
+        return check_local_worker_health(url)
+
     try:
         res = requests.get(
             f"{url}/health",
@@ -184,6 +188,36 @@ def check_worker_health(
             status="offline",
             detail=str(exc),
         )
+
+
+def check_local_worker_health(url: str = "") -> RemoteWorkerHealth:
+    """Fast health for worker URL pointing at this same host (no HTTP loopback)."""
+    from app.services.gpu_runtime import probe_gpu_runtime
+
+    worker_url = _normalize_url(url) if url else settings.resolve_internal_gpu_url()
+    gpu = probe_gpu_runtime()
+    healthy = gpu.paddle_gpu_ok or not settings.paddle_use_gpu
+    return RemoteWorkerHealth(
+        url=worker_url,
+        reachable=True,
+        status="healthy" if healthy else "degraded",
+        detail=gpu.detail or "OK",
+        use_gpu=gpu.paddle_gpu_ok,
+    )
+
+
+def should_run_local_gpu_job(
+    remote_provider: RemoteProvider | None,
+    remote_url: str = "",
+) -> bool:
+    """True when remote-internal resolves to this machine — run GPU in-process."""
+    if remote_provider != RemoteProvider.INTERNAL:
+        return False
+    try:
+        worker_url, _ = resolve_remote_target(remote_provider, remote_url)
+    except ValueError:
+        return False
+    return settings.is_local_worker_url(worker_url)
 
 
 def upload_pdf_to_remote(

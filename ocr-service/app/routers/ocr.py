@@ -5,9 +5,9 @@ OCR Router — API endpoints for PDF upload, OCR processing, review, and export.
 from __future__ import annotations
 
 import logging
+import threading
 import uuid
 from pathlib import Path
-from threading import Thread
 
 import aiofiles
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Query
@@ -28,6 +28,7 @@ from app.models.schemas import (
     UploadResponse,
 )
 from app.services.excel_service import export_to_excel, import_from_excel
+from app.services.job_queue import OcrJobTask, QueueFullError, start_job_queue
 from app.services.remote_ocr_service import (
     check_worker_health,
     resolve_remote_target,
@@ -43,6 +44,7 @@ from app.services.table_service import (
     process_remote_job,
     set_job_remote_token,
     set_result,
+    update_job_queue_position,
     update_result,
 )
 
@@ -57,6 +59,47 @@ router = APIRouter(
 ALLOWED_EXTENSIONS = {".pdf"}
 ALLOWED_EXCEL_EXTENSIONS = {".xlsx", ".xlsm"}
 MAX_FILE_SIZE = 50 * 1024 * 1024
+_queue_started = False
+
+
+def init_ocr_worker() -> None:
+    """Start bounded OCR job queue (call once at app startup)."""
+    global _queue_started
+    if not _queue_started:
+        start_job_queue(_run_ocr_task)
+        _queue_started = True
+
+
+def _ensure_queue():
+    init_ocr_worker()
+    from app.services.job_queue import get_job_queue
+
+    return get_job_queue()
+
+
+def _run_ocr_task(task: OcrJobTask) -> None:
+    job = get_job(task.job_id)
+    if job:
+        job.status = JobStatus.PROCESSING
+        update_job_queue_position(task.job_id, 0)
+    _run_ocr_job(
+        task.job_id,
+        task.pdf_path,
+        task.processing_mode,
+        task.api_provider,
+        task.use_gpu,
+        task.remote_provider,
+        task.remote_url,
+        task.remote_token,
+    )
+
+
+@router.get("/queue", summary="Trạng thái hàng đợi OCR")
+async def get_queue_status():
+    init_ocr_worker()
+    from app.services.job_queue import get_job_queue
+
+    return get_job_queue().stats()
 
 
 @router.get(
@@ -68,12 +111,15 @@ async def get_runtime_config():
     """Expose non-secret runtime options for the frontend."""
     from app.services.gpu_runtime import probe_gpu_runtime
 
-    internal_url = settings.internal_gpu_url.strip()
+    gpu = probe_gpu_runtime()
+    internal_url = settings.resolve_internal_gpu_url(local_gpu_ok=gpu.paddle_gpu_ok)
     label = ""
     if internal_url:
-        label = internal_url.replace("http://", "").replace("https://", "")[:48]
+        if internal_url.startswith(("http://127.0.0.1", "http://localhost")):
+            label = gpu.gpu_name or "GPU máy chủ"
+        else:
+            label = internal_url.replace("http://", "").replace("https://", "")[:48]
 
-    gpu = probe_gpu_runtime()
     return OcrRuntimeConfig(
         internal_gpu_configured=bool(internal_url),
         internal_gpu_label=label,
@@ -209,21 +255,27 @@ async def upload_pdf(
     if mode == ProcessingMode.REMOTE:
         set_job_remote_token(job_id, remote_token)
 
-    thread = Thread(
-        target=_run_ocr_job,
-        args=(
-            job_id,
-            pdf_path,
-            mode,
-            api_provider,
-            use_gpu_flag,
-            remote_provider_enum,
-            remote_url,
-            remote_token,
-        ),
-        daemon=True,
+    task = OcrJobTask(
+        job_id=job_id,
+        pdf_path=pdf_path,
+        processing_mode=mode,
+        api_provider=api_provider,
+        use_gpu=use_gpu_flag,
+        remote_provider=remote_provider_enum,
+        remote_url=remote_url,
+        remote_token=remote_token,
     )
-    thread.start()
+    try:
+        queue_position = _ensure_queue().submit(task)
+    except QueueFullError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    msg = "PDF đã upload thành công. Đang xử lý OCR..."
+    if queue_position > 1:
+        msg = (
+            f"PDF đã upload. Đang xếp hàng (vị trí {queue_position}) — "
+            "GPU xử lý tuần tự, vui lòng chờ."
+        )
 
     return UploadResponse(
         job_id=job_id,
@@ -233,7 +285,8 @@ async def upload_pdf(
         use_gpu=use_gpu_flag,
         remote_provider=remote_provider_enum,
         remote_url=remote_url,
-        message="PDF đã upload thành công. Đang xử lý OCR...",
+        queue_position=queue_position,
+        message=msg,
     )
 
 
@@ -302,8 +355,22 @@ def _run_ocr_job(
     remote_token: str = "",
 ) -> None:
     """Run OCR processing in a background thread."""
+    from app.services.remote_ocr_service import should_run_local_gpu_job
+
     try:
-        if processing_mode == ProcessingMode.REMOTE and remote_provider:
+        if (
+            processing_mode == ProcessingMode.REMOTE
+            and remote_provider
+            and should_run_local_gpu_job(remote_provider, remote_url)
+        ):
+            process_job(
+                job_id,
+                pdf_path,
+                processing_mode=ProcessingMode.LOCAL,
+                api_provider=api_provider,
+                use_gpu=True,
+            )
+        elif processing_mode == ProcessingMode.REMOTE and remote_provider:
             process_remote_job(
                 job_id,
                 pdf_path,

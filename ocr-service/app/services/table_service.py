@@ -10,6 +10,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
+from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 
@@ -27,15 +29,24 @@ from app.models.schemas import (
     RemoteProvider,
     UpdateCellRequest,
 )
+from app.services.gpu_runtime import begin_ocr_job, end_ocr_job
 from app.services.ocr_api_service import process_page_via_api
 from app.services.ocr_service import (
+    SsoGridDraft,
+    complete_draft_page,
     configure_ocr_device,
     force_cpu_mode,
     is_gpu_runtime_error,
+    load_page_image,
+    prepare_page_draft,
     probe_local_gpu,
     process_page,
 )
-from app.services.pdf_service import convert_pdf_to_images, get_page_count
+from app.services.pdf_service import (
+    convert_pdf_page,
+    convert_pdf_to_images,
+    get_page_count,
+)
 from app.services.remote_ocr_service import (
     cache_remote_page_image,
     fetch_remote_result,
@@ -58,6 +69,27 @@ MAX_JOB_LOGS = 300
 _jobs: dict[str, JobInfo] = {}
 _results: dict[str, OcrResult] = {}
 _job_remote_tokens: dict[str, str] = {}
+_jobs_lock = threading.RLock()
+_pdf_prep_executor: ThreadPoolExecutor | None = None
+
+
+def _get_pdf_prep_executor() -> ThreadPoolExecutor:
+    global _pdf_prep_executor
+    if _pdf_prep_executor is None:
+        workers = max(1, min(settings.poppler_thread_count, 4))
+        _pdf_prep_executor = ThreadPoolExecutor(
+            max_workers=workers,
+            thread_name_prefix="pdf-prep",
+        )
+    return _pdf_prep_executor
+
+
+def update_job_queue_position(job_id: str, position: int) -> None:
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if job:
+            job.queue_position = position
+            job.updated_at = datetime.now()
 
 
 def set_job_remote_token(job_id: str, token: str) -> None:
@@ -72,7 +104,8 @@ def get_job_remote_token(job_id: str) -> str:
 
 def get_job(job_id: str) -> JobInfo | None:
     """Get job info by ID."""
-    return _jobs.get(job_id)
+    with _jobs_lock:
+        return _jobs.get(job_id)
 
 
 def get_all_jobs() -> list[JobInfo]:
@@ -174,7 +207,8 @@ def create_job(
         updated_at=datetime.now(),
     )
     _init_page_statuses(job, total_pages)
-    _jobs[job_id] = job
+    with _jobs_lock:
+        _jobs[job_id] = job
     return job
 
 
@@ -237,6 +271,174 @@ def _save_partial_result(job: JobInfo, pages: list[PageResult]) -> OcrResult:
     return result
 
 
+def _process_local_page_standard(
+    image_path: Path,
+    page_number: int,
+    *,
+    processing_mode: ProcessingMode,
+    api_provider: str,
+    use_gpu: bool,
+    job: JobInfo,
+) -> PageResult:
+    """Single-page OCR (legacy sequential path)."""
+    provider = api_provider or settings.ocr_api_provider
+    if processing_mode == ProcessingMode.API:
+        return process_page_via_api(
+            image_path=image_path,
+            page_number=page_number,
+            provider=provider,
+        )
+    if processing_mode == ProcessingMode.AUTO:
+        try:
+            return process_page(image_path, page_number=page_number, use_gpu=use_gpu)
+        except Exception as local_error:
+            _append_log(
+                job,
+                f"Local OCR trang {page_number} lỗi, chuyển sang API: {local_error}",
+                LogLevel.WARNING,
+            )
+            return process_page_via_api(
+                image_path=image_path,
+                page_number=page_number,
+                provider=provider,
+            )
+    try:
+        return process_page(image_path, page_number=page_number, use_gpu=use_gpu)
+    except Exception as page_error:
+        if use_gpu and is_gpu_runtime_error(page_error):
+            _append_log(
+                job,
+                "GPU Paddle lỗi — thử lại trang này trên CPU…",
+                LogLevel.WARNING,
+            )
+            force_cpu_mode(page_error)
+            job.use_gpu = False
+            return process_page(image_path, page_number=page_number, use_gpu=False)
+        raise
+
+
+def _process_local_pages_pipelined(
+    job: JobInfo,
+    pdf_path: Path,
+    image_paths: list[Path],
+    *,
+    use_gpu: bool,
+) -> list[PageResult]:
+    """
+    Overlap Poppler convert, Paddle GPU detect, and VietOCR CPU recognize.
+
+    While VietOCR finishes page N, GPU detects grid on page N+1 and Poppler
+    converts page N+2 (never concurrent with GPU detect on Windows).
+    """
+    total = job.total_pages
+    pages: list[PageResult] = []
+    prep_pool = _get_pdf_prep_executor()
+    recognize_pool = ThreadPoolExecutor(
+        max_workers=1,
+        thread_name_prefix="vietocr-rec",
+    )
+    prefetch_future: Future[Path] | None = None
+    pending_draft: SsoGridDraft | None = None
+    pending_path: Path | None = None
+
+    def _resolve_image(i: int) -> Path:
+        nonlocal prefetch_future
+        if settings.pdf_lazy_convert:
+            if prefetch_future is not None:
+                try:
+                    image_path = prefetch_future.result(
+                        timeout=max(30, settings.pdf_convert_timeout_seconds)
+                    )
+                except TimeoutError as exc:
+                    raise RuntimeError(
+                        f"Prefetch PDF trang {i} quá thời gian chờ"
+                    ) from exc
+                prefetch_future = None
+            else:
+                image_path = convert_pdf_page(pdf_path, job.job_id, i)
+            return image_path
+        return image_paths[i - 1]
+
+    try:
+        for i in range(1, total + 1):
+            image_path = _resolve_image(i)
+            _set_page_status(job, i, PageStatus.PROCESSING)
+            _append_log(job, f"▶ Bắt đầu OCR trang {i}/{total}…")
+
+            rec_future: Future[PageResult] | None = None
+            if pending_draft is not None and pending_path is not None:
+                rec_future = recognize_pool.submit(
+                    complete_draft_page,
+                    pending_path,
+                    pending_draft,
+                    use_gpu=use_gpu,
+                )
+
+            img = load_page_image(image_path)
+            current_draft = prepare_page_draft(img, i)
+
+            if rec_future is not None:
+                prev_result = rec_future.result()
+                pages.append(prev_result)
+                _finalize_page(job, prev_result, pages)
+
+            if current_draft is None:
+                page_result = _process_local_page_standard(
+                    image_path,
+                    i,
+                    processing_mode=ProcessingMode.LOCAL,
+                    api_provider="",
+                    use_gpu=use_gpu,
+                    job=job,
+                )
+                pages.append(page_result)
+                _finalize_page(job, page_result, pages)
+                pending_draft = None
+                pending_path = None
+            else:
+                pending_draft = current_draft
+                pending_path = image_path
+
+            if settings.pdf_lazy_convert and i < total:
+                prefetch_future = prep_pool.submit(
+                    convert_pdf_page, pdf_path, job.job_id, i + 1
+                )
+
+        if pending_draft is not None and pending_path is not None:
+            last_result = complete_draft_page(
+                pending_path, pending_draft, use_gpu=use_gpu
+            )
+            pages.append(last_result)
+            _finalize_page(job, last_result, pages)
+    finally:
+        recognize_pool.shutdown(wait=True)
+
+    return pages
+
+
+def _finalize_page(
+    job: JobInfo, page_result: PageResult, pages: list[PageResult]
+) -> None:
+    """Update job state after a page completes in pipelined mode."""
+    pn = page_result.page_number
+    _set_page_status(job, pn, PageStatus.COMPLETED)
+    job.progress = pn
+    job.updated_at = datetime.now()
+    table_count = len(page_result.tables)
+    cell_count = sum(len(t.cells) for t in page_result.tables)
+    _append_log(
+        job,
+        f"✓ Trang {pn}/{job.total_pages} hoàn tất — "
+        f"{table_count} bảng, {cell_count} ô",
+        LogLevel.SUCCESS,
+    )
+    if (
+        pn % max(1, settings.ocr_save_every_n_pages) == 0
+        or pn == job.total_pages
+    ):
+        _save_partial_result(job, pages)
+
+
 def process_job(
     job_id: str,
     pdf_path: str | Path,
@@ -255,6 +457,7 @@ def process_job(
         raise ValueError(f"Job not found: {job_id}")
 
     try:
+        begin_ocr_job()
         job.status = JobStatus.PROCESSING
         job.use_gpu = use_gpu
         job.updated_at = datetime.now()
@@ -299,89 +502,149 @@ def process_job(
             else:
                 _append_log(job, f"OCR engine đã cấu hình chạy trên {device_label}")
 
-        # Step 1: Convert PDF to images
-        _append_log(job, "Đang chuyển PDF sang ảnh (Poppler)…")
-        image_paths = convert_pdf_to_images(pdf_path, job_id)
-        job.total_pages = len(image_paths)
-        _init_page_statuses(job, len(image_paths))
-        _append_log(job, f"Đã tách {len(image_paths)} trang PDF thành ảnh PNG")
+        # Step 1: PDF → images (lazy: từng trang, prefetch trang kế)
+        total_pages = job.total_pages or get_page_count(pdf_path)
+        if total_pages <= 0:
+            raise RuntimeError("Không đọc được số trang PDF")
 
-        # Step 2: OCR each page independently
+        job.total_pages = total_pages
+        _init_page_statuses(job, total_pages)
+
+        # Prefetch Poppler song song OCR GPU gây treo pdftoppm trên Windows.
+        allow_prefetch = settings.pdf_prefetch_pages and not use_gpu
+
+        if settings.pdf_lazy_convert:
+            _append_log(
+                job,
+                f"Chế độ lazy PDF — OCR từng trang @ {settings.pdf_dpi} DPI "
+                f"(prefetch={'bật' if allow_prefetch else 'tắt'})",
+            )
+            image_paths: list[Path] = []
+        else:
+            _append_log(job, "Đang chuyển toàn bộ PDF sang ảnh (Poppler)…")
+            image_paths = convert_pdf_to_images(pdf_path, job_id)
+            job.total_pages = len(image_paths)
+            _init_page_statuses(job, len(image_paths))
+            _append_log(job, f"Đã tách {len(image_paths)} trang PDF thành ảnh PNG")
+
+        # Step 2: OCR each page
         pages: list[PageResult] = []
-        provider = api_provider or settings.ocr_api_provider
+        use_pipeline = (
+            processing_mode == ProcessingMode.LOCAL and settings.ocr_page_pipeline
+        )
 
-        for i, image_path in enumerate(image_paths, start=1):
-            _set_page_status(job, i, PageStatus.PROCESSING)
-            _append_log(job, f"▶ Bắt đầu OCR trang {i}/{len(image_paths)}…")
+        if use_pipeline:
+            _append_log(
+                job,
+                "Pipeline overlap — Poppler ∥ GPU detect ∥ VietOCR batch",
+            )
+            pages = _process_local_pages_pipelined(
+                job,
+                Path(pdf_path),
+                image_paths if not settings.pdf_lazy_convert else [],
+                use_gpu=use_gpu,
+            )
+        else:
+            provider = api_provider or settings.ocr_api_provider
+            prefetch_future: Future[Path] | None = None
+            prep_pool = _get_pdf_prep_executor() if allow_prefetch else None
 
-            try:
-                if processing_mode == ProcessingMode.API:
-                    page_result = process_page_via_api(
-                        image_path=image_path,
-                        page_number=i,
-                        provider=provider,
-                    )
-                elif processing_mode == ProcessingMode.AUTO:
-                    try:
-                        page_result = process_page(
-                            image_path, page_number=i, use_gpu=use_gpu
+            for i in range(1, job.total_pages + 1):
+                if settings.pdf_lazy_convert:
+                    if prefetch_future is not None:
+                        try:
+                            image_path = prefetch_future.result(
+                                timeout=max(30, settings.pdf_convert_timeout_seconds)
+                            )
+                        except TimeoutError as exc:
+                            raise RuntimeError(
+                                f"Prefetch PDF trang {i} quá thời gian chờ"
+                            ) from exc
+                        prefetch_future = None
+                    else:
+                        image_path = convert_pdf_page(pdf_path, job_id, i)
+                    if prep_pool and i < job.total_pages:
+                        prefetch_future = prep_pool.submit(
+                            convert_pdf_page, pdf_path, job_id, i + 1
                         )
-                    except Exception as local_error:
-                        _append_log(
-                            job,
-                            f"Local OCR trang {i} lỗi, chuyển sang API: {local_error}",
-                            LogLevel.WARNING,
-                        )
+                else:
+                    image_path = image_paths[i - 1]
+
+                _set_page_status(job, i, PageStatus.PROCESSING)
+                _append_log(job, f"▶ Bắt đầu OCR trang {i}/{job.total_pages}…")
+
+                try:
+                    if processing_mode == ProcessingMode.API:
                         page_result = process_page_via_api(
                             image_path=image_path,
                             page_number=i,
                             provider=provider,
                         )
-                else:
-                    try:
-                        page_result = process_page(
-                            image_path, page_number=i, use_gpu=use_gpu
-                        )
-                    except Exception as page_error:
-                        if use_gpu and is_gpu_runtime_error(page_error):
+                    elif processing_mode == ProcessingMode.AUTO:
+                        try:
+                            page_result = process_page(
+                                image_path, page_number=i, use_gpu=use_gpu
+                            )
+                        except Exception as local_error:
                             _append_log(
                                 job,
-                                "GPU Paddle lỗi — thử lại trang này trên CPU…",
+                                f"Local OCR trang {i} lỗi, chuyển sang API: {local_error}",
                                 LogLevel.WARNING,
                             )
-                            force_cpu_mode(page_error)
-                            use_gpu = False
-                            job.use_gpu = False
-                            page_result = process_page(
-                                image_path, page_number=i, use_gpu=False
+                            page_result = process_page_via_api(
+                                image_path=image_path,
+                                page_number=i,
+                                provider=provider,
                             )
-                        else:
-                            raise
+                    else:
+                        try:
+                            page_result = process_page(
+                                image_path, page_number=i, use_gpu=use_gpu
+                            )
+                        except Exception as page_error:
+                            if use_gpu and is_gpu_runtime_error(page_error):
+                                _append_log(
+                                    job,
+                                    "GPU Paddle lỗi — thử lại trang này trên CPU…",
+                                    LogLevel.WARNING,
+                                )
+                                force_cpu_mode(page_error)
+                                use_gpu = False
+                                job.use_gpu = False
+                                page_result = process_page(
+                                    image_path, page_number=i, use_gpu=False
+                                )
+                            else:
+                                raise
 
-                pages.append(page_result)
-                _set_page_status(job, i, PageStatus.COMPLETED)
-                job.progress = i
-                job.updated_at = datetime.now()
+                    pages.append(page_result)
+                    _set_page_status(job, i, PageStatus.COMPLETED)
+                    job.progress = i
+                    job.updated_at = datetime.now()
 
-                table_count = len(page_result.tables)
-                cell_count = sum(len(t.cells) for t in page_result.tables)
-                _append_log(
-                    job,
-                    f"✓ Trang {i}/{len(image_paths)} hoàn tất — "
-                    f"{table_count} bảng, {cell_count} ô",
-                    LogLevel.SUCCESS,
-                )
+                    table_count = len(page_result.tables)
+                    cell_count = sum(len(t.cells) for t in page_result.tables)
+                    _append_log(
+                        job,
+                        f"✓ Trang {i}/{job.total_pages} hoàn tất — "
+                        f"{table_count} bảng, {cell_count} ô",
+                        LogLevel.SUCCESS,
+                    )
 
-                _save_partial_result(job, pages)
+                    if (
+                        i % max(1, settings.ocr_save_every_n_pages) == 0
+                        or i == job.total_pages
+                    ):
+                        _save_partial_result(job, pages)
 
-            except Exception as page_error:
-                _set_page_status(job, i, PageStatus.FAILED, str(page_error))
-                _append_log(
-                    job,
-                    f"✗ Trang {i} thất bại: {page_error}",
-                    LogLevel.ERROR,
-                )
-                raise
+                except Exception as page_error:
+                    _set_page_status(job, i, PageStatus.FAILED, str(page_error))
+                    _append_log(
+                        job,
+                        f"✗ Trang {i} thất bại: {page_error}",
+                        LogLevel.ERROR,
+                    )
+                    raise
 
         result = _save_partial_result(job, pages)
         job.status = JobStatus.COMPLETED
@@ -405,6 +668,8 @@ def process_job(
         job.updated_at = datetime.now()
         _append_log(job, f"Lỗi xử lý: {e}", LogLevel.ERROR)
         raise
+    finally:
+        end_ocr_job()
 
 
 def process_remote_job(

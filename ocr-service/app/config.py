@@ -4,6 +4,8 @@ OCR Service Configuration.
 """
 
 from pathlib import Path
+from urllib.parse import urlparse
+
 from pydantic_settings import BaseSettings
 
 
@@ -33,8 +35,28 @@ class Settings(BaseSettings):
     ocr_api_timeout_seconds: int = 60
 
     # --- PDF Processing ---
-    pdf_dpi: int = 300
+    pdf_dpi: int = 250
     poppler_path: str = ""
+    poppler_thread_count: int = 4
+    pdf_lazy_convert: bool = True
+    # Prefetch + Paddle GPU trên Windows dễ treo pdftoppm — mặc định tắt.
+    pdf_prefetch_pages: bool = False
+    pdf_convert_timeout_seconds: int = 120
+
+    # --- Job queue (multi-user GPU host) ---
+    ocr_queue_max_size: int = 30
+    ocr_worker_threads: int = 2
+    ocr_warmup_on_startup: bool = True
+    ocr_save_every_n_pages: int = 1
+    ocr_page_pipeline: bool = True
+
+    # --- VietOCR / CPU tuning ---
+    vietocr_batch_size: int = 32
+    torch_num_threads: int = 4
+    cell_ink_min_ratio: float = 0.015
+    # Phase 4: VietOCR torch-CUDA trong process con (tránh xung đột Paddle GPU)
+    vietocr_gpu_subprocess: bool = True
+    vietocr_gpu_python: str = ""
 
     # --- Confidence ---
     ocr_confidence_threshold: float = 0.85
@@ -121,6 +143,33 @@ class Settings(BaseSettings):
         """Parse CORS origins from comma-separated string."""
         return [origin.strip() for origin in self.cors_origins.split(",")]
 
+    def resolve_internal_gpu_url(self, *, local_gpu_ok: bool | None = None) -> str:
+        """
+        URL worker GPU nội bộ.
+
+        - .env INTERNAL_GPU_URL: dùng khi client proxy sang máy GPU khác
+        - Máy host GPU (PADDLE_USE_GPU=true): tự trỏ localhost nếu chưa cấu hình
+        """
+        explicit = self.internal_gpu_url.strip()
+        if explicit:
+            return explicit
+        if not self.paddle_use_gpu:
+            return ""
+        if local_gpu_ok is False:
+            return ""
+        return f"http://127.0.0.1:{self.port}"
+
+    def is_local_worker_url(self, url: str) -> bool:
+        """True when worker URL points to this same ocr-service instance."""
+        raw = (url or "").strip()
+        if not raw:
+            return False
+        parsed = urlparse(raw)
+        host = (parsed.hostname or "").lower()
+        if host not in ("127.0.0.1", "localhost", "::1"):
+            return False
+        port = parsed.port or 80
+        return port == self.port
     @property
     def keycloak_default_required_actions_list(self) -> list[str]:
         """Parse default required actions from comma-separated string."""

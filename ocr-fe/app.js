@@ -2,7 +2,9 @@
    Agribank Banca OCR — Client Application
    ============================================================ */
 
-const API_BASE = window.location.port === '8100' ? '' : 'http://localhost:8100';
+// FE dev server (5173/3000) → API riêng port 8100. Còn lại (8100, Tailscale, Cloudflare…) → same origin.
+const _devFePorts = new Set(['5173', '3000', '5500']);
+const API_BASE = _devFePorts.has(window.location.port) ? 'http://localhost:8100' : '';
 
 // ── State ──
 let currentStep = 0;
@@ -106,7 +108,9 @@ async function loadRuntimeConfig() {
         if (res.ok) {
             runtimeConfig = await res.json();
             if (runtimeConfig.internal_gpu_configured) {
-                internalGpuLabel.textContent = `Worker: ${runtimeConfig.internal_gpu_label}`;
+                internalGpuLabel.textContent = runtimeConfig.internal_gpu_label
+                    ? `Máy chủ GPU: ${runtimeConfig.internal_gpu_label}`
+                    : 'Máy chủ GPU nội bộ';
             } else {
                 chipInternalGpu.classList.add('disabled');
                 chipInternalGpu.querySelector('input').disabled = true;
@@ -124,6 +128,9 @@ async function loadRuntimeConfig() {
     const savedMode = localStorage.getItem('processing_mode');
     if (savedMode) {
         const radio = document.querySelector(`input[name="processing-mode"][value="${savedMode}"]`);
+        if (radio && !radio.disabled) radio.checked = true;
+    } else if (runtimeConfig?.internal_gpu_configured) {
+        const radio = document.querySelector('input[name="processing-mode"][value="remote-internal"]');
         if (radio && !radio.disabled) radio.checked = true;
     }
     syncModeUi();
@@ -359,6 +366,16 @@ async function uploadPdf(file) {
         processingSubtitle.textContent = subtitle;
 
         appendLog({ level: 'info', message: `Upload thành công — Job ${jobId}`, timestamp: new Date().toISOString() });
+        if (data.queue_position > 1) {
+            appendLog({
+                level: 'info',
+                message: `Đang xếp hàng GPU — vị trí ${data.queue_position}. Các job chạy tuần tự, vui lòng chờ.`,
+                timestamp: new Date().toISOString(),
+            });
+        }
+        if (data.message) {
+            appendLog({ level: 'info', message: data.message, timestamp: new Date().toISOString() });
+        }
         const modeLabel = data.processing_mode === 'remote'
             ? `REMOTE · ${data.remote_provider || 'worker'}`
             : data.processing_mode.toUpperCase();
@@ -489,6 +506,16 @@ async function pollTick() {
 }
 
 function updateProgressFromJob(job) {
+    if (job.status === 'queued') {
+        const pos = job.queue_position || '?';
+        updateProgress(0, `Đang chờ GPU (hàng đợi #${pos})…`);
+        processingSubtitle.textContent = `Job đang xếp hàng — GPU xử lý tuần tự, vị trí ${pos}`;
+        return;
+    }
+    if (job.status === 'pending') {
+        updateProgress(0, 'Đang khởi tạo…');
+        return;
+    }
     const pct = job.total_pages > 0
         ? Math.min(99, Math.round((job.progress / job.total_pages) * 100))
         : 5;
