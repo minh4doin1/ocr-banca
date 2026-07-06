@@ -82,6 +82,43 @@ def test_map_skips_empty_username_rows():
     assert users[0].username == "user1"
 
 
+def test_map_sso_data_without_header_row():
+    """Form SSO: dòng 0 là STT=1 (postprocess đã bỏ header)."""
+    table = _make_table(
+        [
+            "1",
+            "Nguyễn Thị Phú Lương",
+            "KT&NQ",
+            "LANLUONG",
+            "054178007182 (10/08/2021)",
+            "luongnguyenthiphu@agribank.com.vn",
+            "0908976096",
+            "Phê duyệt viên",
+            "Cấp mới",
+        ],
+        [
+            [
+                "2",
+                "Trương Thị Trúc Phương",
+                "KT&NQ",
+                "TRUCPHUONG",
+                "083179011564 (13/08/2021)",
+                "phuongtruongthitruc@agribank.com.vn",
+                "0848709211",
+                "Phê duyệt viên",
+                "Cấp mới",
+            ],
+        ],
+    )
+    users, warnings = map_result_to_users(_make_result(table))
+    assert not warnings or not any("username" in w for w in warnings)
+    assert len(users) == 2
+    assert users[0].username == "LANLUONG"
+    assert users[0].name == "Nguyễn Thị Phú Lương"
+    assert users[0].cccd == "054178007182"
+    assert users[0].email == "luongnguyenthiphu@agribank.com.vn"
+
+
 def test_map_warns_when_no_username_column():
     """Không có cột username -> cảnh báo, không tạo user."""
     table = _make_table(

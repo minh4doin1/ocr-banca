@@ -282,7 +282,10 @@ async def field_config():
 async def enrich_users(request: EnrichRequest):
     users, warnings = _resolve_users_list(request.job_id, request.users)
     if not users:
-        raise HTTPException(status_code=400, detail="Không có user để enrich.")
+        detail = "Không có user để enrich."
+        if warnings:
+            detail += " " + " ".join(warnings)
+        raise HTTPException(status_code=400, detail=detail)
     resp = _enrich_users(users)
     resp.warnings = warnings + resp.warnings
     return resp

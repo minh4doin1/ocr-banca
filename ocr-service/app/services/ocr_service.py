@@ -641,6 +641,13 @@ def _extract_table(
         if not cell_data_list and not html_str:
             return None
 
+        if (
+            cell_data_list
+            and settings.ocr_sso_enhance
+            and _looks_like_sso_cells(cell_data_list)
+        ):
+            cell_data_list = _postprocess_sso_cells(cell_data_list)
+
         max_row = max((c.row for c in cell_data_list), default=0)
         max_col = max((c.col for c in cell_data_list), default=0)
 
@@ -960,11 +967,7 @@ def _reconstruct_table_from_lines(
     if not row_anchors:
         return []
 
-    # Assign each line to the nearest row anchor.
-    grid: dict[tuple[int, int], list[dict]] = {}
-    for ln in lines:
-        row = min(range(len(row_anchors)), key=lambda i: abs(row_anchors[i] - ln["cy"]))
-        grid.setdefault((row, ln["col"]), []).append(ln)
+    grid = _assign_lines_to_grid(lines, row_anchors)
 
     cells: list[CellData] = []
     for (row, col), members in grid.items():
@@ -987,8 +990,288 @@ def _reconstruct_table_from_lines(
 
     cells = _merge_annotation_header_rows(cells)
     cells = _fix_cccd_email_columns(cells)
+    if settings.ocr_sso_enhance and settings.ocr_sso_row_merge:
+        cells = _merge_fragment_sso_rows(cells)
     cells.sort(key=lambda c: (c.row, c.col))
     return cells
+
+
+def _assign_lines_to_grid(
+    lines: list[dict],
+    row_anchors: list[float],
+) -> dict[tuple[int, int], list[dict]]:
+    """
+    Assign detected text lines to table rows/columns.
+
+    Wrapped lines inside one cell (e.g. email on two lines) are kept on the
+    same row as the nearest STT anchor above them, not split into a new row.
+    """
+    if not lines or not row_anchors:
+        return {}
+
+    min_col = min(ln["col"] for ln in lines)
+    heights = [ln["y2"] - ln["y1"] for ln in lines]
+    med_h = float(np.median(heights)) if heights else 20.0
+    wrap_gap = med_h * 2.5 if settings.ocr_sso_enhance else med_h * 1.2
+
+    def _row_for_line(ln: dict) -> int:
+        if ln["col"] == min_col:
+            return min(
+                range(len(row_anchors)),
+                key=lambda i: abs(row_anchors[i] - ln["cy"]),
+            )
+        if not settings.ocr_sso_enhance:
+            return min(
+                range(len(row_anchors)),
+                key=lambda i: abs(row_anchors[i] - ln["cy"]),
+            )
+        above = [
+            i for i, cy in enumerate(row_anchors) if cy <= ln["cy"] + med_h * 0.4
+        ]
+        if above:
+            anchor_idx = above[-1]
+            if abs(row_anchors[anchor_idx] - ln["cy"]) <= wrap_gap:
+                return anchor_idx
+        return min(
+            range(len(row_anchors)),
+            key=lambda i: abs(row_anchors[i] - ln["cy"]),
+        )
+
+    grid: dict[tuple[int, int], list[dict]] = {}
+    for ln in lines:
+        row = _row_for_line(ln)
+        grid.setdefault((row, ln["col"]), []).append(ln)
+    return grid
+
+
+def _looks_like_sso_cells(cells: list[CellData]) -> bool:
+    """True when header rows match Agribank SSO table keywords."""
+    texts: list[str] = []
+    for c in cells:
+        if c.row > 2:
+            break
+        texts.append(c.text)
+    combined = _normalize_match_text(" ".join(texts))
+    return sum(1 for kw in _SSO_HEADER_KEYWORDS if kw in combined) >= 3
+
+
+def _is_email_domain_fragment(text: str) -> bool:
+    import re
+
+    t = text.strip().lower()
+    if not t:
+        return False
+    if t in (".vn", "vn", "g"):
+        return True
+    return bool(
+        re.search(r"ribank|agribank|\.com|@", t)
+        or (len(t) <= 5 and t.endswith("ag"))
+    )
+
+
+def _is_cccd_date_fragment(text: str) -> bool:
+    import re
+
+    t = text.strip()
+    if not t:
+        return False
+    if re.match(r"^\(\d", t) or re.match(r"^\d{1,2}/\d{2,4}\)?$", t):
+        return True
+    compact = re.sub(r"\s", "", t)
+    return bool(re.match(r"^\d{5,12}$", compact))
+
+
+def _is_stt_value(text: str) -> bool:
+    import re
+
+    return bool(re.match(r"^\d{1,3}$", (text or "").strip()))
+
+
+def _is_vietnamese_name_fragment(text: str) -> bool:
+    import re
+
+    t = (text or "").strip()
+    if not t or len(t) > 48:
+        return False
+    if "@" in t or re.search(r"\d{5,}", t):
+        return False
+    vn_chars = (
+        "àáảãạăắằẳẵặâấầẩẫậèéẻẽẹêếềểễệìíỉĩịòóỏõọôốồổỗộơớờởỡợùúủũụưứừửữựỳýỷỹỵđ"
+    )
+    if any(c in vn_chars for c in t.lower()):
+        return True
+    return len(t.split()) <= 4 and any(ord(c) > 127 for c in t)
+
+
+def _row_looks_like_fragment_continuation(
+    upper: dict[int, CellData],
+    lower: dict[int, CellData],
+) -> bool:
+    """True when lower row is ONLY a line-wrap continuation (not a new data row)."""
+    import re
+
+    low_stt = (lower.get(0).text if lower.get(0) else "").strip()
+    up_stt = (upper.get(0).text if upper.get(0) else "").strip()
+
+    if _is_stt_value(low_stt):
+        return False
+    if re.search(r"\d{1,3}", low_stt):
+        return False
+    if not _is_stt_value(up_stt):
+        return False
+
+    lower_cols = {
+        col: c.text.strip()
+        for col, c in lower.items()
+        if c.text.strip()
+    }
+    if not lower_cols:
+        return False
+
+    # Dòng dữ liệu đầy đủ (nhiều cột) — không gộp
+    if len(lower_cols) >= 4:
+        return False
+
+    lower_texts = list(lower_cols.values())
+
+    frag_hits = sum(
+        1
+        for t in lower_texts
+        if _is_email_domain_fragment(t) or _is_cccd_date_fragment(t)
+    )
+    if frag_hits >= 1:
+        return len(lower_cols) <= 2
+
+    name_cols = {c for c in lower_cols if c in (1, 2)}
+    other = set(lower_cols.keys()) - name_cols - {0}
+    if name_cols and not other:
+        return any(_is_vietnamese_name_fragment(lower_cols[c]) for c in name_cols)
+
+    role_cols = set(lower_cols.keys()) - {0}
+    if role_cols <= {7, 8} and any(
+        "viên" in t.lower() or t.lower() in ("viên", "vien", "vi")
+        for t in lower_texts
+    ):
+        return True
+
+    return False
+
+
+def _merge_row_cells_into(
+    target: dict[int, CellData],
+    source: dict[int, CellData],
+) -> None:
+    """Merge source row cells into target (in-place)."""
+    for col, scell in source.items():
+        stext = scell.text.strip()
+        if not stext:
+            continue
+        if col in target:
+            existing = target[col].text.strip()
+            if existing:
+                if (
+                    stext.startswith(".")
+                    or existing.endswith("@")
+                    or existing.endswith("ag")
+                    or (existing.endswith("(") and stext[0].isdigit())
+                ):
+                    target[col].text = existing + stext
+                else:
+                    target[col].text = f"{existing} {stext}".strip()
+            else:
+                target[col].text = stext
+            target[col].confidence = max(target[col].confidence, scell.confidence)
+            if scell.bbox:
+                if target[col].bbox and len(target[col].bbox) >= 4:
+                    tb, sb = target[col].bbox, scell.bbox
+                    target[col].bbox = [
+                        min(tb[0], sb[0]),
+                        min(tb[1], sb[1]),
+                        max(tb[2], sb[2]),
+                        max(tb[3], sb[3]),
+                    ]
+                else:
+                    target[col].bbox = scell.bbox
+        else:
+            target[col] = CellData(
+                row=target[next(iter(target))].row if target else scell.row,
+                col=col,
+                text=stext,
+                confidence=scell.confidence,
+                bbox=scell.bbox,
+            )
+
+
+def _merge_fragment_sso_rows(cells: list[CellData]) -> list[CellData]:
+    """Merge OCR rows that are line-wrap continuations (email, CCCD, tên)."""
+    from collections import defaultdict
+
+    if not cells:
+        return cells
+
+    by_row: dict[int, dict[int, CellData]] = defaultdict(dict)
+    for c in cells:
+        by_row[c.row][c.col] = c
+
+    merged_groups: list[dict[int, CellData]] = []
+    for rid in sorted(by_row):
+        cols = by_row[rid]
+        if merged_groups and _row_looks_like_fragment_continuation(
+            merged_groups[-1], cols
+        ):
+            _merge_row_cells_into(merged_groups[-1], cols)
+        else:
+            merged_groups.append({col: c for col, c in cols.items()})
+
+    result: list[CellData] = []
+    for new_row, group in enumerate(merged_groups):
+        for col, cell in sorted(group.items()):
+            result.append(
+                CellData(
+                    row=new_row,
+                    col=col,
+                    text=_normalize_cell_text(cell.text),
+                    confidence=cell.confidence,
+                    bbox=cell.bbox,
+                )
+            )
+    return result
+
+
+def _merge_clean_row_continuations(
+    clean_rows: dict[int, dict[int, CellData]],
+) -> dict[int, dict[int, CellData]]:
+    """Merge STT row with the row immediately below inside cleaned data rows."""
+    if not clean_rows:
+        return clean_rows
+
+    row_ids = sorted(clean_rows)
+    skip: set[int] = set()
+    merged: dict[int, dict[int, CellData]] = {}
+
+    for i, rid in enumerate(row_ids):
+        if rid in skip:
+            continue
+        cols = {
+            col: CellData(
+                row=cell.row,
+                col=cell.col,
+                text=cell.text,
+                confidence=cell.confidence,
+                bbox=cell.bbox,
+            )
+            for col, cell in clean_rows[rid].items()
+        }
+        if i + 1 < len(row_ids):
+            nxt = row_ids[i + 1]
+            if nxt not in skip and _row_looks_like_fragment_continuation(
+                cols, clean_rows[nxt]
+            ):
+                _merge_row_cells_into(cols, clean_rows[nxt])
+                skip.add(nxt)
+        merged[rid] = cols
+
+    return merged
 
 
 def _find_cccd_email_cols(cells: list[CellData]) -> tuple[int | None, int | None]:
@@ -1060,7 +1343,11 @@ def _fix_cccd_email_columns(cells: list[CellData]) -> list[CellData]:
             if cccd_part:
                 cccd_cell = cols.get(cccd_col)
                 if not (cccd_cell and cccd_cell.text.strip()):
-                    email_cell.text = _normalize_cell_text(remainder)
+                    email_cell.text = (
+                        _format_sso_email(remainder)
+                        if settings.ocr_sso_email_fixed_domain
+                        else _normalize_cell_text(remainder)
+                    )
                     if cccd_cell:
                         cccd_cell.text = _normalize_cccd_text(cccd_part)
                     else:
@@ -1080,14 +1367,157 @@ def _fix_cccd_email_columns(cells: list[CellData]) -> list[CellData]:
     return cells
 
 
+def _sso_email_domain() -> str:
+    """Domain email SSO (luôn có prefix @)."""
+    dom = (settings.ocr_sso_email_domain or "@agribank.com.vn").strip().lower()
+    return dom if dom.startswith("@") else f"@{dom}"
+
+
+def _resolve_sso_email_col(num_cols: int, cells: list[CellData] | None = None) -> int | None:
+    """Return email column index for Agribank SSO grid."""
+    if cells:
+        _, email_col = _find_cccd_email_cols(cells)
+        if email_col is not None:
+            return email_col
+    if settings.ocr_sso_email_col >= 0:
+        return settings.ocr_sso_email_col
+    if num_cols >= 7:
+        return 5
+    return None
+
+
+def _extract_sso_email_local(text: str) -> str:
+    """Lấy phần username từ OCR (bỏ domain cố định @agribank.com.vn)."""
+    import re
+
+    t = re.sub(r"\s+", "", text.strip().lower())
+    if not t:
+        return ""
+    t = re.sub(r"@?agribank\.com\.?vn.*$", "", t, flags=re.IGNORECASE)
+    t = re.sub(r"ribank\.com\.vn.*$", "", t, flags=re.IGNORECASE)
+    t = re.sub(r"(?:@ag)+$", "", t, flags=re.IGNORECASE)
+    t = t.rstrip("@")
+    if len(t) > 4 and t.endswith("ag"):
+        t = t[:-2]
+    return re.sub(r"[^a-z0-9._+-]", "", t)
+
+
+def _format_sso_email(text: str) -> str:
+    """Ghép username OCR + domain SSO cố định."""
+    if not settings.ocr_sso_email_fixed_domain:
+        return _repair_agribank_email(text)
+    local = _extract_sso_email_local(text)
+    if not local:
+        return ""
+    return f"{local}{_sso_email_domain()}"
+
+
+def _apply_fixed_email_domain(cells: list[CellData]) -> list[CellData]:
+    """Gán domain cố định cho cột email (sau khi biết header)."""
+    if not settings.ocr_sso_email_fixed_domain or not cells:
+        return cells
+
+    max_col = max(c.col for c in cells)
+    email_col = _resolve_sso_email_col(max_col + 1, cells)
+    if email_col is None:
+        return cells
+
+    header_rows = {c.row for c in cells if c.row <= 1}
+    out: list[CellData] = []
+    for c in cells:
+        if c.col == email_col and c.row not in header_rows and c.text.strip():
+            formatted = _format_sso_email(c.text)
+            if formatted:
+                out.append(
+                    CellData(
+                        row=c.row,
+                        col=c.col,
+                        text=formatted,
+                        confidence=c.confidence,
+                        bbox=c.bbox,
+                    )
+                )
+            else:
+                out.append(c)
+        else:
+            out.append(c)
+    return out
+
+
+def _join_multiline_ocr_lines(lines: list[str]) -> str:
+    """Join OCR lines from one cell (email wrap, tên 2 dòng, ngày trong ngoặc)."""
+    cleaned = [ln.strip() for ln in lines if ln and ln.strip()]
+    if not cleaned:
+        return ""
+    if len(cleaned) == 1:
+        return cleaned[0]
+
+    out = cleaned[0]
+    for nxt in cleaned[1:]:
+        low_out = out.lower().rstrip()
+        low_nxt = nxt.lower().lstrip()
+        if (
+            low_nxt.startswith("ribank")
+            or low_nxt.startswith("agribank")
+            or low_nxt.startswith(".vn")
+            or low_out.endswith("@")
+            or low_out.endswith("@ag")
+            or low_out.endswith("(ag")
+        ):
+            out = out.rstrip() + nxt.lstrip()
+        elif nxt.startswith(".") or (
+            out.rstrip().endswith("(") and nxt and nxt[0].isdigit()
+        ):
+            out = out.rstrip() + nxt.lstrip()
+        else:
+            out = f"{out} {nxt}".strip()
+    return out
+
+
+def _repair_agribank_email(text: str) -> str:
+    """Chuẩn hóa email @agribank.com.vn sau OCR multi-line / lỗi @ag lặp."""
+    import re
+
+    t = re.sub(r"\s+", "", text.strip())
+    if not t:
+        return text.strip()
+
+    t = re.sub(r"ribank\.com\.vn", "agribank.com.vn", t, flags=re.IGNORECASE)
+    dom = re.search(r"agribank\.com\.vn", t, flags=re.IGNORECASE)
+    if not dom:
+        return " ".join(text.split())
+
+    local = t[: dom.start()]
+    local = re.sub(r"(?:@ag)+$", "", local, flags=re.IGNORECASE)
+    local = local.rstrip("@")
+    if len(local) > 4 and local.lower().endswith("ag"):
+        local = local[:-2]
+    local = re.sub(r"[^a-z0-9._+-]", "", local.lower())
+    if not local:
+        return " ".join(text.split())
+    return f"{local}@agribank.com.vn"
+
+
 def _normalize_cell_text(text: str) -> str:
-    """Clean common OCR artefacts (e.g. '@' misread as Q/(J before agribank.com.vn)."""
+    """Clean common OCR artefacts (@/&/. misreads, Agribank email domain)."""
     import re
 
     t = " ".join(text.split())
-    # VietOCR frequently misreads '@' as one of Q ( ) J { } [ ] | before the
-    # fixed Agribank e-mail domain. Restore a single '@'.
-    t = re.sub(r"[\s@Qq(){}\[\]Jj|]*agribank\.com\.vn", "@agribank.com.vn", t)
+    low = t.lower()
+
+    if settings.ocr_sso_email_fixed_domain and (
+        "agribank" in low or "ribank.com" in low or "@" in t
+    ):
+        return _format_sso_email(t)
+
+    if "agribank" in low or "ribank.com" in low or "@" in t:
+        return _repair_agribank_email(t).strip()
+
+    if settings.ocr_symbol_normalize:
+        t = re.sub(r"\bKT\s*[8B&\s]+\s*NQ\b", "KT&NQ", t, flags=re.IGNORECASE)
+        t = re.sub(r"\bKT8NQ\b", "KT&NQ", t, flags=re.IGNORECASE)
+        t = re.sub(r"\bKT[ÁÀAáà&8\s]+NQ\b", "KT&NQ", t, flags=re.IGNORECASE)
+
     return t.strip()
 
 
@@ -1686,11 +2116,132 @@ def _filter_sliver_rows(
     return kept
 
 
+def _collapse_short_row_bands(
+    row_lines: list[int], ratio: float = 0.48
+) -> list[int]:
+    """
+    Remove interior row boundaries that split one logical cell in two.
+
+    Only collapses bands clearly shorter than half a row (~line wrap inside cell).
+    """
+    lines = list(row_lines)
+    if len(lines) < 3:
+        return lines
+
+    for _ in range(len(lines)):
+        gaps = [lines[i + 1] - lines[i] for i in range(len(lines) - 1)]
+        if not gaps:
+            break
+        med = float(np.median(gaps))
+        thr = max(14, min(med * ratio, med * 0.52))
+        removed = False
+        for i, gap in enumerate(gaps):
+            if gap >= thr:
+                continue
+            if i == 0 or i >= len(gaps) - 1:
+                continue
+            del lines[i + 1]
+            removed = True
+            break
+        if not removed:
+            break
+    return lines
+
+
+def _offset_cells_bbox(
+    cells: list[CellData], dy: int = 0, dx: int = 0
+) -> list[CellData]:
+    """Shift cell bboxes from crop-local to full-page coordinates."""
+    if not dy and not dx:
+        return cells
+    out: list[CellData] = []
+    for c in cells:
+        if c.bbox and len(c.bbox) >= 4:
+            x1, y1, x2, y2 = c.bbox
+            bbox = [x1 + dx, y1 + dy, x2 + dx, y2 + dy]
+        else:
+            bbox = c.bbox
+        out.append(
+            CellData(
+                row=c.row,
+                col=c.col,
+                text=c.text,
+                confidence=c.confidence,
+                bbox=bbox,
+            )
+        )
+    return out
+
+
+def _split_cell_text_lines(crop: np.ndarray) -> list[np.ndarray]:
+    """
+    Split a table cell image into horizontal text-line crops (top → bottom).
+
+    VietOCR predict_batch on a tall multi-line cell often returns only the
+    first line; OCR each sub-line then join.
+    """
+    if crop is None or crop.size == 0:
+        return []
+    h, w = crop.shape[:2]
+    if h < 30 or w < 12:
+        return [crop]
+
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if len(crop.shape) == 3 else crop
+    _, binary = cv2.threshold(
+        gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
+    )
+    proj = np.sum(binary, axis=1).astype(np.float64)
+    mx = float(np.max(proj)) if proj.size else 0.0
+    if mx <= 0:
+        return [crop]
+
+    thr = max(mx * 0.06, 1.0)
+    spans: list[tuple[int, int]] = []
+    start: int | None = None
+    for i, val in enumerate(proj):
+        if val >= thr:
+            if start is None:
+                start = i
+        elif start is not None:
+            spans.append((start, i))
+            start = None
+    if start is not None:
+        spans.append((start, h))
+
+    if len(spans) <= 1:
+        return [crop]
+
+    heights = [b - a for a, b in spans]
+    med_h = float(np.median(heights)) if heights else 12.0
+    merge_gap = max(4, int(med_h * 0.35))
+    merged: list[tuple[int, int]] = [spans[0]]
+    for y1, y2 in spans[1:]:
+        py1, py2 = merged[-1]
+        if y1 - py2 <= merge_gap:
+            merged[-1] = (py1, y2)
+        else:
+            merged.append((y1, y2))
+
+    line_crops: list[np.ndarray] = []
+    pad = 1
+    for y1, y2 in merged:
+        if y2 - y1 < 5:
+            continue
+        cy1 = max(0, y1 - pad)
+        cy2 = min(h, y2 + pad)
+        sub = crop[cy1:cy2, :]
+        if sub.size > 0:
+            line_crops.append(sub)
+
+    return line_crops if len(line_crops) > 1 else [crop]
+
+
 def _detect_grid_line_positions(
     image: np.ndarray,
     *,
     min_rows: int = 8,
     min_cols: int = 6,
+    col_min_gap: int = 35,
 ) -> tuple[list[int], list[int]] | None:
     """
     Detect printed table grid from horizontal/vertical ruling lines.
@@ -1729,13 +2280,15 @@ def _detect_grid_line_positions(
         return peaks
 
     row_lines = _peaks(np.sum(horizontal, axis=1), min_gap=12)
-    col_lines = _peaks(np.sum(vertical, axis=0), min_gap=35)
+    col_lines = _peaks(np.sum(vertical, axis=0), min_gap=col_min_gap)
 
     if len(row_lines) >= 3:
         gaps = [row_lines[i + 1] - row_lines[i] for i in range(len(row_lines) - 1)]
         med_gap = float(np.median(gaps)) if gaps else 20.0
         row_lines = _merge_close_peaks(row_lines, max(8, int(med_gap * 0.45)))
-        row_lines = _filter_sliver_rows(row_lines, min_height=max(14, int(med_gap * 0.55)))
+        row_lines = _filter_sliver_rows(row_lines, min_height=max(18, int(med_gap * 0.72)))
+        if settings.ocr_sso_enhance and settings.ocr_sso_collapse_row_bands:
+            row_lines = _collapse_short_row_bands(row_lines)
 
     if len(col_lines) >= 3:
         cgaps = [col_lines[i + 1] - col_lines[i] for i in range(len(col_lines) - 1)]
@@ -1753,9 +2306,18 @@ def _ocr_table_grid(
     col_lines: list[int],
 ) -> list[CellData]:
     """OCR each grid cell with VietOCR (skip empty cells to avoid hallucinations)."""
-    cells: list[CellData] = []
+    from collections import defaultdict
+
+    num_cols = max(len(col_lines) - 1, 0)
+    email_col = (
+        _resolve_sso_email_col(num_cols)
+        if settings.ocr_sso_email_fixed_domain
+        else None
+    )
+
     crops: list[np.ndarray] = []
-    metas: list[tuple[int, int, int, int, int, int]] = []
+    # ri, ci, x1, y1, x2, y2, line_idx_in_cell
+    metas: list[tuple[int, int, int, int, int, int, int]] = []
 
     for ri in range(len(row_lines) - 1):
         y1, y2 = row_lines[ri], row_lines[ri + 1]
@@ -1765,7 +2327,7 @@ def _ocr_table_grid(
             x1, x2 = col_lines[ci], col_lines[ci + 1]
             if x2 - x1 < 18:
                 continue
-            pad = 4
+            pad = 2
             cy1 = min(image.shape[0], y1 + pad)
             cy2 = max(cy1 + 1, y2 - pad)
             cx1 = min(image.shape[1], x1 + pad)
@@ -1775,18 +2337,53 @@ def _ocr_table_grid(
                 continue
             if not _cell_has_ink(crop):
                 continue
-            crops.append(crop)
-            metas.append((ri, ci, x1, y1, x2, y2))
+            if settings.ocr_sso_enhance and settings.ocr_cell_multiline:
+                line_crops = _split_cell_text_lines(crop)
+            else:
+                line_crops = [crop]
+            # Email SSO: domain cố định — chỉ OCR dòng 1 (username), bỏ ribank.com.vn
+            if (
+                email_col is not None
+                and ci == email_col
+                and settings.ocr_sso_email_fixed_domain
+                and line_crops
+            ):
+                line_crops = line_crops[:1]
+            for li, line_crop in enumerate(line_crops):
+                crops.append(line_crop)
+                metas.append((ri, ci, x1, y1, x2, y2, li))
 
     if not crops:
         return []
 
     recognised = _recognize_lines(crops)
     min_conf = settings.ocr_confidence_threshold * 0.35
-    for (ri, ci, x1, y1, x2, y2), (text, conf) in zip(metas, recognised):
-        text = _normalize_cell_text(text)
+
+    grouped: dict[tuple[int, int], list[tuple[str, float, int, int, int, int, int]]] = (
+        defaultdict(list)
+    )
+    for meta, (text, conf) in zip(metas, recognised):
+        ri, ci, x1, y1, x2, y2, li = meta
+        grouped[(ri, ci)].append((text, conf, li, x1, y1, x2, y2))
+
+    cells: list[CellData] = []
+    for (ri, ci), parts in grouped.items():
+        parts.sort(key=lambda p: p[2])
+        x1, y1, x2, y2 = parts[0][3], parts[0][4], parts[0][5], parts[0][6]
+        line_texts: list[str] = []
+        confs: list[float] = []
+        for text, conf, _li, *_bbox in parts:
+            raw = text.strip()
+            if raw:
+                line_texts.append(raw)
+                confs.append(conf)
+        if email_col is not None and ci == email_col and settings.ocr_sso_email_fixed_domain:
+            text = _format_sso_email(_join_multiline_ocr_lines(line_texts))
+        else:
+            text = _normalize_cell_text(_join_multiline_ocr_lines(line_texts))
         if not text:
             continue
+        conf = float(np.mean(confs)) if confs else 0.0
         if conf < min_conf and _is_gibberish_text(text):
             continue
         cells.append(
@@ -1829,12 +2426,23 @@ def _prepare_sso_grid_draft(
         return None
 
     rows = _cluster_line_boxes_into_rows(line_boxes)
-    table_top = _find_table_top_y(image, rows)
-    if table_top is None:
-        table_top = int(image.shape[0] * 0.12)
+    header_y = _find_table_top_y(image, rows)
+    sso_header = header_y is not None
+    table_top = header_y if header_y is not None else int(image.shape[0] * 0.12)
 
     crop = image[table_top:, :]
-    grid = _detect_grid_line_positions(crop)
+    if settings.ocr_sso_enhance:
+        crop = deskew_image(crop)
+    if settings.ocr_sso_grid_relax and sso_header:
+        grid = _detect_grid_line_positions(
+            crop, min_rows=6, min_cols=5, col_min_gap=28
+        )
+    else:
+        grid = _detect_grid_line_positions(crop)
+    if grid is None and settings.ocr_sso_grid_relax:
+        grid = _detect_grid_line_positions(
+            crop, min_rows=5, min_cols=4, col_min_gap=22
+        )
     if grid is None:
         return None
 
@@ -1854,6 +2462,7 @@ def _recognize_sso_grid_draft(draft: SsoGridDraft) -> TableData | None:
     if len(cells) < 20:
         return None
 
+    cells = _offset_cells_bbox(cells, dy=draft.table_top, dx=0)
     cells = _postprocess_sso_cells(cells)
     if not cells:
         return None
@@ -2069,6 +2678,9 @@ def _postprocess_sso_cells(cells: list[CellData]) -> list[CellData]:
 
     cells = _merge_annotation_header_rows(cells)
     cells = _fix_cccd_email_columns(cells)
+    if settings.ocr_sso_enhance and settings.ocr_sso_row_merge:
+        cells = _merge_fragment_sso_rows(cells)
+    cells = _apply_fixed_email_domain(cells)
 
     by_row: dict[int, dict[int, CellData]] = defaultdict(dict)
     for c in cells:

@@ -50,6 +50,21 @@ class Settings(BaseSettings):
     ocr_save_every_n_pages: int = 1
     ocr_page_pipeline: bool = True
 
+    # --- SSO accuracy enhancements (Agribank form) ---
+    ocr_sso_enhance: bool = True
+    ocr_symbol_normalize: bool = True
+    ocr_sso_row_merge: bool = True
+    ocr_sso_grid_relax: bool = True
+    # Tách nhiều dòng chữ trong cùng một ô grid trước khi VietOCR
+    ocr_cell_multiline: bool = True
+    # Gộp band grid nội bộ ô (tắt mặc định — dễ nuốt nhiều dòng dữ liệu)
+    ocr_sso_collapse_row_bands: bool = False
+    # Email SSO luôn @agribank.com.vn — chỉ OCR phần username (nhanh hơn)
+    ocr_sso_email_fixed_domain: bool = True
+    ocr_sso_email_domain: str = "@agribank.com.vn"
+    # Cột email (0-based); -1 = tự đoán theo layout SSO (thường cột 5)
+    ocr_sso_email_col: int = -1
+
     # --- VietOCR / CPU tuning ---
     vietocr_batch_size: int = 32
     torch_num_threads: int = 4
@@ -92,8 +107,8 @@ class Settings(BaseSettings):
     # Map tiêu đề cột (Excel/OCR, chữ thường không dấu cách thừa) -> field Keycloak.
     # Định dạng: "field:alias1|alias2;field2:aliasA|aliasB"
     keycloak_header_map: str = (
-        "username:tên đăng nhập|tendangnhap|username|user|tài khoản|tai khoan;"
-        "email:email|thư điện tử|thu dien tu;"
+        "username:tên đăng nhập|tendangnhap|username|user|tài khoản|tai khoan|user ipcas|ipcas;"
+        "email:email|thư điện tử|thu dien tu|email agribank;"
         "name:họ tên|họ và tên|hoten|full name|fullname;"
         "first_name:tên|first name|firstname;"
         "last_name:họ|last name|lastname;"
