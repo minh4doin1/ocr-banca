@@ -10,6 +10,9 @@ from __future__ import annotations
 import logging
 import platform
 import shutil
+import subprocess
+import threading
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from pathlib import Path
 
 from PIL import Image
@@ -18,6 +21,10 @@ from pdf2image import convert_from_path
 from app.config import settings
 
 logger = logging.getLogger(__name__)
+
+# Poppler (pdftoppm) treo trên Windows khi chạy song song với Paddle GPU.
+_PDF_CONVERT_LOCK = threading.Lock()
+_convert_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="pdf-convert")
 
 
 def _configured_poppler_path() -> str:
@@ -90,6 +97,53 @@ def _poppler_convert_kwargs() -> dict:
     return {}
 
 
+def _kill_stuck_poppler_processes() -> None:
+    """Best-effort cleanup when pdftoppm hangs (Windows + concurrent GPU OCR)."""
+    if platform.system() == "Windows":
+        for name in ("pdftoppm.exe", "pdfinfo.exe"):
+            try:
+                subprocess.run(
+                    ["taskkill", "/F", "/IM", name],
+                    capture_output=True,
+                    timeout=5,
+                    check=False,
+                )
+            except Exception:
+                pass
+    else:
+        for name in ("pdftoppm", "pdfinfo"):
+            found = shutil.which(name)
+            if found:
+                try:
+                    subprocess.run(
+                        ["pkill", "-f", name],
+                        capture_output=True,
+                        timeout=5,
+                        check=False,
+                    )
+                except Exception:
+                    pass
+
+
+def _run_poppler_with_timeout(fn, *, action: str):
+    """Serialize Poppler calls and abort if pdftoppm hangs."""
+    timeout = max(30, settings.pdf_convert_timeout_seconds)
+
+    def _wrapped():
+        with _PDF_CONVERT_LOCK:
+            return fn()
+
+    future = _convert_pool.submit(_wrapped)
+    try:
+        return future.result(timeout=timeout)
+    except FuturesTimeoutError as exc:
+        _kill_stuck_poppler_processes()
+        raise RuntimeError(
+            f"Poppler timeout sau {timeout}s khi {action}. "
+            "Thử giảm PDF_DPI hoặc tắt prefetch."
+        ) from exc
+
+
 def check_poppler_available() -> tuple[bool, str]:
     """Verify Poppler binaries are reachable (for health checks)."""
     poppler_path = _get_poppler_path()
@@ -155,13 +209,16 @@ def convert_pdf_to_images(
     logger.info("Using Poppler: %s", poppler_info)
 
     try:
-        # Convert all pages
-        pages: list[Image.Image] = convert_from_path(
-            str(pdf_path),
-            dpi=dpi,
-            fmt="png",
-            thread_count=2,
-            **_poppler_convert_kwargs(),
+        # Convert all pages (serialized — tránh treo pdftoppm trên Windows)
+        pages: list[Image.Image] = _run_poppler_with_timeout(
+            lambda: convert_from_path(
+                str(pdf_path),
+                dpi=dpi,
+                fmt="png",
+                thread_count=1,
+                **_poppler_convert_kwargs(),
+            ),
+            action=f"convert toàn bộ {pdf_path.name}",
         )
 
         image_paths: list[Path] = []
@@ -182,6 +239,52 @@ def convert_pdf_to_images(
             f"Failed to convert PDF to images: {e}. "
             "Make sure Poppler is installed (poppler-utils)."
         ) from e
+
+
+def convert_pdf_page(
+    pdf_path: str | Path,
+    job_id: str,
+    page_number: int,
+    dpi: int | None = None,
+) -> Path:
+    """
+    Convert a single PDF page to PNG (lazy pipeline — OCR trang 1 nhanh hơn).
+    """
+    pdf_path = Path(pdf_path)
+    if page_number < 1:
+        raise ValueError("page_number must be >= 1")
+
+    if dpi is None:
+        dpi = settings.pdf_dpi
+
+    output_dir = settings.images_path / job_id
+    output_dir.mkdir(parents=True, exist_ok=True)
+    image_path = output_dir / f"page_{page_number:03d}.png"
+    if image_path.exists() and image_path.stat().st_size > 0:
+        return image_path
+
+    ok, poppler_info = check_poppler_available()
+    if not ok:
+        raise RuntimeError(f"{poppler_info}")
+
+    pages = _run_poppler_with_timeout(
+        lambda: convert_from_path(
+            str(pdf_path),
+            dpi=dpi,
+            fmt="png",
+            first_page=page_number,
+            last_page=page_number,
+            thread_count=1,
+            **_poppler_convert_kwargs(),
+        ),
+        action=f"convert trang {page_number} của {pdf_path.name}",
+    )
+    if not pages:
+        raise RuntimeError(f"Không convert được trang {page_number} của PDF")
+
+    pages[0].save(str(image_path), "PNG", optimize=True)
+    logger.debug("Saved page %d → %s (Poppler: %s)", page_number, image_path.name, poppler_info)
+    return image_path
 
 
 def get_page_count(pdf_path: str | Path) -> int:

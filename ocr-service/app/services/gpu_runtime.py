@@ -14,10 +14,15 @@ import os
 import platform
 import shutil
 import subprocess
+import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+_GPU_INFERENCE_LOCK = threading.Lock()
+_ACTIVE_OCR_JOBS = 0
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _BIN_CUDA = _PROJECT_ROOT / "bin" / "cuda"
@@ -46,6 +51,11 @@ class GpuRuntimeStatus:
             "paddle_gpu_ok": self.paddle_gpu_ok,
             "detail": self.detail,
         }
+
+
+_PROBE_CACHE: GpuRuntimeStatus | None = None
+_PROBE_CACHE_AT: float = 0.0
+_PROBE_TTL_SECONDS = 60.0
 
 
 def _prepend_path(*dirs: str) -> None:
@@ -178,8 +188,48 @@ def setup_gpu_path() -> list[str]:
     return unique
 
 
-def probe_gpu_runtime() -> GpuRuntimeStatus:
-    """Full GPU readiness check (safe to call from /health)."""
+def gpu_inference_lock():
+    """Serialize Paddle GPU calls (health probe vs OCR job)."""
+    return _GPU_INFERENCE_LOCK
+
+
+def begin_ocr_job() -> None:
+    global _ACTIVE_OCR_JOBS
+    with _GPU_INFERENCE_LOCK:
+        _ACTIVE_OCR_JOBS += 1
+
+
+def end_ocr_job() -> None:
+    global _ACTIVE_OCR_JOBS
+    with _GPU_INFERENCE_LOCK:
+        _ACTIVE_OCR_JOBS = max(0, _ACTIVE_OCR_JOBS - 1)
+
+
+def probe_gpu_runtime(*, force: bool = False) -> GpuRuntimeStatus:
+    """Full GPU readiness check (safe to call from /health). Cached ~60s."""
+    global _PROBE_CACHE, _PROBE_CACHE_AT
+
+    now = time.monotonic()
+    if (
+        not force
+        and _PROBE_CACHE is not None
+        and (now - _PROBE_CACHE_AT) < _PROBE_TTL_SECONDS
+    ):
+        return _PROBE_CACHE
+
+    # Tránh probe GPU song song khi đang OCR (gây PreconditionNotMet trên Windows).
+    if not force and _ACTIVE_OCR_JOBS > 0 and _PROBE_CACHE is not None:
+        return _PROBE_CACHE
+
+    with _GPU_INFERENCE_LOCK:
+        status = _probe_gpu_runtime_uncached()
+        _PROBE_CACHE = status
+        _PROBE_CACHE_AT = time.monotonic()
+        return status
+
+
+def _probe_gpu_runtime_uncached() -> GpuRuntimeStatus:
+    """Run GPU probe without cache."""
     status = GpuRuntimeStatus(cuda_paths_added=[])
     detected, name, cuda_ver = _nvidia_smi_info()
     status.nvidia_detected = detected

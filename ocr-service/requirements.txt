@@ -6,13 +6,13 @@ pydantic>=2.7.0
 pydantic-settings>=2.3.0
 
 # OCR Engine
-paddlepaddle-gpu>=2.6.2
+paddlepaddle-gpu>=2.6.2; platform_system == "Linux"
+paddlepaddle>=2.6.2; platform_system == "Windows"
 paddleocr>=2.9.1,<3.0.0
 vietocr>=0.3.5
-# VietOCR cần PyTorch. QUAN TRỌNG: dùng bản CPU để tránh xung đột CUDA/pybind
-# với paddlepaddle-gpu trong cùng process (Paddle chạy GPU, VietOCR chạy CPU):
-#   pip install torch==2.4.1+cpu torchvision==0.19.1+cpu \
-#       --index-url https://download.pytorch.org/whl/cpu
+# VietOCR cần PyTorch CPU (tránh xung đột CUDA với paddlepaddle-gpu):
+#   pip install torch==2.4.1+cpu torchvision==0.19.1+cpu --index-url https://download.pytorch.org/whl/cpu
+# Hoặc chạy: ocr-service/scripts/setup_gpu_windows.ps1
 
 # PDF Processing
 pdf2image>=1.17.0

@@ -12,6 +12,7 @@ class JobStatus(str, enum.Enum):
     """OCR job processing status."""
 
     PENDING = "pending"
+    QUEUED = "queued"
     PROCESSING = "processing"
     COMPLETED = "completed"
     FAILED = "failed"
@@ -151,6 +152,7 @@ class JobInfo(BaseModel):
     page_statuses: list[PageStatusInfo] = Field(default_factory=list)
     logs: list[JobLogEntry] = Field(default_factory=list)
     error_message: str = ""
+    queue_position: int = 0
     created_at: datetime = Field(default_factory=datetime.now)
     updated_at: datetime = Field(default_factory=datetime.now)
 
@@ -165,6 +167,7 @@ class UploadResponse(BaseModel):
     use_gpu: bool = False
     remote_provider: RemoteProvider | None = None
     remote_url: str = ""
+    queue_position: int = 0
     message: str = "PDF uploaded successfully. Processing started."
 
 

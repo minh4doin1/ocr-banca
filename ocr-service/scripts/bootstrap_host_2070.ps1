@@ -77,7 +77,7 @@ if (!(Test-Path $envFile)) {
 Ensure-EnvLine $envFile "HOST" $Host
 Ensure-EnvLine $envFile "PORT" "$Port"
 Ensure-EnvLine $envFile "PADDLE_USE_GPU" "true"
-Ensure-EnvLine $envFile "INTERNAL_GPU_URL" ""
+Ensure-EnvLine $envFile "INTERNAL_GPU_URL" "http://127.0.0.1:$Port"
 Ensure-EnvLine $envFile "INTERNAL_GPU_TOKEN" ""
 Ensure-EnvLine $envFile "REMOTE_WORKER_TOKEN" $WorkerToken
 Ensure-EnvLine $envFile "REMOTE_POLL_INTERVAL_SECONDS" "1.5"

@@ -8,6 +8,8 @@ table data from PDF files for the Banca user batch creation system.
 from __future__ import annotations
 
 import logging
+import os
+import threading
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -66,6 +68,18 @@ from fastapi.staticfiles import StaticFiles
 app.include_router(ocr_router)
 
 
+def _vietocr_gpu_health() -> bool:
+    if not settings.vietocr_gpu_subprocess or not settings.paddle_use_gpu:
+        return False
+    try:
+        from app.services.vietocr_gpu_client import get_vietocr_gpu_client
+
+        client = get_vietocr_gpu_client(auto_start=False)
+        return client is not None and client.is_ready
+    except Exception:
+        return False
+
+
 @app.get("/health", tags=["Health"])
 async def health_check():
     """Detailed health check."""
@@ -74,7 +88,7 @@ async def health_check():
     healthy = poppler_ok and (
         not settings.paddle_use_gpu or gpu_status.paddle_gpu_ok
     )
-    return {
+    payload = {
         "status": "healthy" if healthy else "degraded",
         "poppler_ok": poppler_ok,
         "poppler": poppler_info,
@@ -85,10 +99,21 @@ async def health_check():
         "confidence_threshold": settings.ocr_confidence_threshold,
         "gpu_enabled": settings.paddle_use_gpu,
         "gpu_available": gpu_status.paddle_gpu_ok,
-        "internal_gpu_configured": bool(settings.internal_gpu_url.strip()),
+        "vietocr_gpu_subprocess": settings.vietocr_gpu_subprocess,
+        "vietocr_gpu_ready": _vietocr_gpu_health(),
+        "internal_gpu_configured": bool(
+            settings.resolve_internal_gpu_url(local_gpu_ok=gpu_status.paddle_gpu_ok)
+        ),
         "worker_token_required": bool(settings.remote_worker_token.strip()),
         "role": "worker" if settings.paddle_use_gpu else "client-or-cpu",
     }
+    try:
+        from app.services.job_queue import get_job_queue
+
+        payload["ocr_queue"] = get_job_queue().stats()
+    except Exception:
+        payload["ocr_queue"] = {"queue_depth": 0}
+    return payload
 
 
 # Mount standalone frontend static files at root
@@ -108,6 +133,9 @@ else:
 @app.on_event("startup")
 async def startup_event():
     """Application startup: ensure storage directories exist."""
+    from app.routers.ocr import init_ocr_worker
+    from app.services.ocr_service import warmup_ocr_engines
+
     logger.info("=" * 60)
     logger.info("Banca OCR Service starting up")
     logger.info("Engine: %s", settings.ocr_engine)
@@ -117,7 +145,12 @@ async def startup_event():
         logger.info("GPU card: %s | Paddle GPU OK: %s", gpu.gpu_name, gpu.paddle_gpu_ok)
         if settings.paddle_use_gpu and not gpu.paddle_gpu_ok:
             logger.warning("PADDLE_USE_GPU=true nhưng GPU chưa sẵn sàng: %s", gpu.detail)
-    logger.info("DPI: %d", settings.pdf_dpi)
+    logger.info("DPI: %d (lazy=%s)", settings.pdf_dpi, settings.pdf_lazy_convert)
+    logger.info(
+        "Queue: max=%d workers=%d",
+        settings.ocr_queue_max_size,
+        settings.ocr_worker_threads,
+    )
     logger.info("Storage: %s", settings.storage_path)
     logger.info("CORS: %s", settings.cors_origins_list)
     logger.info("=" * 60)
@@ -128,8 +161,20 @@ async def startup_event():
     _ = settings.export_path
     _ = settings.images_path
 
+    init_ocr_worker()
+
+    if settings.ocr_warmup_on_startup:
+        threading.Thread(
+            target=warmup_ocr_engines,
+            name="ocr-warmup",
+            daemon=True,
+        ).start()
+
 
 @app.on_event("shutdown")
 async def shutdown_event():
     """Application shutdown."""
+    from app.services.vietocr_gpu_client import shutdown_vietocr_gpu_client
+
+    shutdown_vietocr_gpu_client()
     logger.info("Banca OCR Service shutting down")

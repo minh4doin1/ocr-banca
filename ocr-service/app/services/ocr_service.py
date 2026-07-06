@@ -13,6 +13,7 @@ import inspect
 import logging
 import os
 import threading
+from dataclasses import dataclass
 from pathlib import Path
 
 import cv2
@@ -35,7 +36,7 @@ if _sys.platform == "win32":
 
 from app.config import settings
 from app.models.schemas import CellData, PageResult, TableData
-from app.services.gpu_runtime import setup_gpu_path
+from app.services.gpu_runtime import setup_gpu_path, gpu_inference_lock
 from app.utils.image_utils import deskew_image, pil_to_cv2, preprocess_for_ocr
 
 logger = logging.getLogger(__name__)
@@ -47,6 +48,8 @@ logger = logging.getLogger(__name__)
 # the GPU before Paddle is imported guarantees a stable CPU pipeline.
 # ──────────────────────────────────────────────────────────────
 _paddle_imported = False
+_pp_structure_unavailable = False
+_pp_structure_disable_reason = ""
 
 
 def _hide_gpu_from_paddle() -> None:
@@ -69,17 +72,39 @@ _paddle_ocr_fallback = None
 _vietocr_predictor = None
 _vietocr_config = None
 _vietocr_disabled = False
+_vietocr_lock = threading.Lock()
 _force_cpu = False
 _loaded_use_gpu: bool | None = None
 _device_local = threading.local()
 
 
 def _get_effective_use_gpu() -> bool:
-    """Resolve GPU flag: thread override → global settings."""
+    """Resolve GPU flag: force CPU → thread override → global settings."""
+    if _force_cpu:
+        return False
     override = getattr(_device_local, "use_gpu", None)
     if override is not None:
         return override
     return settings.paddle_use_gpu
+
+
+def _is_pp_structure_broken(error: Exception) -> bool:
+    """True when PP-Structure table model cannot load/run (Paddle 2.6 Windows bug)."""
+    text = str(error).lower()
+    return "preconditionnotmet" in text or "operator < scale >" in text
+
+
+def _disable_pp_structure(reason: Exception | str) -> None:
+    """Switch pipeline to PaddleOCR full-page fallback (stable on this host)."""
+    global _pp_structure_unavailable, _pp_structure_disable_reason, _paddle_engine
+
+    _pp_structure_unavailable = True
+    _pp_structure_disable_reason = str(reason)[:200]
+    _paddle_engine = None
+    logger.warning(
+        "PP-Structure không khả dụng (%s) — dùng PaddleOCR full-page fallback.",
+        _pp_structure_disable_reason,
+    )
 
 
 def configure_ocr_device(use_gpu: bool) -> None:
@@ -137,6 +162,8 @@ def _should_fallback_to_cpu(error: Exception) -> bool:
         "memory's size is 0",
         "tensor's dimension",
         "out of bound",
+        "operator < scale >",
+        "dense_tensor",
         "dynamic library",
         "cuda",
         "gpu",
@@ -178,6 +205,13 @@ def _activate_cpu_fallback(reason: Exception | str) -> None:
 
     logger.warning("GPU OCR failed (%s). Falling back to CPU.", reason)
     os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+    os.environ["FLAGS_use_cuda"] = "false"
+    try:
+        import paddle
+
+        paddle.device.set_device("cpu")
+    except Exception:
+        pass
     _force_cpu = True
     _paddle_engine = None
     _paddle_ocr_fallback = None
@@ -208,7 +242,9 @@ def _init_with_supported_kwargs(cls, kwargs: dict):
 
 def _get_paddle_engine():
     """Lazily initialise PP-Structure engine (v2/v3 compatible)."""
-    global _paddle_engine, _force_cpu, _paddle_imported
+    global _paddle_engine, _force_cpu, _paddle_imported, _pp_structure_unavailable
+    if _pp_structure_unavailable:
+        return None
     if _paddle_engine is None:
         logger.info("Loading PaddleOCR PP-Structure engine …")
         _paddle_imported = True
@@ -247,14 +283,25 @@ def _get_paddle_engine():
         try:
             _paddle_engine = _init_with_supported_kwargs(PPStructureClass, kwargs)
         except Exception as e:
+            if _is_pp_structure_broken(e):
+                _disable_pp_structure(e)
+                return None
             if _get_effective_use_gpu() and _should_fallback_to_cpu(e):
                 _activate_cpu_fallback(e)
-                kwargs["device"] = "cpu"
+                if is_v3:
+                    kwargs["device"] = "cpu"
                 kwargs["use_gpu"] = False
-                _paddle_engine = _init_with_supported_kwargs(PPStructureClass, kwargs)
+                try:
+                    _paddle_engine = _init_with_supported_kwargs(PPStructureClass, kwargs)
+                except Exception as e2:
+                    if _is_pp_structure_broken(e2):
+                        _disable_pp_structure(e2)
+                        return None
+                    raise
             else:
                 raise
-        logger.info("PaddleOCR engine loaded successfully")
+        if _paddle_engine is not None:
+            logger.info("PaddleOCR PP-Structure engine loaded successfully")
     return _paddle_engine
 
 
@@ -290,18 +337,19 @@ def _get_paddle_ocr_fallback():
 
 def _run_pp_structure(engine, img_cv2: np.ndarray):
     """Run PP-Structure predict/infer on one page image."""
-    if hasattr(engine, "predict"):
-        return engine.predict(
-            img_cv2,
-            use_doc_orientation_classify=False,
-            use_doc_unwarping=False,
-            use_textline_orientation=False,
-            use_seal_recognition=False,
-            use_formula_recognition=False,
-            use_chart_recognition=False,
-            use_region_detection=False,
-        )
-    return engine(img_cv2)
+    with gpu_inference_lock():
+        if hasattr(engine, "predict"):
+            return engine.predict(
+                img_cv2,
+                use_doc_orientation_classify=False,
+                use_doc_unwarping=False,
+                use_textline_orientation=False,
+                use_seal_recognition=False,
+                use_formula_recognition=False,
+                use_chart_recognition=False,
+                use_region_detection=False,
+            )
+        return engine(img_cv2)
 
 
 def _result_to_dict(result) -> dict:
@@ -327,9 +375,9 @@ def _get_vietocr_predictor():
             from vietocr.tool.config import Cfg
             from vietocr.tool.predictor import Predictor
 
-            # Use CUDA only if both requested AND torch actually sees a GPU.
+            # Windows: VietOCR luôn CPU (tránh xung đột CUDA với paddlepaddle-gpu).
             device = "cpu"
-            if _get_effective_use_gpu():
+            if _sys.platform != "win32" and _get_effective_use_gpu():
                 try:
                     import torch
 
@@ -344,6 +392,7 @@ def _get_vietocr_predictor():
             config["predictor"]["beamsearch"] = False  # greedy is faster
 
             _vietocr_config = config
+            _configure_torch_threads()
             _vietocr_predictor = Predictor(config)
             logger.info("VietOCR model loaded successfully (device=%s)", device)
         except Exception as e:
@@ -360,6 +409,36 @@ def _get_vietocr_predictor():
 # ──────────────────────────────────────────────────────────────
 
 
+def warmup_ocr_engines() -> None:
+    """Preload Paddle + VietOCR — tránh job đầu tiên chờ 30–60s load model."""
+    use_gpu = settings.paddle_use_gpu
+    logger.info("Warming up OCR engines (gpu=%s)…", use_gpu)
+    try:
+        configure_ocr_device(use_gpu)
+        engine = _get_paddle_engine()
+        if engine is None:
+            logger.info(
+                "PP-Structure skipped (%s) — warming PaddleOCR fallback only",
+                _pp_structure_disable_reason or "unavailable",
+            )
+        _get_paddle_ocr_fallback()
+        if settings.vietocr_gpu_subprocess and settings.paddle_use_gpu:
+            from app.services.vietocr_gpu_client import warmup_vietocr_gpu_worker
+
+            if warmup_vietocr_gpu_worker():
+                logger.info("VietOCR GPU subprocess warmup OK")
+            else:
+                logger.warning(
+                    "VietOCR GPU subprocess không khởi động — dùng CPU in-process"
+                )
+                _get_vietocr_predictor()
+        else:
+            _get_vietocr_predictor()
+        logger.info("OCR engine warmup complete")
+    except Exception as exc:
+        logger.warning("OCR warmup failed — models will load on first job: %s", exc)
+
+
 def process_page(
     image_path: str | Path,
     page_number: int,
@@ -373,18 +452,37 @@ def process_page(
       image → (optional) preprocess → PaddleOCR PP-Structure
         → for each table region → extract cells → VietOCR re-recognize
         → PageResult
-
-    Args:
-        image_path: Path to the page image (PNG)
-        page_number: 1-based page number
-        enable_preprocessing: Whether to preprocess (deskew, denoise)
-
-    Returns:
-        PageResult with extracted tables
     """
-    image_path = Path(image_path)
     if use_gpu is not None:
         configure_ocr_device(use_gpu)
+
+    want_gpu = use_gpu if use_gpu is not None else _get_effective_use_gpu()
+    try:
+        return _process_page_impl(
+            image_path, page_number, enable_preprocessing=enable_preprocessing
+        )
+    except Exception as exc:
+        if want_gpu and not _force_cpu and _should_fallback_to_cpu(exc):
+            logger.warning(
+                "Page %d GPU OCR failed (%s) — retrying entire page on CPU",
+                page_number,
+                exc,
+            )
+            _activate_cpu_fallback(exc)
+            configure_ocr_device(False)
+            return _process_page_impl(
+                image_path, page_number, enable_preprocessing=enable_preprocessing
+            )
+        raise
+
+
+def _process_page_impl(
+    image_path: str | Path,
+    page_number: int,
+    enable_preprocessing: bool = True,
+) -> PageResult:
+    """Internal page OCR (device already configured via configure_ocr_device)."""
+    image_path = Path(image_path)
     logger.info("Processing page %d: %s", page_number, image_path.name)
 
     # Load image
@@ -396,15 +494,24 @@ def process_page(
     if enable_preprocessing:
         img_cv2 = deskew_image(img_cv2)
 
-    # ── Step 1: PaddleOCR PP-StructureV3 ──
-    try:
-        predictions = _run_pp_structure(_get_paddle_engine(), img_cv2)
-    except Exception as e:
-        if _get_effective_use_gpu() and not _force_cpu and _should_fallback_to_cpu(e):
-            _activate_cpu_fallback(e)
-            predictions = _run_pp_structure(_get_paddle_engine(), img_cv2)
-        else:
-            raise
+    # ── Step 1: PaddleOCR PP-Structure (or full-page fallback) ──
+    predictions = None
+    if not _pp_structure_unavailable:
+        try:
+            engine = _get_paddle_engine()
+            if engine is not None:
+                predictions = _run_pp_structure(engine, img_cv2)
+        except Exception as e:
+            if _is_pp_structure_broken(e):
+                _disable_pp_structure(e)
+            elif _get_effective_use_gpu() and not _force_cpu and _should_fallback_to_cpu(e):
+                _activate_cpu_fallback(e)
+                configure_ocr_device(False)
+                engine = _get_paddle_engine()
+                if engine is not None:
+                    predictions = _run_pp_structure(engine, img_cv2)
+            else:
+                raise
 
     tables: list[TableData] = []
     raw_texts: list[str] = []
@@ -461,7 +568,13 @@ def process_page(
 
     # If no tables detected by PP-Structure, try full-page OCR
     if not tables:
-        logger.info("No table detected on page %d, trying full-page OCR", page_number)
+        if _pp_structure_unavailable:
+            logger.info(
+                "Page %d: PP-Structure off — full-page PaddleOCR pipeline",
+                page_number,
+            )
+        else:
+            logger.info("No table detected on page %d, trying full-page OCR", page_number)
         table_data = _fallback_full_page_ocr(img_cv2, page_number)
         if table_data is not None:
             tables.append(table_data)
@@ -723,32 +836,33 @@ def _detect_lines_in_region(crop: np.ndarray) -> list[tuple[int, int, int, int]]
     boxes: list[tuple[int, int, int, int]] = []
 
     try:
-        if hasattr(ocr, "predict"):
-            predictions = ocr.predict(crop)
-            if predictions:
-                r = _result_to_dict(predictions[0])
-                polys = r.get("rec_polys", r.get("dt_polys", []))
-                for poly in polys:
-                    xyxy = _poly_to_xyxy(poly)
-                    if xyxy:
-                        boxes.append(tuple(int(v) for v in xyxy))
-        else:
-            # Detection only (rec=False) — VietOCR handles the actual text, so
-            # skipping PaddleOCR recognition here saves a full pass per page.
-            rec_off = True
-            try:
-                result = ocr.ocr(crop, det=True, rec=False, cls=False)
-            except Exception:  # noqa: BLE001 - older API without rec kw
-                rec_off = False
-                result = ocr.ocr(crop, cls=False)
-            if result and result[0]:
-                for line in result[0]:
-                    # rec=False -> line is a polygon (4 points);
-                    # rec=True  -> line is [polygon, (text, score)].
-                    poly = line if rec_off else line[0]
-                    xyxy = _poly_to_xyxy(poly)
-                    if xyxy:
-                        boxes.append(tuple(int(v) for v in xyxy))
+        with gpu_inference_lock():
+            if hasattr(ocr, "predict"):
+                predictions = ocr.predict(crop)
+                if predictions:
+                    r = _result_to_dict(predictions[0])
+                    polys = r.get("rec_polys", r.get("dt_polys", []))
+                    for poly in polys:
+                        xyxy = _poly_to_xyxy(poly)
+                        if xyxy:
+                            boxes.append(tuple(int(v) for v in xyxy))
+            else:
+                # Detection only (rec=False) — VietOCR handles the actual text, so
+                # skipping PaddleOCR recognition here saves a full pass per page.
+                rec_off = True
+                try:
+                    result = ocr.ocr(crop, det=True, rec=False, cls=False)
+                except Exception:  # noqa: BLE001 - older API without rec kw
+                    rec_off = False
+                    result = ocr.ocr(crop, cls=False)
+                if result and result[0]:
+                    for line in result[0]:
+                        # rec=False -> line is a polygon (4 points);
+                        # rec=True  -> line is [polygon, (text, score)].
+                        poly = line if rec_off else line[0]
+                        xyxy = _poly_to_xyxy(poly)
+                        if xyxy:
+                            boxes.append(tuple(int(v) for v in xyxy))
     except Exception as exc:
         if _get_effective_use_gpu() and not _force_cpu and _should_fallback_to_cpu(exc):
             _activate_cpu_fallback(exc)
@@ -762,6 +876,9 @@ def _reconstruct_table_from_lines(
     table_bbox: list[int],
     cell_bbox: list,
     html_str: str,
+    *,
+    col_bounds_override: list[tuple[float, float]] | None = None,
+    line_boxes_override: list[tuple[int, int, int, int]] | None = None,
 ) -> list[CellData]:
     """
     Rebuild a table grid from individually detected text lines.
@@ -778,19 +895,23 @@ def _reconstruct_table_from_lines(
     if crop.size == 0:
         return []
 
-    # Number of columns from the widest HTML row.
-    num_cols = 0
-    if html_str:
-        for row_html in re.findall(r"<tr>(.*?)</tr>", html_str, re.DOTALL):
-            num_cols = max(num_cols, len(re.findall(r"<td", row_html)))
-    if num_cols <= 1:
-        return []
+    if col_bounds_override is not None:
+        col_bounds = col_bounds_override
+    else:
+        num_cols = 0
+        if html_str:
+            for row_html in re.findall(r"<tr>(.*?)</tr>", html_str, re.DOTALL):
+                num_cols = max(num_cols, len(re.findall(r"<td", row_html)))
+        if num_cols <= 1:
+            return []
+        col_bounds = _derive_column_bounds(cell_bbox, num_cols)
+        if not col_bounds:
+            return []
 
-    col_bounds = _derive_column_bounds(cell_bbox, num_cols)
-    if not col_bounds:
-        return []
-
-    line_boxes = _detect_lines_in_region(crop)
+    if line_boxes_override is not None:
+        line_boxes = line_boxes_override
+    else:
+        line_boxes = _detect_lines_in_region(crop)
     if not line_boxes:
         return []
 
@@ -1188,20 +1309,44 @@ def _recognize_lines(crops: list[np.ndarray]) -> list[tuple[str, float]]:
     """
     Recognise many line crops at once.
 
-    Uses VietOCR's batched predictor when available (much faster on CPU),
-    falling back to per-line recognition otherwise.
+    Uses VietOCR GPU subprocess when available, else in-process batch/line.
     """
     if not crops:
         return []
 
+    batch_size = max(1, settings.vietocr_batch_size)
+
+    if settings.vietocr_gpu_subprocess and settings.paddle_use_gpu:
+        try:
+            from app.services.vietocr_gpu_client import get_vietocr_gpu_client
+
+            gpu_client = get_vietocr_gpu_client(auto_start=True)
+            if gpu_client is not None:
+                results: list[tuple[str, float]] = []
+                with _vietocr_lock:
+                    for start in range(0, len(crops), batch_size):
+                        chunk = crops[start : start + batch_size]
+                        results.extend(gpu_client.predict_batch(chunk))
+                return results
+        except Exception as e:  # noqa: BLE001
+            logger.warning("VietOCR GPU subprocess failed (%s); fallback CPU.", e)
+
     predictor = _get_vietocr_predictor()
+    batch_size = max(1, settings.vietocr_batch_size)
     if predictor is not None and hasattr(predictor, "predict_batch"):
         try:
             pil_imgs = [
                 Image.fromarray(cv2.cvtColor(c, cv2.COLOR_BGR2RGB)) for c in crops
             ]
-            texts = predictor.predict_batch(pil_imgs)
-            return [(t.strip(), _estimate_confidence(t)) for t in texts]
+            results: list[tuple[str, float]] = []
+            with _vietocr_lock:
+                for start in range(0, len(pil_imgs), batch_size):
+                    chunk = pil_imgs[start : start + batch_size]
+                    texts = predictor.predict_batch(chunk)
+                    results.extend(
+                        (t.strip(), _estimate_confidence(t)) for t in texts
+                    )
+            return results
         except Exception as e:  # noqa: BLE001
             logger.warning("VietOCR batch failed (%s); using per-line.", e)
 
@@ -1227,7 +1372,8 @@ def _recognize_with_vietocr(cell_image: np.ndarray) -> tuple[str, float]:
         pil_img = Image.fromarray(cv2.cvtColor(cell_image, cv2.COLOR_BGR2RGB))
 
         # Predict
-        text = predictor.predict(pil_img)
+        with _vietocr_lock:
+            text = predictor.predict(pil_img)
         # VietOCR doesn't return confidence directly in simple mode
         # We estimate based on text length and character validity
         confidence = _estimate_confidence(text)
@@ -1253,31 +1399,32 @@ def _recognize_with_paddle_cell(cell_image: np.ndarray) -> tuple[str, float]:
 def _run_paddle_cell_ocr(cell_image: np.ndarray) -> tuple[str, float]:
     """Run PaddleOCR on a single cell image."""
     ocr = _get_paddle_ocr_fallback()
-    if hasattr(ocr, "predict"):
-        predictions = ocr.predict(cell_image)
-        if not predictions:
-            return "", 0.0
-        ocr_res = _result_to_dict(predictions[0])
-        rec_texts = ocr_res.get("rec_texts", [])
-        rec_scores = ocr_res.get("rec_scores", [])
-        text = " ".join(str(t).strip() for t in rec_texts if str(t).strip())
-        score = float(np.mean(rec_scores)) if rec_scores else _estimate_confidence(text)
-        return text, score
+    with gpu_inference_lock():
+        if hasattr(ocr, "predict"):
+            predictions = ocr.predict(cell_image)
+            if not predictions:
+                return "", 0.0
+            ocr_res = _result_to_dict(predictions[0])
+            rec_texts = ocr_res.get("rec_texts", [])
+            rec_scores = ocr_res.get("rec_scores", [])
+            text = " ".join(str(t).strip() for t in rec_texts if str(t).strip())
+            score = float(np.mean(rec_scores)) if rec_scores else _estimate_confidence(text)
+            return text, score
 
-    result = ocr.ocr(cell_image, cls=True)
-    if not result or not result[0]:
-        return "", 0.0
-    texts: list[str] = []
-    scores: list[float] = []
-    for line in result[0]:
-        text_info = line[1]
-        if text_info:
-            texts.append(str(text_info[0]))
-            if len(text_info) > 1:
-                scores.append(float(text_info[1]))
-    text = " ".join(t.strip() for t in texts if t.strip())
-    score = float(np.mean(scores)) if scores else _estimate_confidence(text)
-    return text, score
+        result = ocr.ocr(cell_image, cls=True)
+        if not result or not result[0]:
+            return "", 0.0
+        texts: list[str] = []
+        scores: list[float] = []
+        for line in result[0]:
+            text_info = line[1]
+            if text_info:
+                texts.append(str(text_info[0]))
+                if len(text_info) > 1:
+                    scores.append(float(text_info[1]))
+        text = " ".join(t.strip() for t in texts if t.strip())
+        score = float(np.mean(scores)) if scores else _estimate_confidence(text)
+        return text, score
 
 
 def _estimate_confidence(text: str) -> float:
@@ -1349,83 +1496,793 @@ def _parse_html_table(html: str) -> list[CellData]:
     return cells
 
 
+def _normalize_match_text(text: str) -> str:
+    """Lowercase ASCII-ish form for fuzzy header matching."""
+    import unicodedata
+
+    t = unicodedata.normalize("NFD", text.lower())
+    t = "".join(c for c in t if unicodedata.category(c) != "Mn")
+    return t.replace(" ", "")
+
+
+_SSO_HEADER_KEYWORDS = (
+    "stt",
+    "hovaten",
+    "hoten",
+    "phong",
+    "donvi",
+    "ipcas",
+    "cccd",
+    "email",
+    "sdt",
+    "phanquyen",
+    "ghichu",
+)
+
+
+def _cluster_line_boxes_into_rows(
+    boxes: list[tuple[int, int, int, int]],
+    gap_ratio: float = 0.65,
+) -> list[list[tuple[int, int, int, int]]]:
+    """Group detection boxes into horizontal rows by y-centre proximity."""
+    if not boxes:
+        return []
+    ordered = sorted(boxes, key=lambda b: (b[1] + b[3]) / 2)
+    heights = [b[3] - b[1] for b in ordered]
+    med_h = float(np.median(heights)) if heights else 20.0
+    gap = max(med_h * gap_ratio, 12.0)
+
+    rows: list[list[tuple[int, int, int, int]]] = [[ordered[0]]]
+    for box in ordered[1:]:
+        cy = (box[1] + box[3]) / 2
+        row_cy = float(np.mean([(b[1] + b[3]) / 2 for b in rows[-1]]))
+        if abs(cy - row_cy) <= gap:
+            rows[-1].append(box)
+        else:
+            rows.append([box])
+    return rows
+
+
+def _column_bounds_from_row_boxes(
+    row: list[tuple[int, int, int, int]],
+) -> list[tuple[float, float]]:
+    """Derive column x-ranges from a header row's detection boxes."""
+    header = sorted(row, key=lambda b: b[0])
+    bounds: list[tuple[float, float]] = []
+    for i, b in enumerate(header):
+        left = b[0] if i == 0 else (header[i - 1][2] + b[0]) / 2
+        right = b[2] if i == len(header) - 1 else (b[2] + header[i + 1][0]) / 2
+        bounds.append((left, right))
+    return bounds
+
+
+def _crop_line_boxes(image: np.ndarray, boxes: list[tuple[int, int, int, int]]) -> list[np.ndarray]:
+    """Crop each line box from the image (with small padding)."""
+    h, w = image.shape[:2]
+    crops: list[np.ndarray] = []
+    for x1, y1, x2, y2 in boxes:
+        pad = 2
+        cy1 = max(0, y1 - pad)
+        cy2 = min(h, y2 + pad)
+        cx1 = max(0, x1 - pad)
+        cx2 = min(w, x2 + pad)
+        crop = image[cy1:cy2, cx1:cx2]
+        if crop.size:
+            crops.append(crop)
+    return crops
+
+
+def _recognize_row_boxes(
+    image: np.ndarray, row: list[tuple[int, int, int, int]]
+) -> list[str]:
+    """VietOCR each box in a row (left → right)."""
+    boxes = sorted(row, key=lambda b: b[0])
+    crops = _crop_line_boxes(image, boxes)
+    if not crops:
+        return []
+    return [t for t, _ in _recognize_lines(crops)]
+
+
+def _score_sso_header_row(texts: list[str]) -> int:
+    """Count how many SSO table header keywords appear in a row."""
+    combined = _normalize_match_text(" ".join(texts))
+    return sum(1 for kw in _SSO_HEADER_KEYWORDS if kw in combined)
+
+
+def _is_paren_annotation_row(texts: list[str]) -> bool:
+    """True when row is the (1)(2)(3)… column-number annotation line."""
+    import re
+
+    paren = re.compile(r"^\(\d+\)$")
+    vals = [t.strip() for t in texts if t.strip()]
+    if len(vals) < 3:
+        return False
+    return sum(1 for v in vals if paren.match(v)) >= len(vals) * 0.5
+
+
+def _is_section_title_row(
+    row: list[tuple[int, int, int, int]], image_w: int
+) -> bool:
+    """Skip wide single-line section titles (e.g. 'Phòng Khách hàng…')."""
+    if len(row) > 3:
+        return False
+    max_w = max(b[2] - b[0] for b in row)
+    return max_w > image_w * 0.42
+
+
+def _configure_torch_threads() -> None:
+    """Limit PyTorch CPU threads for VietOCR (leave cores for Poppler + 2nd job)."""
+    try:
+        import torch
+
+        n = max(1, settings.torch_num_threads)
+        torch.set_num_threads(n)
+        if hasattr(torch, "set_num_interop_threads"):
+            torch.set_num_interop_threads(max(1, n // 2))
+    except Exception:
+        pass
+
+
+@dataclass
+class SsoGridDraft:
+    """GPU/OpenCV stage output — VietOCR runs in a separate (overlapped) step."""
+
+    page_number: int
+    crop: np.ndarray
+    row_lines: list[int]
+    col_lines: list[int]
+    table_top: int
+
+
+def _cell_has_ink(crop: np.ndarray) -> bool:
+    """True when cell image contains visible ink (skip empty cells before VietOCR)."""
+    if crop is None or crop.size == 0:
+        return False
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if len(crop.shape) == 3 else crop
+    h, w = gray.shape
+    my, mx = max(2, h // 10), max(2, w // 10)
+    inner = (
+        gray[my : h - my, mx : w - mx]
+        if h > 2 * my and w > 2 * mx
+        else gray
+    )
+    if inner.size == 0:
+        inner = gray
+    _, binary = cv2.threshold(
+        inner, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
+    )
+    ink_ratio = float(np.count_nonzero(binary)) / max(binary.size, 1)
+    if ink_ratio < settings.cell_ink_min_ratio:
+        return False
+    return float(np.std(inner)) >= 6.0 or ink_ratio >= settings.cell_ink_min_ratio * 2
+
+
+def _merge_close_peaks(peaks: list[int], min_gap: int) -> list[int]:
+    """Merge grid line peaks that are closer than min_gap pixels."""
+    if not peaks:
+        return []
+    merged: list[int] = [peaks[0]]
+    for p in peaks[1:]:
+        if p - merged[-1] < min_gap:
+            merged[-1] = (merged[-1] + p) // 2
+        else:
+            merged.append(p)
+    return merged
+
+
+def _filter_sliver_rows(
+    row_lines: list[int], min_height: int = 18
+) -> list[int]:
+    """Drop grid rows whose cell height is too small (double-line artifacts)."""
+    if len(row_lines) < 2:
+        return row_lines
+    kept = [row_lines[0]]
+    for y in row_lines[1:]:
+        if y - kept[-1] >= min_height:
+            kept.append(y)
+        elif len(row_lines) > 2:
+            # merge with previous boundary
+            kept[-1] = (kept[-1] + y) // 2
+    return kept
+
+
+def _detect_grid_line_positions(
+    image: np.ndarray,
+    *,
+    min_rows: int = 8,
+    min_cols: int = 6,
+) -> tuple[list[int], list[int]] | None:
+    """
+    Detect printed table grid from horizontal/vertical ruling lines.
+
+    Works well on Agribank SSO forms (kẻ ô rõ). Returns row/col boundary y/x coords.
+    """
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    bw = cv2.adaptiveThreshold(
+        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 15, 4
+    )
+    h, w = bw.shape
+    hk = max(w // 25, 25)
+    vk = max(h // 40, 20)
+    h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (hk, 1))
+    v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, vk))
+    horizontal = cv2.dilate(
+        cv2.erode(bw, h_kernel, iterations=1), h_kernel, iterations=1
+    )
+    vertical = cv2.dilate(
+        cv2.erode(bw, v_kernel, iterations=1), v_kernel, iterations=1
+    )
+
+    def _peaks(proj: np.ndarray, min_gap: int, ratio: float = 0.35) -> list[int]:
+        mx = float(np.max(proj)) if proj.size else 0.0
+        if mx <= 0:
+            return []
+        thr = mx * ratio
+        peaks: list[int] = []
+        for i, val in enumerate(proj):
+            if val < thr:
+                continue
+            if not peaks or i - peaks[-1] >= min_gap:
+                peaks.append(i)
+            elif val > proj[peaks[-1]]:
+                peaks[-1] = i
+        return peaks
+
+    row_lines = _peaks(np.sum(horizontal, axis=1), min_gap=12)
+    col_lines = _peaks(np.sum(vertical, axis=0), min_gap=35)
+
+    if len(row_lines) >= 3:
+        gaps = [row_lines[i + 1] - row_lines[i] for i in range(len(row_lines) - 1)]
+        med_gap = float(np.median(gaps)) if gaps else 20.0
+        row_lines = _merge_close_peaks(row_lines, max(8, int(med_gap * 0.45)))
+        row_lines = _filter_sliver_rows(row_lines, min_height=max(14, int(med_gap * 0.55)))
+
+    if len(col_lines) >= 3:
+        cgaps = [col_lines[i + 1] - col_lines[i] for i in range(len(col_lines) - 1)]
+        med_cgap = float(np.median(cgaps)) if cgaps else 40.0
+        col_lines = _merge_close_peaks(col_lines, max(18, int(med_cgap * 0.32)))
+
+    if len(row_lines) >= min_rows and len(col_lines) >= min_cols:
+        return row_lines, col_lines
+    return None
+
+
+def _ocr_table_grid(
+    image: np.ndarray,
+    row_lines: list[int],
+    col_lines: list[int],
+) -> list[CellData]:
+    """OCR each grid cell with VietOCR (skip empty cells to avoid hallucinations)."""
+    cells: list[CellData] = []
+    crops: list[np.ndarray] = []
+    metas: list[tuple[int, int, int, int, int, int]] = []
+
+    for ri in range(len(row_lines) - 1):
+        y1, y2 = row_lines[ri], row_lines[ri + 1]
+        if y2 - y1 < 14:
+            continue
+        for ci in range(len(col_lines) - 1):
+            x1, x2 = col_lines[ci], col_lines[ci + 1]
+            if x2 - x1 < 18:
+                continue
+            pad = 4
+            cy1 = min(image.shape[0], y1 + pad)
+            cy2 = max(cy1 + 1, y2 - pad)
+            cx1 = min(image.shape[1], x1 + pad)
+            cx2 = max(cx1 + 1, x2 - pad)
+            crop = image[cy1:cy2, cx1:cx2]
+            if crop.size == 0:
+                continue
+            if not _cell_has_ink(crop):
+                continue
+            crops.append(crop)
+            metas.append((ri, ci, x1, y1, x2, y2))
+
+    if not crops:
+        return []
+
+    recognised = _recognize_lines(crops)
+    min_conf = settings.ocr_confidence_threshold * 0.35
+    for (ri, ci, x1, y1, x2, y2), (text, conf) in zip(metas, recognised):
+        text = _normalize_cell_text(text)
+        if not text:
+            continue
+        if conf < min_conf and _is_gibberish_text(text):
+            continue
+        cells.append(
+            CellData(
+                row=ri,
+                col=ci,
+                text=text,
+                confidence=conf,
+                bbox=[x1, y1, x2, y2],
+            )
+        )
+    return cells
+
+
+def _find_table_top_y(
+    image: np.ndarray, rows: list[list[tuple[int, int, int, int]]]
+) -> int | None:
+    """Find y-coordinate of SSO header row (STT | Họ tên | …)."""
+    img_h = image.shape[0]
+    best_y: int | None = None
+    best_score = 0
+    for row in rows:
+        row_cy = int(np.mean([(b[1] + b[3]) / 2 for b in row]))
+        if row_cy < img_h * 0.10 or row_cy > img_h * 0.55 or len(row) < 5:
+            continue
+        texts = _recognize_row_boxes(image, row)
+        score = _score_sso_header_row(texts)
+        if score > best_score and score >= 3:
+            best_score = score
+            best_y = min(b[1] for b in row)
+    return best_y
+
+
+def _prepare_sso_grid_draft(
+    image: np.ndarray, page_number: int
+) -> SsoGridDraft | None:
+    """GPU detect + OpenCV grid — no VietOCR cell batch yet."""
+    line_boxes = _detect_lines_in_region(image)
+    if not line_boxes:
+        return None
+
+    rows = _cluster_line_boxes_into_rows(line_boxes)
+    table_top = _find_table_top_y(image, rows)
+    if table_top is None:
+        table_top = int(image.shape[0] * 0.12)
+
+    crop = image[table_top:, :]
+    grid = _detect_grid_line_positions(crop)
+    if grid is None:
+        return None
+
+    row_lines, col_lines = grid
+    return SsoGridDraft(
+        page_number=page_number,
+        crop=crop,
+        row_lines=row_lines,
+        col_lines=col_lines,
+        table_top=table_top,
+    )
+
+
+def _recognize_sso_grid_draft(draft: SsoGridDraft) -> TableData | None:
+    """VietOCR batch on pre-detected grid (CPU-heavy, runs overlapped with next page GPU)."""
+    cells = _ocr_table_grid(draft.crop, draft.row_lines, draft.col_lines)
+    if len(cells) < 20:
+        return None
+
+    cells = _postprocess_sso_cells(cells)
+    if not cells:
+        return None
+
+    max_row = max(c.row for c in cells)
+    max_col = max(c.col for c in cells)
+    logger.info(
+        "Page %d: grid-line SSO table %d×%d (%d cells)",
+        draft.page_number,
+        max_row + 1,
+        max_col + 1,
+        len(cells),
+    )
+    return TableData(
+        table_index=0,
+        num_rows=max_row + 1,
+        num_cols=max_col + 1,
+        cells=cells,
+        html="",
+    )
+
+
+def prepare_page_draft(
+    image: np.ndarray,
+    page_number: int,
+    *,
+    enable_preprocessing: bool = True,
+) -> SsoGridDraft | None:
+    """Public: run detect stage for pipelined page OCR."""
+    img = deskew_image(image) if enable_preprocessing else image
+    return _prepare_sso_grid_draft(img, page_number)
+
+
+def recognize_page_draft(draft: SsoGridDraft) -> TableData | None:
+    """Public: run VietOCR recognize stage for a prepared draft."""
+    return _recognize_sso_grid_draft(draft)
+
+
+def build_page_result_from_table(
+    image_path: str | Path,
+    page_number: int,
+    table: TableData,
+) -> PageResult:
+    """Wrap TableData as PageResult."""
+    return PageResult(
+        page_number=page_number,
+        image_path=str(image_path),
+        tables=[table],
+        raw_text="",
+    )
+
+
+def load_page_image(
+    image_path: str | Path,
+    *,
+    enable_preprocessing: bool = True,
+) -> np.ndarray:
+    """Load a page PNG and optionally deskew."""
+    image_path = Path(image_path)
+    img = cv2.imread(str(image_path))
+    if img is None:
+        raise ValueError(f"Cannot read image: {image_path}")
+    if enable_preprocessing:
+        img = deskew_image(img)
+    return img
+
+
+def complete_draft_page(
+    image_path: str | Path,
+    draft: SsoGridDraft,
+    *,
+    use_gpu: bool | None = None,
+) -> PageResult:
+    """Run VietOCR on a prepared grid draft; fall back to full page OCR if needed."""
+    table = recognize_page_draft(draft)
+    if table is not None:
+        return build_page_result_from_table(image_path, draft.page_number, table)
+    logger.info(
+        "Page %d: grid draft recognize failed — full page fallback",
+        draft.page_number,
+    )
+    return process_page(
+        image_path,
+        page_number=draft.page_number,
+        use_gpu=use_gpu,
+    )
+
+
+def _fallback_sso_grid_lines_ocr(
+    image: np.ndarray, page_number: int
+) -> TableData | None:
+    """SSO pipeline: detect ruling lines → OCR từng ô bằng VietOCR."""
+    draft = _prepare_sso_grid_draft(image, page_number)
+    if draft is None:
+        return None
+    return _recognize_sso_grid_draft(draft)
+
+
+def _find_sso_table_header(
+    image: np.ndarray, rows: list[list[tuple[int, int, int, int]]]
+) -> tuple[int, list[tuple[float, float]]] | tuple[None, None]:
+    """Locate SSO header row and column boundaries."""
+    img_h = image.shape[0]
+    best_idx: int | None = None
+    best_score = 0
+    best_bounds: list[tuple[float, float]] = []
+
+    for idx, row in enumerate(rows):
+        row_cy = float(np.mean([(b[1] + b[3]) / 2 for b in row]))
+        if row_cy < img_h * 0.12 or row_cy > img_h * 0.55:
+            continue
+        if len(row) < 5:
+            continue
+        texts = _recognize_row_boxes(image, row)
+        score = _score_sso_header_row(texts)
+        if score > best_score and score >= 3:
+            best_score = score
+            best_idx = idx
+            best_bounds = _refine_sso_column_bounds(rows, idx)
+
+    if best_idx is None:
+        return None, None
+    return best_idx, best_bounds
+
+
+def _refine_sso_column_bounds(
+    rows: list[list[tuple[int, int, int, int]]],
+    header_idx: int,
+    sample_rows: int = 6,
+) -> list[tuple[float, float]]:
+    """Derive column x-ranges from header + vài dòng dữ liệu đầu (ổn định hơn)."""
+    boxes: list[tuple[int, int, int, int]] = []
+    for row in rows[header_idx : header_idx + sample_rows]:
+        boxes.extend(row)
+    if len(boxes) < 5:
+        return _column_bounds_from_row_boxes(rows[header_idx])
+
+    header_sorted = sorted(rows[header_idx], key=lambda b: b[0])
+    num_cols = max(len(header_sorted), 7)
+    num_cols = min(num_cols, 10)
+
+    centers = sorted((b[0] + b[2]) / 2 for b in boxes)
+    bounds = _cluster_centers_to_bounds(centers, num_cols)
+
+    # Căn biên trái/phải theo hàng header thực tế
+    hx1 = header_sorted[0][0]
+    hx2 = header_sorted[-1][2]
+    if bounds:
+        bounds[0] = (hx1 - 4, bounds[0][1])
+        bounds[-1] = (bounds[-1][0], hx2 + 4)
+    return bounds
+
+
+def _is_gibberish_text(text: str) -> bool:
+    """Heuristic: OCR noise on empty cells or misread grid lines."""
+    import unicodedata
+
+    t = text.strip()
+    if len(t) < 8:
+        return False
+
+    # Long ASCII uppercase (CONTRACTIONALISTS, INTERMINITIC, …)
+    if t.isascii():
+        letters = sum(c.isalpha() for c in t)
+        uppers = sum(c.isupper() for c in t)
+        if letters > 8 and uppers / max(letters, 1) > 0.82:
+            return True
+        vowels = sum(c.lower() in "aeiou" for c in t)
+        if letters > 10 and vowels / max(letters, 1) < 0.15:
+            return True
+        return False
+
+    # Vietnamese-looking but no tone marks and almost no vowels → likely noise
+    norm = unicodedata.normalize("NFD", t)
+    has_tone = any(unicodedata.category(c) == "Mn" for c in norm)
+    ascii_letters = sum(c.isascii() and c.isalpha() for c in t)
+    if ascii_letters > len(t) * 0.6 and not has_tone:
+        return True
+    return False
+
+
+def _is_valid_data_row(cols: dict[int, CellData]) -> bool:
+    """Keep rows with numeric STT or enough real Vietnamese content."""
+    import re
+
+    c0 = cols.get(0)
+    stt = (c0.text.strip() if c0 else "") or ""
+    if re.match(r"^\d{1,3}$", stt):
+        return True
+
+    texts = [c.text.strip() for c in cols.values() if c.text.strip()]
+    if not texts:
+        return False
+    gib = sum(1 for t in texts if _is_gibberish_text(t))
+    if gib >= max(2, len(texts) // 2):
+        return False
+    # At least one cell with Vietnamese diacritics or email/cccd pattern
+    for t in texts:
+        if "@" in t or re.search(r"\d{9,12}", t):
+            return True
+        if any("\u0300" <= ch <= "\u036f" or ord(ch) > 127 for ch in t):
+            return True
+    return gib == 0 and len(texts) >= 2
+
+
+def _postprocess_sso_cells(cells: list[CellData]) -> list[CellData]:
+    """Chuẩn hóa lưới SSO: bỏ dòng rác, tách STT, sửa cột email/CCCD."""
+    import re
+    from collections import defaultdict
+
+    if not cells:
+        return cells
+
+    cells = _merge_annotation_header_rows(cells)
+    cells = _fix_cccd_email_columns(cells)
+
+    by_row: dict[int, dict[int, CellData]] = defaultdict(dict)
+    for c in cells:
+        by_row[c.row][c.col] = c
+
+    # Bỏ dòng rác (OCR noise trên vùng kẻ bảng)
+    clean_rows: dict[int, dict[int, CellData]] = {}
+    for row, cols in sorted(by_row.items()):
+        texts = [c.text.strip() for c in cols.values() if c.text.strip()]
+        if not texts:
+            continue
+        if not _is_valid_data_row(cols):
+            continue
+        clean_rows[row] = cols
+
+    # Tìm dòng header (STT | Họ và tên) hoặc dòng dữ liệu đầu (cột 0 = số)
+    start_row = min(clean_rows) if clean_rows else 0
+    for row, cols in sorted(clean_rows.items()):
+        c0 = cols.get(0, CellData(row=0, col=0, text="", confidence=0)).text.strip()
+        c1 = cols.get(1, CellData(row=0, col=1, text="", confidence=0)).text.strip()
+        norm = _normalize_match_text(c0 + c1)
+        if "stt" in norm or ("hoten" in norm and "phong" in _normalize_match_text(
+            " ".join(c.text for c in cols.values())
+        )):
+            start_row = row
+            break
+        if re.match(r"^\d{1,3}$", c0) and c1 and not c1.isascii():
+            start_row = row
+            break
+
+    renumbered: list[CellData] = []
+    new_idx = 0
+    for row in sorted(clean_rows):
+        if row < start_row:
+            continue
+        cols = clean_rows[row]
+        # Bỏ dòng header STT (chỉ giữ nếu là dòng duy nhất kiểu header)
+        c0 = cols.get(0, CellData(row=0, col=0, text="", confidence=0)).text.strip()
+        if "stt" in _normalize_match_text(c0):
+            continue
+        for col, cell in sorted(cols.items()):
+            text = cell.text.strip()
+            # Tách STT dính cuối tên
+            m = re.search(r"^(.+?)\s+(\d{1,3})$", text)
+            if m and col == 1:
+                text = m.group(1).strip()
+            renumbered.append(
+                CellData(
+                    row=new_idx,
+                    col=col,
+                    text=_normalize_cell_text(text),
+                    confidence=cell.confidence,
+                    bbox=cell.bbox,
+                )
+            )
+        new_idx += 1
+
+    renumbered = _fix_cccd_email_columns(renumbered)
+    renumbered.sort(key=lambda c: (c.row, c.col))
+    return renumbered
+
+
+def _fallback_sso_table_ocr(
+    image: np.ndarray, page_number: int
+) -> TableData | None:
+    """
+    SSO form pipeline: detect lines → find table header → VietOCR data cells.
+
+    Excludes letterhead and section titles; keeps 7–9 column grid aligned to header.
+    """
+    img_h, img_w = image.shape[:2]
+    line_boxes = _detect_lines_in_region(image)
+    if not line_boxes:
+        return None
+
+    rows = _cluster_line_boxes_into_rows(line_boxes)
+    header_idx, col_bounds_abs = _find_sso_table_header(image, rows)
+    if header_idx is None or not col_bounds_abs:
+        logger.info("Page %d: SSO header not found — generic fallback", page_number)
+        return None
+
+    tx1 = max(0, int(min(b[0] for b in rows[header_idx])) - 8)
+    tx2 = min(img_w, int(max(b[2] for b in rows[header_idx])) + 8)
+    ty1 = max(0, int(min(b[1] for b in rows[header_idx])) - 4)
+    ty2 = img_h - 10
+
+    table_boxes: list[tuple[int, int, int, int]] = []
+    for idx, row in enumerate(rows):
+        if idx < header_idx:
+            continue
+        if idx == header_idx:
+            table_boxes.extend(row)
+            continue
+        if _is_section_title_row(row, img_w):
+            continue
+        texts = _recognize_row_boxes(image, row)
+        if _is_paren_annotation_row(texts):
+            continue
+        table_boxes.extend(row)
+
+    col_bounds_crop = [(l - tx1, r - tx1) for l, r in col_bounds_abs]
+    line_boxes_crop = [
+        (x1 - tx1, y1 - ty1, x2 - tx1, y2 - ty1)
+        for x1, y1, x2, y2 in table_boxes
+        if y1 >= ty1 - 2 and y2 <= ty2 + 2
+    ]
+
+    cells = _reconstruct_table_from_lines(
+        image,
+        [tx1, ty1, tx2, ty2],
+        [],
+        "",
+        col_bounds_override=col_bounds_crop,
+        line_boxes_override=line_boxes_crop,
+    )
+    if not cells:
+        return None
+
+    cells = _postprocess_sso_cells(cells)
+
+    max_row = max(c.row for c in cells)
+    max_col = max(c.col for c in cells)
+    logger.info(
+        "Page %d: SSO table %d×%d (%d cells, VietOCR)",
+        page_number,
+        max_row + 1,
+        max_col + 1,
+        len(cells),
+    )
+    return TableData(
+        table_index=0,
+        num_rows=max_row + 1,
+        num_cols=max_col + 1,
+        cells=cells,
+        html="",
+    )
+
+
 def _fallback_full_page_ocr(
     image: np.ndarray, page_number: int
 ) -> TableData | None:
     """
-    Fallback: run PaddleOCR text detection on the full page
-    and try to arrange results into a table grid.
+    Fallback when PP-Structure is unavailable.
 
-    Used when PP-Structure doesn't detect any table region.
+    Prefers SSO table pipeline (det + VietOCR); generic grid as last resort.
     """
     try:
-        ocr = _get_paddle_ocr_fallback()
-        cells: list[CellData] = []
+        table = _fallback_sso_grid_lines_ocr(image, page_number)
+        if table is not None:
+            return table
 
-        if hasattr(ocr, "predict"):
-            predictions = ocr.predict(image)
-            if not predictions:
-                return None
+        table = _fallback_sso_table_ocr(image, page_number)
+        if table is not None:
+            return table
 
-            ocr_res = _result_to_dict(predictions[0])
-            rec_texts = ocr_res.get("rec_texts", [])
-            rec_scores = ocr_res.get("rec_scores", [])
-            rec_polys = ocr_res.get("rec_polys", ocr_res.get("dt_polys", []))
+        line_boxes = _detect_lines_in_region(image)
+        if not line_boxes:
+            return None
 
-            if not rec_texts:
-                return None
+        img_h, img_w = image.shape[:2]
+        # Exclude top letterhead (~12% page height).
+        content_boxes = [
+            b for b in line_boxes if b[1] >= int(img_h * 0.12)
+        ]
+        if not content_boxes:
+            content_boxes = line_boxes
 
-            for i, text in enumerate(rec_texts):
-                confidence = float(rec_scores[i]) if i < len(rec_scores) else 0.0
-                poly = rec_polys[i] if i < len(rec_polys) else []
+        ty1 = min(b[1] for b in content_boxes)
+        ty2 = max(b[3] for b in content_boxes)
+        tx1 = max(0, min(b[0] for b in content_boxes) - 8)
+        tx2 = min(img_w, max(b[2] for b in content_boxes) + 8)
 
-                if len(poly) >= 4:
-                    xs = [p[0] for p in poly]
-                    ys = [p[1] for p in poly]
-                    bbox = [int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys))]
-                else:
-                    bbox = []
+        centers = sorted((b[0] + b[2]) / 2 for b in content_boxes)
+        num_cols = min(9, max(4, _estimate_column_count(centers)))
+        col_bounds = _cluster_centers_to_bounds(centers, num_cols)
+        col_bounds_crop = [(l - tx1, r - tx1) for l, r in col_bounds]
+        line_boxes_crop = [
+            (x1 - tx1, y1 - ty1, x2 - tx1, y2 - ty1)
+            for x1, y1, x2, y2 in content_boxes
+        ]
 
-                cells.append(
-                    CellData(row=0, col=0, text=text, confidence=confidence, bbox=bbox)
-                )
-        else:
-            result = ocr.ocr(image, cls=True)
-            if not result or not result[0]:
-                return None
+        cells = _reconstruct_table_from_lines(
+            image,
+            [tx1, ty1, tx2, ty2],
+            [],
+            "",
+            col_bounds_override=col_bounds_crop,
+            line_boxes_override=line_boxes_crop,
+        )
+        if not cells:
+            return None
 
-            for line in result[0]:
-                bbox_points = line[0]
-                text_info = line[1]
-
-                text = text_info[0] if text_info else ""
-                confidence = float(text_info[1]) if len(text_info) > 1 else 0.0
-
-                xs = [p[0] for p in bbox_points]
-                ys = [p[1] for p in bbox_points]
-                bbox = [int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys))]
-
-                cells.append(
-                    CellData(row=0, col=0, text=text, confidence=confidence, bbox=bbox)
-                )
-
-        # Try to arrange into grid
-        if cells:
-            cells = _arrange_cells_into_grid(cells)
-
-            max_row = max(c.row for c in cells)
-            max_col = max(c.col for c in cells)
-
-            return TableData(
-                table_index=0,
-                num_rows=max_row + 1,
-                num_cols=max_col + 1,
-                cells=cells,
-                html="",
-            )
-
-        return None
+        max_row = max(c.row for c in cells)
+        max_col = max(c.col for c in cells)
+        return TableData(
+            table_index=0,
+            num_rows=max_row + 1,
+            num_cols=max_col + 1,
+            cells=cells,
+            html="",
+        )
 
     except Exception as e:
         logger.error("Fallback OCR failed on page %d: %s", page_number, e)
         return None
+
+
+def _estimate_column_count(centers: list[float]) -> int:
+    """Estimate column count from x-centre gaps (for generic fallback)."""
+    if len(centers) < 4:
+        return 4
+    gaps = [centers[i + 1] - centers[i] for i in range(len(centers) - 1)]
+    med_gap = float(np.median(gaps))
+    if med_gap <= 0:
+        return 6
+    big_gaps = sum(1 for g in gaps if g > med_gap * 1.8)
+    return max(4, min(9, big_gaps + 1))

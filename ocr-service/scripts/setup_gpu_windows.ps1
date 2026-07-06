@@ -41,3 +41,4 @@ if (Test-Path $envFile) {
 }
 
 Write-Host "`nXong. Restart server: uvicorn app.main:app --host 0.0.0.0 --port 8100" -ForegroundColor Green
+Write-Host "Phase 4 (VietOCR GPU): chạy thêm scripts/setup_vietocr_gpu_worker.ps1" -ForegroundColor Cyan
