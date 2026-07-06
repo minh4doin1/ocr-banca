@@ -74,6 +74,31 @@ class Settings(BaseSettings):
     # --- Logging ---
     log_level: str = "INFO"
 
+    # --- Keycloak (User Provisioning) ---
+    keycloak_base_url: str = ""  # vd: https://keycloak-domain (không có dấu / cuối)
+    keycloak_realm: str = ""
+    keycloak_client_id: str = ""
+    keycloak_client_secret: str = ""
+    keycloak_verify_ssl: bool = True
+    keycloak_timeout_seconds: int = 30
+    keycloak_token_leeway_seconds: int = 30
+
+    # Mặc định nghiệp vụ khi tạo/reset user
+    keycloak_default_temporary: bool = True
+    keycloak_default_required_actions: str = "UPDATE_PASSWORD,CONFIGURE_TOTP"
+    # Mật khẩu tạm mặc định khi input không cung cấp password
+    keycloak_default_temp_password: str = ""
+
+    # Map tiêu đề cột (Excel/OCR, chữ thường không dấu cách thừa) -> field Keycloak.
+    # Định dạng: "field:alias1|alias2;field2:aliasA|aliasB"
+    keycloak_header_map: str = (
+        "username:tên đăng nhập|tendangnhap|username|user|tài khoản|tai khoan;"
+        "email:email|thư điện tử|thu dien tu;"
+        "first_name:tên|first name|firstname;"
+        "last_name:họ|họ và tên|last name|lastname;"
+        "password:mật khẩu|mat khau|password|matkhau"
+    )
+
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"
@@ -145,6 +170,43 @@ class Settings(BaseSettings):
             return False
         port = parsed.port or 80
         return port == self.port
+    @property
+    def keycloak_default_required_actions_list(self) -> list[str]:
+        """Parse default required actions from comma-separated string."""
+        return [
+            a.strip()
+            for a in self.keycloak_default_required_actions.split(",")
+            if a.strip()
+        ]
+
+    @property
+    def keycloak_configured(self) -> bool:
+        """True when all mandatory Keycloak settings are present."""
+        return bool(
+            self.keycloak_base_url.strip()
+            and self.keycloak_realm.strip()
+            and self.keycloak_client_id.strip()
+            and self.keycloak_client_secret.strip()
+        )
+
+    @property
+    def keycloak_header_map_parsed(self) -> dict[str, list[str]]:
+        """
+        Parse header map config into {field: [alias, ...]}.
+
+        Aliases are lower-cased and stripped for case-insensitive matching.
+        """
+        result: dict[str, list[str]] = {}
+        for group in self.keycloak_header_map.split(";"):
+            group = group.strip()
+            if not group or ":" not in group:
+                continue
+            field, aliases = group.split(":", 1)
+            field = field.strip()
+            alias_list = [a.strip().lower() for a in aliases.split("|") if a.strip()]
+            if field and alias_list:
+                result[field] = alias_list
+        return result
 
 
 settings = Settings()

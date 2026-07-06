@@ -201,3 +201,106 @@ class ErrorResponse(BaseModel):
     """Standard error response."""
 
     detail: str
+
+
+# ──────────────────────────────────────────────────────────────
+# Keycloak user provisioning
+# ──────────────────────────────────────────────────────────────
+
+
+class OnConflictAction(str, enum.Enum):
+    """Hành động khi user đã tồn tại trong Keycloak."""
+
+    SKIP = "skip"
+    RESET_PASSWORD = "reset_password"
+    RESET_OTP = "reset_otp"
+    RESET_BOTH = "reset_both"
+
+
+class ProvisionStatus(str, enum.Enum):
+    """Kết quả xử lý một user trong lô."""
+
+    CREATED = "created"
+    UPDATED = "updated"
+    SKIPPED = "skipped"
+    FAILED = "failed"
+
+
+class KeycloakUserInput(BaseModel):
+    """Một user đầu vào cho việc tạo lô."""
+
+    username: str = Field(..., description="Tên đăng nhập (bắt buộc)")
+    email: str = Field(default="", description="Email")
+    first_name: str = Field(default="", description="Tên")
+    last_name: str = Field(default="", description="Họ")
+    password: str = Field(
+        default="",
+        description="Mật khẩu tạm. Bỏ trống để dùng mặc định/sinh ngẫu nhiên.",
+    )
+    on_conflict: OnConflictAction | None = Field(
+        default=None,
+        description="Hành động khi user đã tồn tại (ghi đè mặc định của lô).",
+    )
+    required_actions: list[str] | None = Field(
+        default=None,
+        description="Ghi đè required actions cho user này (nếu cần).",
+    )
+
+
+class BatchProvisionRequest(BaseModel):
+    """Yêu cầu tạo lô user. Cung cấp job_id HOẶC users."""
+
+    job_id: str = Field(
+        default="",
+        description="Lấy dữ liệu từ kết quả OCR đã review theo job_id.",
+    )
+    users: list[KeycloakUserInput] = Field(
+        default_factory=list,
+        description="Danh sách user trực tiếp (nếu không dùng job_id).",
+    )
+    realm: str = Field(
+        default="",
+        description="Ghi đè realm Keycloak (mặc định lấy từ cấu hình).",
+    )
+    default_temporary: bool | None = Field(
+        default=None,
+        description="Mật khẩu tạm (temporary). Mặc định theo cấu hình.",
+    )
+    default_on_conflict: OnConflictAction = Field(
+        default=OnConflictAction.SKIP,
+        description="Hành động mặc định khi user đã tồn tại.",
+    )
+    default_required_actions: list[str] | None = Field(
+        default=None,
+        description="Required actions mặc định khi tạo user. Mặc định theo cấu hình.",
+    )
+
+
+class UserProvisionResult(BaseModel):
+    """Kết quả xử lý cho một user."""
+
+    username: str
+    status: ProvisionStatus
+    user_id: str = ""
+    actions_applied: list[str] = Field(default_factory=list)
+    error: str = ""
+
+
+class BatchProvisionResponse(BaseModel):
+    """Tổng hợp kết quả tạo lô user."""
+
+    total: int = 0
+    created: int = 0
+    updated: int = 0
+    skipped: int = 0
+    failed: int = 0
+    results: list[UserProvisionResult] = Field(default_factory=list)
+
+
+class UserPreviewResponse(BaseModel):
+    """Danh sách user được map từ job OCR để review trước khi tạo."""
+
+    job_id: str
+    total: int = 0
+    users: list[KeycloakUserInput] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
