@@ -87,6 +87,64 @@ Script vận hành host:
 | `PUT` | `/api/ocr/result/{job_id}` | Cập nhật dữ liệu sau review |
 | `GET` | `/api/ocr/result/{job_id}/export` | Xuất Excel |
 | `GET` | `/api/ocr/jobs` | Danh sách jobs |
+| `GET` | `/api/users/preview-from-job/{job_id}` | Xem trước user map từ job OCR |
+| `POST` | `/api/users/provision-batch` | Tạo lô user trên Keycloak |
+
+## Tạo lô User trên Keycloak
+
+Module này tạo/đồng bộ user lên Keycloak 24 qua Admin REST API bằng
+**Service Account** (grant `client_credentials`) — KHÔNG dùng tài khoản admin.
+
+### 1. Tạo Service Account Client trong realm cần quản lý
+
+- Client ID: ví dụ `user-provisioning-tool`
+- `Client authentication = ON`
+- `Service Accounts = ON`
+- `Standard Flow = OFF`, `Direct Access Grants = OFF`
+
+### 2. Cấp quyền (Least Privilege)
+
+`Clients → user-provisioning-tool → Service Account Roles`, thêm role từ client
+`realm-management`:
+
+- `manage-users`
+- `view-users`
+
+### 3. Cấu hình `.env`
+
+```env
+KEYCLOAK_BASE_URL=https://keycloak-domain
+KEYCLOAK_REALM=myrealm
+KEYCLOAK_CLIENT_ID=user-provisioning-tool
+KEYCLOAK_CLIENT_SECRET=YOUR_SECRET
+```
+
+### 4. Gọi API
+
+Nguồn dữ liệu: `job_id` (kết quả OCR đã review) **hoặc** `users` (JSON trực tiếp).
+Khi user đã tồn tại, xử lý theo `on_conflict` (per-user hoặc mặc định của lô):
+`skip` | `reset_password` | `reset_otp` | `reset_both`.
+
+```jsonc
+// POST /api/users/provision-batch
+{
+  "job_id": "abc123",              // hoặc bỏ trống và dùng "users"
+  "default_on_conflict": "skip",
+  "users": [
+    {
+      "username": "nguyenvana",
+      "email": "a@example.com",
+      "first_name": "Văn A",
+      "last_name": "Nguyễn",
+      "on_conflict": "reset_both"   // ghi đè mặc định của lô cho user này
+    }
+  ]
+}
+```
+
+Mật khẩu reset đặt `temporary=true` (bắt đổi lần đăng nhập kế tiếp). Reset OTP =
+xóa credential `type=otp` + gán lại `CONFIGURE_TOTP` (không tự sinh/không lưu OTP
+secret).
 
 ## Cấu trúc thư mục
 

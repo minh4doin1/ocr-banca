@@ -14,6 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
 from app.routers.ocr import router as ocr_router
+from app.routers.users import router as users_router
 from app.services.gpu_runtime import probe_gpu_runtime
 from app.services.pdf_service import check_poppler_available
 
@@ -64,6 +65,7 @@ import os
 from fastapi.staticfiles import StaticFiles
 
 app.include_router(ocr_router)
+app.include_router(users_router)
 
 
 @app.get("/health", tags=["Health"])
