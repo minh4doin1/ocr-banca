@@ -198,6 +198,7 @@ class KeycloakClient:
         temporary: bool = True,
         required_actions: list[str] | None = None,
         enabled: bool = True,
+        attributes: dict[str, list[str]] | None = None,
     ) -> str:
         """
         Tạo user mới. Trả về userId (lấy từ header Location).
@@ -224,6 +225,8 @@ class KeycloakClient:
             ]
         if required_actions:
             payload["requiredActions"] = required_actions
+        if attributes:
+            payload["attributes"] = attributes
 
         resp = self._request("POST", self._admin_url("/users"), json=payload)
 
@@ -340,6 +343,37 @@ class KeycloakClient:
                 f"(HTTP {update_resp.status_code}): {_safe_body(update_resp)}"
             )
         return merged
+
+    def update_user_attributes(
+        self, user_id: str, attributes: dict[str, list[str]]
+    ) -> None:
+        """Merge attributes vào user hiện có."""
+        if not attributes:
+            return
+        resp = self._request(
+            "GET",
+            self._admin_url(f"/users/{user_id}"),
+            json_body=False,
+        )
+        if resp.status_code != 200:
+            raise KeycloakError(
+                f"Lấy user {user_id} thất bại (HTTP {resp.status_code})"
+            )
+        user = resp.json()
+        existing = dict(user.get("attributes") or {})
+        for key, vals in attributes.items():
+            if vals:
+                existing[key] = vals
+        update_resp = self._request(
+            "PUT",
+            self._admin_url(f"/users/{user_id}"),
+            json={"attributes": existing},
+        )
+        if update_resp.status_code not in (200, 204):
+            raise KeycloakError(
+                f"Cập nhật attributes (user {user_id}) thất bại "
+                f"(HTTP {update_resp.status_code})"
+            )
 
 
 def _safe_body(resp: requests.Response) -> str:

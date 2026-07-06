@@ -217,6 +217,14 @@ class OnConflictAction(str, enum.Enum):
     RESET_BOTH = "reset_both"
 
 
+class MatchStatus(str, enum.Enum):
+    """Kết quả auto-match chi nhánh/đại lý."""
+
+    AUTO = "auto"
+    SUGGEST = "suggest"
+    MANUAL = "manual"
+
+
 class ProvisionStatus(str, enum.Enum):
     """Kết quả xử lý một user trong lô."""
 
@@ -231,8 +239,21 @@ class KeycloakUserInput(BaseModel):
 
     username: str = Field(..., description="Tên đăng nhập (bắt buộc)")
     email: str = Field(default="", description="Email")
+    name: str = Field(default="", description="Họ tên đầy đủ")
     first_name: str = Field(default="", description="Tên")
     last_name: str = Field(default="", description="Họ")
+    cccd: str = Field(default="", description="Số CCCD/CMND")
+    branch_name: str = Field(default="", description="Tên chi nhánh (OCR/manual)")
+    department_name: str = Field(default="", description="Tên phòng GD/PGD")
+    branch_code: str = Field(default="", description="Mã chi nhánh")
+    agent_code: str = Field(default="", description="Mã đại lý")
+    branch_name_matched: str = Field(default="", description="Tên CN khớp từ banca-core")
+    department_name_matched: str = Field(default="", description="Tên PGD khớp")
+    match_status: MatchStatus | None = Field(default=None)
+    match_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    enrich_source: str = Field(default="", description="auto|email|manual")
+    missing_fields: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
     password: str = Field(
         default="",
         description="Mật khẩu tạm. Bỏ trống để dùng mặc định/sinh ngẫu nhiên.",
@@ -244,6 +265,10 @@ class KeycloakUserInput(BaseModel):
     required_actions: list[str] | None = Field(
         default=None,
         description="Ghi đè required actions cho user này (nếu cần).",
+    )
+    attributes: dict[str, list[str]] | None = Field(
+        default=None,
+        description="Keycloak user attributes ghi đè.",
     )
 
 
@@ -304,3 +329,61 @@ class UserPreviewResponse(BaseModel):
     total: int = 0
     users: list[KeycloakUserInput] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
+
+
+class EnrichRequest(BaseModel):
+    """Yêu cầu enrich mã chi nhánh/đại lý."""
+
+    job_id: str = ""
+    users: list[KeycloakUserInput] = Field(default_factory=list)
+
+
+class BranchAgentMatchResult(BaseModel):
+    """Kết quả auto-match một dòng."""
+
+    branch_code: str = ""
+    agent_code: str = ""
+    agency_id: str = ""
+    branch_name_matched: str = ""
+    department_name_matched: str = ""
+    match_status: MatchStatus = MatchStatus.MANUAL
+    match_confidence: float = 0.0
+    warnings: list[str] = Field(default_factory=list)
+
+
+class AgencyLookupItem(BaseModel):
+    id: str = ""
+    name: str = ""
+    core_bank_code: str = ""
+    agency_code: str = ""
+    status: str = ""
+
+
+class AgentLookupItem(BaseModel):
+    id: str = ""
+    name: str = ""
+    email: str = ""
+    ipcas_code: str = ""
+    branch_code: str = ""
+    agent_code: str = ""
+
+
+class AgencyLookupResponse(BaseModel):
+    items: list[AgencyLookupItem] = Field(default_factory=list)
+    total: int = 0
+
+
+class AgentLookupResponse(BaseModel):
+    items: list[AgentLookupItem] = Field(default_factory=list)
+    total: int = 0
+
+
+class EnrichResponse(BaseModel):
+    users: list[KeycloakUserInput] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+
+
+class FieldConfigResponse(BaseModel):
+    required_fields: list[str] = Field(default_factory=list)
+    header_map: dict[str, list[str]] = Field(default_factory=dict)
+    banca_core_enabled: bool = False

@@ -61,6 +61,7 @@
                     <div class="upload-file-row">
                         <button type="button" class="btn btn-primary btn-sm" id="select-btn">Chọn PDF</button>
                         <button type="button" class="btn btn-outline btn-sm" id="select-excel-btn">Nạp Excel</button>
+                        <button type="button" class="btn btn-ghost btn-sm" id="btn-clear-file" type="button">Xóa file</button>
                         <span class="file-name" id="file-name-label">Chưa chọn file</span>
                         <div class="drop-hint" id="drop-zone">Kéo thả PDF vào đây</div>
                     </div>
@@ -245,6 +246,7 @@
                                 <span>Bảng đối chiếu</span>
                                 <div class="toolbar-actions">
                                     <button class="btn btn-sm btn-outline hidden" id="btn-show-pdf" type="button">Hiện ảnh gốc</button>
+                                    <button class="btn btn-sm btn-outline" id="btn-reocr-page" type="button" title="OCR lại trang hiện tại">OCR lại trang</button>
                                     <button class="btn btn-sm btn-outline" id="btn-import-excel" type="button">Nạp Excel đã chỉnh</button>
                                     <button class="btn btn-sm btn-outline" id="btn-export-excel" type="button">Xuất Excel</button>
                                     <button class="btn btn-sm btn-ghost" id="btn-restart" type="button">Làm lại</button>
@@ -281,14 +283,11 @@
                         <strong class="mono" id="success-batch-code">—</strong>
                     </div>
                     <div class="detail-row">
-                        <span>Tổng cán bộ</span>
+                        <span>Kết quả</span>
                         <strong id="success-total-records">—</strong>
                     </div>
-                    <div class="detail-row">
-                        <span>Trạng thái</span>
-                        <strong class="text-warn">Chờ TSC phê duyệt</strong>
-                    </div>
                 </div>
+                <div id="batch-results-detail" class="batch-results-detail"></div>
                 <div class="success-actions">
                     <button class="btn btn-primary" id="btn-success-new">Tải PDF khác</button>
                     <button class="btn btn-outline" id="btn-success-home">Quay lại</button>
@@ -298,6 +297,51 @@
 
     </main>
 
-    <script src="app.js?v=7"></script>
+    <!-- Modal: Review trước khi tạo lô user -->
+    <div class="modal-overlay hidden" id="batch-review-modal">
+        <div class="modal-card card">
+            <div class="modal-header">
+                <h3>Review & Tạo lô User Keycloak</h3>
+                <button type="button" class="btn btn-ghost btn-sm" id="btn-batch-cancel">✕</button>
+            </div>
+            <p class="text-muted modal-hint">Kiểm tra mã chi nhánh/đại lý. Dùng nút Tìm để chọn thủ công hoặc Enrich lại sau khi sửa tên CN/PGD.</p>
+            <div class="modal-toolbar">
+                <label>Mặc định khi trùng:
+                    <select id="batch-default-conflict">
+                        <option value="skip">Bỏ qua</option>
+                        <option value="reset_password">Đổi mật khẩu</option>
+                        <option value="reset_otp">Đổi OTP</option>
+                        <option value="reset_both">Đổi cả 2</option>
+                    </select>
+                </label>
+                <button type="button" class="btn btn-outline btn-sm" id="btn-batch-re-enrich">Enrich lại</button>
+            </div>
+            <div class="batch-review-scroll">
+                <table class="ocr-table batch-review-table">
+                    <thead>
+                        <tr>
+                            <th>Username</th><th>Họ tên</th><th>CCCD</th><th>Email</th>
+                            <th>Tên CN</th><th>Mã CN</th><th>Mã ĐL</th><th>Khớp</th><th>Trùng</th><th>TT</th>
+                        </tr>
+                    </thead>
+                    <tbody id="batch-review-tbody"></tbody>
+                </table>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-outline" id="btn-batch-cancel-2">Hủy</button>
+                <button type="button" class="btn btn-primary" id="btn-batch-confirm">Xác nhận tạo lô</button>
+            </div>
+        </div>
+    </div>
+
+    <div class="replace-popover hidden" id="replace-popover">
+        <p>Có ô khác cùng giá trị cũ. Thay thế?</p>
+        <div id="replace-popover-list"></div>
+        <button type="button" class="btn btn-sm btn-primary" id="btn-replace-apply">Áp dụng</button>
+        <button type="button" class="btn btn-sm btn-ghost" id="btn-replace-skip">Bỏ qua</button>
+    </div>
+
+    <script src="app.js?v=8"></script>
+    <script src="batch-users.js?v=1"></script>
 </body>
 </html>

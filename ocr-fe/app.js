@@ -21,6 +21,7 @@ let pollTimer = null;
 let lastLogCount = 0;
 let workspaceEntered = false;
 let runtimeConfig = null;
+let pendingReplace = null;
 
 // ── DOM refs ──
 const $ = (sel) => document.querySelector(sel);
@@ -96,9 +97,11 @@ const stepItems = $$('.step-item');
 // ── Init ──
 document.addEventListener('DOMContentLoaded', async () => {
     await loadRuntimeConfig();
+    await loadFieldConfig();
     setupUpload();
     setupWorkspace();
     setupKeyboard();
+    setupBatchReviewModal();
     syncModeUi();
 });
 
@@ -151,6 +154,29 @@ function setStep(step) {
     else if (step === 1) viewProcessing.classList.add('active');
     else if (step === 2) viewWorkspace.classList.add('active');
     else if (step === 3) viewSuccess.classList.add('active');
+}
+
+// ── Reset / clear ──
+function resetAll() {
+    stopPolling();
+    selectedFile = null;
+    jobId = '';
+    totalPages = 0;
+    currentPageNumber = 1;
+    ocrData = null;
+    jobStatus = null;
+    activeCell = null;
+    workspaceEntered = false;
+    lastLogCount = 0;
+    pendingReplace = null;
+    if (fileInput) fileInput.value = '';
+    if (excelInput) excelInput.value = '';
+    if (fileNameLabel) fileNameLabel.textContent = 'Chưa chọn file';
+    if (logConsole) logConsole.innerHTML = '';
+    if (pageStatusGrid) pageStatusGrid.innerHTML = '';
+    hideBatchReviewModal?.();
+    document.getElementById('replace-popover')?.classList.add('hidden');
+    setStep(0);
 }
 
 // ── Upload ──
@@ -209,6 +235,10 @@ function setupUpload() {
     btnGoReviewEarly.addEventListener('click', () => enterWorkspace());
     btnTestInternal?.addEventListener('click', (e) => { e.preventDefault(); testWorker('internal'); });
     btnTestColab?.addEventListener('click', (e) => { e.preventDefault(); testWorker('colab'); });
+    document.getElementById('btn-clear-file')?.addEventListener('click', (e) => {
+        e.preventDefault();
+        if (confirm('Xóa file và làm lại từ đầu?')) resetAll();
+    });
 }
 
 function getModeKind() {
@@ -395,6 +425,8 @@ async function uploadPdf(file) {
 }
 
 async function uploadExcel(file, targetJobId = '') {
+    const loadingMsg = document.getElementById('excel-loading-msg');
+    if (loadingMsg) loadingMsg.classList.remove('hidden');
     try {
         const formData = new FormData();
         formData.append('file', file);
@@ -423,20 +455,21 @@ async function uploadExcel(file, targetJobId = '') {
         totalPages = ocrData.total_pages || ocrData.pages?.length || 1;
         currentPageNumber = ocrData.pages?.[0]?.page_number || 1;
         workspaceEntered = true;
+        fileNameLabel.textContent = file.name;
         setStep(2);
         renderWorkspace();
         appendLog({
             level: 'success',
             message: targetJobId
-                ? 'Đã nạp Excel và ghi đè dữ liệu OCR hiện tại'
-                : 'Đã nạp Excel, bỏ qua OCR',
+                ? 'Đã nạp Excel và ghi đè dữ liệu OCR'
+                : 'Đã nạp Excel — có thể chỉnh sửa ngay',
             timestamp: new Date().toISOString(),
         });
-        alert(targetJobId
-            ? 'Nạp Excel thành công. Dữ liệu bảng đã được cập nhật.'
-            : 'Nạp Excel thành công. Bạn có thể chỉnh sửa ngay.');
     } catch (e) {
         alert(`Lỗi nạp Excel: ${e.message || 'Không xác định'}`);
+    } finally {
+        if (loadingMsg) loadingMsg.classList.add('hidden');
+        if (excelInput) excelInput.value = '';
     }
 }
 
@@ -688,10 +721,26 @@ function setupWorkspace() {
     setupSplitResizer();
     setupPdfPaneToggle();
     btnRestart.addEventListener('click', () => {
-        stopPolling();
-        fileNameLabel.textContent = 'Chưa chọn file';
-        fileInput.value = '';
-        setStep(0);
+        if (confirm('Làm lại từ đầu?')) resetAll();
+    });
+    document.getElementById('btn-reocr-page')?.addEventListener('click', async () => {
+        if (!jobId) return;
+        const btn = document.getElementById('btn-reocr-page');
+        if (btn) { btn.disabled = true; btn.textContent = 'Đang OCR...'; }
+        try {
+            const res = await fetch(
+                `${API_BASE}/api/ocr/result/${jobId}/page/${currentPageNumber}/reocr`,
+                { method: 'POST' }
+            );
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok) throw new Error(data.detail || 'OCR lại thất bại');
+            ocrData = data;
+            renderWorkspace();
+        } catch (e) {
+            alert(e.message);
+        } finally {
+            if (btn) { btn.disabled = false; btn.textContent = 'OCR lại trang'; }
+        }
     });
     btnExportExcel.addEventListener('click', () => {
         window.open(`${API_BASE}/api/ocr/result/${jobId}/export`);
@@ -701,8 +750,8 @@ function setupWorkspace() {
         excelInput?.click();
     });
     btnConfirmBatch.addEventListener('click', submitBatch);
-    btnSuccessNew.addEventListener('click', () => { stopPolling(); setStep(0); });
-    btnSuccessHome.addEventListener('click', () => { stopPolling(); setStep(0); });
+    btnSuccessNew.addEventListener('click', () => resetAll());
+    btnSuccessHome.addEventListener('click', () => resetAll());
 }
 
 // ── Resizable split + PDF pane toggle ──
@@ -863,7 +912,7 @@ function renderTableGrid() {
                 const td = document.createElement('td');
                 td.id = `cell-${tIdx}-${r}-${c}`;
 
-                const err = validateCellText(r, c, cell.text, cell.confidence);
+                const err = validateCellText(r, c, cell.text, cell.confidence, table, tIdx);
                 if (err) {
                     allErrors.push({ tIdx, r, c, msg: err });
                     td.className = (err.includes('dấu') || cell.confidence < 0.85) ? 'cell-warn' : 'cell-err';
@@ -889,9 +938,15 @@ function renderTableGrid() {
                     </div>`;
 
                 const input = td.querySelector('.cell-input');
-                input.addEventListener('focus', () => focusCell(tIdx, r, c));
+                input.addEventListener('focus', () => {
+                    input.dataset.lastVal = input.value;
+                    focusCell(tIdx, r, c);
+                });
                 input.addEventListener('blur', () => td.classList.remove('cell-focus'));
-                input.addEventListener('change', (e) => handleCellChange(tIdx, r, c, e.target.value));
+                input.addEventListener('change', (e) => {
+                    handleCellChange(tIdx, r, c, e.target.value, e.target.dataset.lastVal);
+                    e.target.dataset.lastVal = e.target.value;
+                });
 
                 tr.appendChild(td);
             }
@@ -929,17 +984,23 @@ function focusCell(tIdx, r, c) {
     if (box) { box.classList.add('active'); box.scrollIntoView({ behavior: 'smooth', block: 'center' }); }
 }
 
-function validateCellText(row, col, text, confidence) {
+function validateCellText(row, col, text, confidence, table, tIdx) {
     if (row === 0) return '';
+    const colMap = table ? headerFieldMap(table) : {};
+    const field = colMap[col] || '';
+    if (field) {
+        return validateCellByField(field, text, confidence, false);
+    }
     if (col === 1 && text) {
         if (/\d/.test(text)) return 'Tên chứa chữ số';
-        const raw = text.normalize('NFD').replace(/[\u0300-\u036f]/g, '');
-        if (raw === text && text.trim().length > 3) return 'Họ tên thiếu dấu VN';
     }
-    if (col === 2 && text) {
+    if (col === 2 && text && /cccd|cmnd|căn cước/i.test(
+        (table?.cells?.find(c => c.row === 0 && c.col === col)?.text || '')
+    )) {
         if (!/^\d{12}$/.test(text.replace(/\s+/g, ''))) return 'CCCD phải có 12 số';
     }
-    if (!text) return 'Không được trống';
+    if (!text?.trim()) return 'Không được trống';
+    if (confidence < 0.85) return 'Độ tin cậy thấp';
     return '';
 }
 
@@ -952,25 +1013,80 @@ function updateValidationAlerts(errors) {
     }
 }
 
-async function handleCellChange(tIdx, r, c, val) {
+async function handleCellChange(tIdx, r, c, val, oldVal) {
     const page = getPageData(currentPageNumber);
     if (!page) return;
-    const cell = page.tables[tIdx]?.cells.find(cl => cl.row === r && cl.col === c);
+    const table = page.tables[tIdx];
+    const cell = table?.cells.find(cl => cl.row === r && cl.col === c);
+    const previous = oldVal !== undefined ? oldVal : (cell?.text || '');
     if (cell) { cell.text = val; cell.confidence = 1.0; }
+
+    const updates = [{ page_number: currentPageNumber, table_index: tIdx, row: r, col: c, text: val }];
+
+    if (previous && previous !== val && r > 0) {
+        const matches = [];
+        table.cells.forEach(cl => {
+            if (cl.row > 0 && cl.text === previous && !(cl.row === r && cl.col === c)) {
+                matches.push({ row: cl.row, col: cl.col });
+            }
+        });
+        if (matches.length > 0) {
+            const applied = await showReplacePopover(matches, tIdx, previous, val);
+            if (applied?.length) {
+                applied.forEach(m => {
+                    const target = table.cells.find(cl => cl.row === m.row && cl.col === m.col);
+                    if (target) { target.text = val; target.confidence = 1.0; }
+                    updates.push({
+                        page_number: currentPageNumber,
+                        table_index: tIdx,
+                        row: m.row,
+                        col: m.col,
+                        text: val,
+                    });
+                });
+            }
+        }
+    }
 
     try {
         await fetch(`${API_BASE}/api/ocr/result/${jobId}`, {
             method: 'PUT',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ updates: [{ page_number: currentPageNumber, table_index: tIdx, row: r, col: c, text: val }] }),
+            body: JSON.stringify({ updates }),
         });
     } catch (e) { console.warn('Sync failed:', e); }
 
     renderTableGrid();
-    setTimeout(() => {
-        const input = document.querySelector(`.cell-input[data-table="${tIdx}"][data-row="${r}"][data-col="${c}"]`);
-        if (input) { input.focus(); const v = input.value; input.value = ''; input.value = v; }
-    }, 10);
+}
+
+function showReplacePopover(matches, tIdx, oldVal, newVal) {
+    return new Promise((resolve) => {
+        const pop = document.getElementById('replace-popover');
+        const list = document.getElementById('replace-popover-list');
+        if (!pop || !list) { resolve([]); return; }
+        list.innerHTML = matches.map((m, i) =>
+            `<label><input type="checkbox" data-i="${i}" checked> Dòng ${m.row + 1}, cột ${m.col + 1}</label>`
+        ).join('');
+        pop.classList.remove('hidden');
+        const onApply = () => {
+            const selected = [];
+            list.querySelectorAll('input:checked').forEach(cb => {
+                selected.push(matches[+cb.dataset.i]);
+            });
+            cleanup();
+            resolve(selected);
+        };
+        const onSkip = () => { cleanup(); resolve([]); };
+        const btnA = document.getElementById('btn-replace-apply');
+        const btnS = document.getElementById('btn-replace-skip');
+        btnA?.addEventListener('click', onApply, { once: true });
+        btnS?.addEventListener('click', onSkip, { once: true });
+        function cleanup() {
+            pop.classList.add('hidden');
+            btnA?.removeEventListener('click', onApply);
+            btnS?.removeEventListener('click', onSkip);
+        }
+    });
 }
 
 // ── Keyboard nav ──
@@ -999,12 +1115,4 @@ function setupKeyboard() {
     });
 }
 
-// ── Submit ──
-function submitBatch() {
-    let total = 0;
-    ocrData?.pages.forEach(p => p.tables.forEach(t => { total += Math.max(0, t.num_rows - 1); }));
-    successBatchCode.textContent = `BATCH-${jobId.toUpperCase()}`;
-    successTotalRecords.textContent = `${total} nhân sự`;
-    stopPolling();
-    setStep(3);
-}
+// submitBatch — batch-users.js

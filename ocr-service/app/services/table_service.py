@@ -894,3 +894,74 @@ def _save_result_to_disk(result: OcrResult) -> None:
         logger.debug("Result saved to %s", result_file)
     except Exception as e:
         logger.error("Failed to save result to disk: %s", e)
+
+
+def _find_pdf_for_job(job_id: str) -> Path | None:
+    """Tìm file PDF gốc theo job_id trong thư mục upload."""
+    pattern = f"{job_id}_*"
+    matches = sorted(settings.upload_path.glob(pattern))
+    for path in matches:
+        if path.suffix.lower() == ".pdf":
+            return path
+    return None
+
+
+def reocr_page(job_id: str, page_number: int, use_gpu: bool | None = None) -> PageResult:
+    """
+    OCR lại một trang PDF đã upload (không áp dụng job nạp từ Excel).
+    """
+    job = get_job(job_id)
+    if job is None:
+        raise ValueError(f"Job not found: {job_id}")
+
+    pdf_path = _find_pdf_for_job(job_id)
+    if pdf_path is None:
+        raise ValueError(
+            "Không tìm thấy PDF gốc — job có thể từ Excel import."
+        )
+
+    if page_number < 1 or page_number > job.total_pages:
+        raise ValueError(f"Trang không hợp lệ: {page_number}")
+
+    gpu = job.use_gpu if use_gpu is None else use_gpu
+    _set_page_status(job, page_number, PageStatus.PROCESSING)
+    _append_log(job, f"▶ OCR lại trang {page_number}…")
+
+    image_path = convert_pdf_page(pdf_path, job_id, page_number)
+    page_result = process_page(image_path, page_number=page_number, use_gpu=gpu)
+
+    result = get_result(job_id)
+    if result is None:
+        result = OcrResult(
+            job_id=job_id,
+            filename=job.filename,
+            total_pages=job.total_pages,
+            pages=[],
+            created_at=job.created_at,
+        )
+
+    replaced = False
+    new_pages: list[PageResult] = []
+    for p in result.pages:
+        if p.page_number == page_number:
+            new_pages.append(page_result)
+            replaced = True
+        else:
+            new_pages.append(p)
+    if not replaced:
+        new_pages.append(page_result)
+    new_pages.sort(key=lambda p: p.page_number)
+
+    result.pages = new_pages
+    result.updated_at = datetime.now()
+    _results[job_id] = result
+    _save_result_to_disk(result)
+
+    _set_page_status(job, page_number, PageStatus.COMPLETED)
+    _append_log(
+        job,
+        f"✓ OCR lại trang {page_number} hoàn tất",
+        LogLevel.SUCCESS,
+    )
+    job.updated_at = datetime.now()
+    return page_result

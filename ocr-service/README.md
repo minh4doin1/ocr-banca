@@ -87,10 +87,40 @@ Script vận hành host:
 | `PUT` | `/api/ocr/result/{job_id}` | Cập nhật dữ liệu sau review |
 | `GET` | `/api/ocr/result/{job_id}/export` | Xuất Excel |
 | `GET` | `/api/ocr/jobs` | Danh sách jobs |
+| `POST` | `/api/ocr/result/{job_id}/page/{page_number}/reocr` | OCR lại một trang PDF |
+| `GET` | `/api/users/field-config` | Trường bắt buộc + map header OCR |
+| `POST` | `/api/users/enrich` | Auto-match mã CN/ĐL + enrich theo email |
+| `GET` | `/api/users/lookup/agencies` | Tra cứu chi nhánh (proxy Banca Core) |
+| `GET` | `/api/users/lookup/agents` | Tra cứu đại lý (proxy Banca Core) |
 | `GET` | `/api/users/preview-from-job/{job_id}` | Xem trước user map từ job OCR |
 | `POST` | `/api/users/provision-batch` | Tạo lô user trên Keycloak |
 
-## Tạo lô User trên Keycloak
+## Enrich mã chi nhánh / đại lý (Banca Core)
+
+OCR trích xuất `username`, `name`, `cccd`, tên chi nhánh, phòng GD. Mã **chi nhánh**
+và **đại lý** được enrich qua Banca Core v2 (không tra CCCD).
+
+### Cấu hình `.env`
+
+```env
+BANCA_CORE_BASE_URL=http://localhost:8996
+BANCA_CORE_KEYCLOAK_REALM=agribank
+BANCA_CORE_KEYCLOAK_CLIENT_ID=banca-seller
+BANCA_CORE_KEYCLOAK_CLIENT_SECRET=YOUR_SECRET
+BANCA_CORE_MATCH_THRESHOLD=0.88
+BANCA_CORE_MATCH_SUGGEST_THRESHOLD=0.75
+USER_REQUIRED_FIELDS=username,name,cccd
+```
+
+Luồng enrich (`POST /api/users/enrich`):
+
+1. **Auto-match** tên chi nhánh + phòng GD (fuzzy tiếng Việt).
+2. Nếu thiếu mã, **tra cứu đại lý theo email** (`GET /api/v1/agents/email`).
+3. Người dùng có thể chọn thủ công qua lookup API hoặc UI picker trên frontend.
+
+Attributes ghi lên Keycloak: `cccd`, `fullName`, `branchCode`, `agentCode`,
+`branchName`, `departmentName`.
+
 
 Module này tạo/đồng bộ user lên Keycloak 24 qua Admin REST API bằng
 **Service Account** (grant `client_credentials`) — KHÔNG dùng tài khoản admin.
@@ -133,9 +163,11 @@ Khi user đã tồn tại, xử lý theo `on_conflict` (per-user hoặc mặc đ
   "users": [
     {
       "username": "nguyenvana",
+      "name": "Nguyễn Văn A",
+      "cccd": "001234567890",
       "email": "a@example.com",
-      "first_name": "Văn A",
-      "last_name": "Nguyễn",
+      "branch_code": "001",
+      "agent_code": "DL001",
       "on_conflict": "reset_both"   // ghi đè mặc định của lô cho user này
     }
   ]
@@ -153,12 +185,18 @@ ocr-service/
 ├── app/
 │   ├── main.py              # FastAPI entry point
 │   ├── config.py            # Settings
-│   ├── routers/ocr.py       # API routes
+│   ├── routers/
+│   │   ├── ocr.py           # API routes OCR
+│   │   └── users.py         # Enrich + provision user
 │   ├── services/
 │   │   ├── pdf_service.py   # PDF → Image
 │   │   ├── ocr_service.py   # OCR pipeline
-│   │   ├── table_service.py # Table extraction
-│   │   └── excel_service.py # Excel export
+│   │   ├── table_service.py # Table extraction + reocr
+│   │   ├── excel_service.py # Excel export
+│   │   ├── keycloak_service.py
+│   │   ├── banca_core_service.py
+│   │   ├── branch_agent_matcher.py
+│   │   └── user_mapping.py
 │   ├── models/schemas.py    # Pydantic models
 │   └── utils/image_utils.py # Helpers
 ├── storage/                 # Runtime file storage

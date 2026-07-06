@@ -94,10 +94,33 @@ class Settings(BaseSettings):
     keycloak_header_map: str = (
         "username:tên đăng nhập|tendangnhap|username|user|tài khoản|tai khoan;"
         "email:email|thư điện tử|thu dien tu;"
+        "name:họ tên|họ và tên|hoten|full name|fullname;"
         "first_name:tên|first name|firstname;"
-        "last_name:họ|họ và tên|last name|lastname;"
+        "last_name:họ|last name|lastname;"
+        "cccd:cccd|căn cước|can cuoc|cmnd|số cccd|so cccd;"
+        "branch_name:chi nhánh|chi nhanh|tên chi nhánh|ten chi nhanh|cn|branch;"
+        "department_name:phòng giao dịch|phong giao dich|pgd|phòng gd|phong gd|đơn vị|don vi;"
+        "branch_code:mã chi nhánh|ma chi nhanh|mã cn|ma cn|branch code;"
+        "agent_code:mã đại lý|ma dai ly|mã đl|ma dl|agent code|agency code;"
         "password:mật khẩu|mat khau|password|matkhau"
     )
+
+    # --- Banca Core (enrich mã chi nhánh / đại lý) ---
+    banca_core_enabled: bool = False
+    banca_core_url: str = "http://localhost:8996"
+    banca_core_kc_base_url: str = "http://localhost:8080"
+    banca_core_kc_realm: str = "agribank"
+    banca_core_kc_client_id: str = ""
+    banca_core_kc_client_secret: str = ""
+    banca_core_verify_ssl: bool = True
+    banca_core_timeout_seconds: int = 30
+    banca_core_token_leeway_seconds: int = 30
+    banca_core_match_threshold: float = 0.85
+    banca_core_match_suggest_threshold: float = 0.65
+    banca_core_match_min_gap: float = 0.08
+
+    # Trường bắt buộc khi tạo user (comma-separated)
+    user_required_fields: str = "username,name,cccd"
 
     class Config:
         env_file = ".env"
@@ -207,6 +230,19 @@ class Settings(BaseSettings):
             if field and alias_list:
                 result[field] = alias_list
         return result
+
+    @property
+    def user_required_fields_list(self) -> list[str]:
+        return [f.strip() for f in self.user_required_fields.split(",") if f.strip()]
+
+    @property
+    def banca_core_configured(self) -> bool:
+        return bool(
+            self.banca_core_enabled
+            and self.banca_core_url.strip()
+            and self.banca_core_kc_client_id.strip()
+            and self.banca_core_kc_client_secret.strip()
+        )
 
 
 settings = Settings()

@@ -127,9 +127,15 @@ def _client_existing_user() -> MagicMock:
     return client
 
 
+def _user(**kwargs) -> KeycloakUserInput:
+    data = {"username": "u", "name": "Nguyễn Văn A", "cccd": "001234567890"}
+    data.update(kwargs)
+    return KeycloakUserInput(**data)
+
+
 def test_provision_creates_new_user():
     client = _client_new_user()
-    user = KeycloakUserInput(username="u", password="Pass@123")
+    user = _user(password="Pass@123")
     result = _provision_one(
         client,
         user,
@@ -146,7 +152,7 @@ def test_provision_creates_new_user():
 
 def test_provision_skip_existing():
     client = _client_existing_user()
-    user = KeycloakUserInput(username="u")
+    user = _user()
     result = _provision_one(
         client,
         user,
@@ -162,7 +168,7 @@ def test_provision_skip_existing():
 
 def test_provision_reset_password():
     client = _client_existing_user()
-    user = KeycloakUserInput(username="u", password="New@123")
+    user = _user(password="New@123")
     result = _provision_one(
         client,
         user,
@@ -182,7 +188,7 @@ def test_provision_reset_password():
 
 def test_provision_reset_otp():
     client = _client_existing_user()
-    user = KeycloakUserInput(username="u")
+    user = _user()
     result = _provision_one(
         client,
         user,
@@ -197,7 +203,7 @@ def test_provision_reset_otp():
 
 def test_provision_reset_both():
     client = _client_existing_user()
-    user = KeycloakUserInput(username="u", password="Both@123")
+    user = _user(password="Both@123")
     result = _provision_one(
         client,
         user,
@@ -213,7 +219,7 @@ def test_provision_reset_both():
 def test_per_user_on_conflict_overrides_batch_default():
     """on_conflict của user ghi đè mặc định của lô."""
     client = _client_existing_user()
-    user = KeycloakUserInput(username="u", on_conflict=OnConflictAction.RESET_OTP)
+    user = _user(on_conflict=OnConflictAction.RESET_OTP)
     result = _provision_one(
         client,
         user,
@@ -223,3 +229,37 @@ def test_per_user_on_conflict_overrides_batch_default():
     )
     assert result.status == ProvisionStatus.UPDATED
     client.reset_otp.assert_called_once()
+
+
+def test_map_cccd_and_name_fields():
+    """Map cột CCCD và Họ tên."""
+    table = _make_table(
+        ["Username", "Họ tên", "CCCD", "Email"],
+        [["user1", "Nguyễn Văn A", "001234567890", "a@example.com"]],
+    )
+    users, _ = map_result_to_users(_make_result(table))
+    assert len(users) == 1
+    assert users[0].name == "Nguyễn Văn A"
+    assert users[0].cccd == "001234567890"
+
+
+def test_validate_user_fields_missing_cccd():
+    from app.services.user_mapping import build_keycloak_attributes, validate_user_fields
+
+    user = KeycloakUserInput(username="u", name="Test User")
+    missing = validate_user_fields(user)
+    assert "cccd" in missing
+
+    user2 = KeycloakUserInput(
+        username="u",
+        name="Test",
+        cccd="001234567890",
+        branch_code="001",
+        agent_code="DL1",
+    )
+    attrs = build_keycloak_attributes(user2)
+    assert attrs["cccd"] == ["001234567890"]
+    assert attrs["branchCode"] == ["001"]
+    assert attrs["agentCode"] == ["DL1"]
+    assert attrs["fullName"] == ["Test"]
+

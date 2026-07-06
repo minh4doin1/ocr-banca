@@ -46,6 +46,7 @@ from app.services.table_service import (
     set_result,
     update_job_queue_position,
     update_result,
+    reocr_page,
 )
 
 logger = logging.getLogger(__name__)
@@ -431,6 +432,25 @@ async def update_ocr_result(job_id: str, request: UpdateResultRequest):
         return update_result(job_id, request.updates)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
+
+
+@router.post(
+    "/result/{job_id}/page/{page_number}/reocr",
+    response_model=OcrResult,
+    summary="OCR lại một trang PDF",
+)
+async def reocr_single_page(job_id: str, page_number: int):
+    try:
+        reocr_page(job_id, page_number)
+        result = get_result(job_id)
+        if result is None:
+            raise HTTPException(status_code=404, detail="Kết quả không tìm thấy")
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error("Re-OCR page failed: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.get("/result/{job_id}/export")
