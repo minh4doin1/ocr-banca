@@ -251,3 +251,56 @@ Health tốt khi `status: "healthy"`, `gpu_available: true`. Phase 4 bật thì 
 | `ocr-service\scripts\setup_gpu_windows.ps1` | Cài GPU Paddle + torch CPU |
 | `ocr-service\scripts\setup_vietocr_gpu_worker.ps1` | Phase 4 VietOCR GPU |
 | `ocr-service\scripts\test_phase4_vietocr_gpu.py` | Test OCR trang 2 + benchmark |
+
+---
+
+## 10. SSH deploy từ máy khác
+
+Máy host **đã có OpenSSH Server** (`sshd` port **22**). Cần thêm **public key** máy deploy (user thuộc nhóm Administrators dùng file đặc biệt, không phải `~/.ssh/authorized_keys`).
+
+### 10.1 Thiết lập trên máy host (1 lần, chạy **Run as Administrator**)
+
+Lấy public key trên máy deploy (Linux/macOS):
+
+```bash
+cat ~/.ssh/id_ed25519.pub
+# hoặc tạo mới: ssh-keygen -t ed25519 -C "deploy@ci"
+```
+
+Trên máy host Windows:
+
+```powershell
+cd C:\Projects\ocr-banca
+powershell -ExecutionPolicy Bypass -File .\ocr-release-kit\Setup-SshDeploy.ps1 -PublicKey "ssh-ed25519 AAAA... deploy@ci"
+```
+
+Script sẽ: bật `sshd`, mở firewall port 22, ghi key vào `C:\ProgramData\ssh\administrators_authorized_keys`.
+
+### 10.2 Kết nối SSH
+
+| Kênh | Lệnh (user hiện tại: `lamanhzuto2k`) |
+|------|--------------------------------------|
+| **Tailscale** (khuyến nghị) | `ssh lamanhzuto2k@100.124.180.55` |
+| LAN | `ssh lamanhzuto2k@<IP-LAN>` |
+| Hostname | `ssh lamanhzuto2k@DESKTOP-20OUIGH` |
+
+### 10.3 Deploy từ máy khác (1 lệnh)
+
+```bash
+ssh lamanhzuto2k@100.124.180.55 \
+  "powershell -ExecutionPolicy Bypass -File C:/Projects/ocr-banca/ocr-release-kit/Deploy-Remote.ps1"
+```
+
+Hoặc SSH vào rồi chạy tay:
+
+```powershell
+cd C:\Projects\ocr-banca
+git pull
+.\ocr-release-kit\Start-OcrSystem.ps1
+```
+
+### 10.4 Lưu ý bảo mật
+
+- Ưu tiên **SSH key**, tắt password nếu có thể (`PasswordAuthentication no` trong `C:\ProgramData\ssh\sshd_config`, restart `sshd`).
+- Chỉ mở port 22 qua **Tailscale** hoặc LAN nội bộ; tránh expose port 22 ra internet công cộng.
+- User deploy nên có quyền `git pull` vào `C:\Projects\ocr-banca`.

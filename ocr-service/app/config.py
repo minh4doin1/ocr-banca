@@ -35,7 +35,7 @@ class Settings(BaseSettings):
     ocr_api_timeout_seconds: int = 60
 
     # --- PDF Processing ---
-    pdf_dpi: int = 250
+    pdf_dpi: int = 300
     poppler_path: str = ""
     poppler_thread_count: int = 4
     pdf_lazy_convert: bool = True
@@ -66,7 +66,7 @@ class Settings(BaseSettings):
     ocr_sso_email_col: int = -1
 
     # --- VietOCR / CPU tuning ---
-    vietocr_batch_size: int = 32
+    vietocr_batch_size: int = 64
     torch_num_threads: int = 4
     cell_ink_min_ratio: float = 0.015
     # Phase 4: VietOCR torch-CUDA trong process con (tránh xung đột Paddle GPU)
@@ -128,21 +128,37 @@ class Settings(BaseSettings):
     # Map tiêu đề cột (Excel/OCR, chữ thường không dấu cách thừa) -> field Keycloak.
     # Định dạng: "field:alias1|alias2;field2:aliasA|aliasB"
     keycloak_header_map: str = (
-        "username:tên đăng nhập|tendangnhap|username|user|tài khoản|tai khoan|user ipcas|ipcas;"
+        "username:tên đăng nhập|tendangnhap|username|user|tài khoản|tai khoan;"
         "email:email|thư điện tử|thu dien tu|email agribank;"
         "name:họ tên|họ và tên|hoten|full name|fullname;"
         "first_name:tên|first name|firstname;"
         "last_name:họ|last name|lastname;"
         "cccd:cccd|căn cước|can cuoc|cmnd|số cccd|so cccd;"
         "branch_name:chi nhánh|chi nhanh|tên chi nhánh|ten chi nhanh|cn|branch;"
-        "department_name:phòng giao dịch|phong giao dich|pgd|phòng gd|phong gd|đơn vị|don vi;"
+        "department_name:phòng giao dịch|phong giao dich|pgd|phòng gd|phong gd|phòng/đơn vị|phong/don vi;"
         "branch_code:mã chi nhánh|ma chi nhanh|mã cn|ma cn|branch code;"
         "agent_code:mã đại lý|ma dai ly|mã đl|ma dl|agent code|agency code;"
         "ipcas_code:mã ipcas|ma ipcas|ipcas|user ipcas|mã ipcas;"
         "phone:số điện thoại|so dien thoai|sdt|sđt|phone|điện thoại|dien thoai|sđt;"
-        "unit_code:mã đơn vị|ma don vi|mã dv|ma dv|mã đv|ma dv|unit code;"
-        "role:vai trò|vai tro|role|quyền|quyen|chức danh|chuc danh;"
+        "unit_code:mã đơn vị|ma don vi|mã dv|ma dv|mã đv|ma dv|unit code|ghi chú|ghichu;"
+        "role:vai trò|vai tro|role|quyền|quyen|chức danh|chuc danh|phân quyền|phan quyen;"
         "password:mật khẩu|mat khau|password|matkhau"
+    )
+
+    field_labels_vi_map: str = (
+        "email:Email;"
+        "first_name:Tên;"
+        "last_name:Họ;"
+        "branch_code:Mã CN;"
+        "ipcas_code:IPCAS;"
+        "cccd:CCCD;"
+        "phone:SĐT;"
+        "unit_code:Mã ĐV;"
+        "role:Vai trò;"
+        "department_name:Phòng/Đơn vị;"
+        "branch_name:Chi nhánh;"
+        "agent_code:Mã ĐL;"
+        "name:Họ và tên"
     )
 
     # --- Banca Core (enrich mã chi nhánh / đại lý) ---
@@ -280,6 +296,13 @@ class Settings(BaseSettings):
     @property
     def keycloak_role_map_parsed(self) -> dict[str, str]:
         """{alias_normalized: role_name}"""
+        import unicodedata
+
+        def _ascii_alias(s: str) -> str:
+            s = s.strip().lower().replace("đ", "d")
+            s = unicodedata.normalize("NFD", s)
+            return "".join(c for c in s if unicodedata.category(c) != "Mn")
+
         result: dict[str, str] = {}
         for group in self.keycloak_role_map.split(";"):
             group = group.strip()
@@ -290,6 +313,9 @@ class Settings(BaseSettings):
             role = role.strip()
             if alias and role:
                 result[alias] = role
+                ascii_alias = _ascii_alias(alias)
+                if ascii_alias and ascii_alias not in result:
+                    result[ascii_alias] = role
         return result
 
     @property
@@ -312,6 +338,19 @@ class Settings(BaseSettings):
     @property
     def keycloak_roles_configured(self) -> bool:
         return bool(self.keycloak_roles_client_id.strip())
+
+    @property
+    def field_labels_vi(self) -> dict[str, str]:
+        result: dict[str, str] = {}
+        for group in self.field_labels_vi_map.split(";"):
+            group = group.strip()
+            if not group or ":" not in group:
+                continue
+            field, label = group.split(":", 1)
+            field, label = field.strip(), label.strip()
+            if field and label:
+                result[field] = label
+        return result
 
     @property
     def banca_core_configured(self) -> bool:

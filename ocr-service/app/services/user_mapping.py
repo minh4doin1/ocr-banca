@@ -40,7 +40,23 @@ _SSO_DATA_COL_FIELDS: dict[int, str] = {
     5: "email",
     6: "phone",
     7: "role",
+    8: "unit_code",
 }
+
+_SSO_COLUMN_LABELS: list[dict[str, str]] = [
+    {"col": "0", "field": "stt", "label": "STT"},
+    {"col": "1", "field": "name", "label": "Họ và tên"},
+    {"col": "2", "field": "department_name", "label": "Phòng/Đơn vị"},
+    {"col": "3", "field": "ipcas_code", "label": "User IPCAS"},
+    {"col": "4", "field": "cccd", "label": "Số CCCD"},
+    {"col": "5", "field": "email", "label": "Email tại Agribank"},
+    {"col": "6", "field": "phone", "label": "Số điện thoại"},
+    {"col": "7", "field": "role", "label": "Phân quyền"},
+    {"col": "8", "field": "unit_code", "label": "Ghi chú / Mã ĐV"},
+]
+
+_UNIT_CODE_RE = re.compile(r"^\d{6,10}$")
+_DEPARTMENT_CODE_RE = re.compile(r"^(\d{4})\s+(.+)$")
 
 
 def _normalize(text: str) -> str:
@@ -63,6 +79,15 @@ def normalize_role(raw: str) -> str:
     role_map = settings.keycloak_role_map_parsed
     if key in role_map:
         return role_map[key]
+    # OCR often returns combined/noisy role labels; map by intent keywords.
+    if any(k in key for k in ("quan tri", "admin")):
+        return "banca-admin"
+    if any(k in key for k in ("phe duyet", "duyet vien", "controller")):
+        return "banca-accounting-controller"
+    if any(k in key for k in ("ke toan", "toan vien", "operator")):
+        return "banca-accounting-operator"
+    if any(k in key for k in ("dai ly", "seller", "sales")):
+        return "banca-seller"
     if key in settings.keycloak_valid_roles:
         return key
     return ""
@@ -79,14 +104,14 @@ def _split_vn_name(full_name: str) -> tuple[str, str]:
 
 def finalize_user(user: KeycloakUserInput) -> KeycloakUserInput:
     """username=email, tách họ/tên, chuẩn hoá role."""
-    email = (user.email or "").strip()
+    email = (user.email or "").strip().lower()
     username = (user.username or "").strip()
     if email:
+        user.email = email
         user.username = email
-        if not user.email:
-            user.email = email
     elif username and "@" in username:
-        user.email = username
+        user.email = username.lower()
+        user.username = user.email
 
     if user.name.strip() and not (user.first_name.strip() and user.last_name.strip()):
         first, last = _split_vn_name(user.name)
@@ -100,7 +125,53 @@ def finalize_user(user: KeycloakUserInput) -> KeycloakUserInput:
 
     user.cccd = re.sub(r"\s", "", user.cccd or "")
     user.phone = re.sub(r"\s", "", user.phone or "")
+    user.ipcas_code = (user.ipcas_code or "").strip().upper()
+    user.unit_code = re.sub(r"\s", "", user.unit_code or "")
     return user
+
+
+def _parse_department_cell(text: str) -> tuple[str, str, str]:
+    """Parse '6900 Hội sở' -> (full, branch_code, branch_name)."""
+    t = (text or "").strip()
+    if not t:
+        return "", "", ""
+    m = _DEPARTMENT_CODE_RE.match(t)
+    if m:
+        return t, m.group(1), m.group(2).strip()
+    return t, "", ""
+
+
+def _parse_unit_or_notes(raw: str) -> tuple[str, str]:
+    """Cột Ghi chú: số 6-10 chữ số -> unit_code, còn lại -> notes."""
+    compact = re.sub(r"\s", "", (raw or "").strip())
+    if _UNIT_CODE_RE.fullmatch(compact):
+        return compact, ""
+    return "", (raw or "").strip()
+
+
+def _derive_agribank_email(seed: str) -> str:
+    """Build agribank email from IPCAS/username-like seed text."""
+    raw = (seed or "").strip().lower()
+    if not raw:
+        return ""
+    local = raw.split("@", 1)[0]
+    local = re.sub(r"\s+", "", local)
+    local = re.sub(r"[^a-z0-9._-]", "", local)
+    if not local:
+        return ""
+    # Reject OCR garbage that often comes from domain fragments.
+    if any(token in local for token in ("agribank", "bank.com.vn", "com.vn")):
+        return ""
+    # IPCAS/account seeds are expected to be compact identifiers, not 1-char or dotted domains.
+    if "." in local:
+        return ""
+    if not re.fullmatch(r"[a-z][a-z0-9_-]{2,24}", local):
+        return ""
+    return f"{local}@agribank.com.vn"
+
+
+def get_sso_column_labels() -> list[dict[str, str]]:
+    return list(_SSO_COLUMN_LABELS)
 
 
 def _build_matrix(table: TableData) -> list[list[str]]:
@@ -190,28 +261,42 @@ def _field_value(data: dict, field: str) -> str:
 
 def validate_user_fields(user: KeycloakUserInput) -> list[str]:
     """Trả danh sách trường bắt buộc còn thiếu hoặc không hợp lệ."""
+    return list(validate_user_field_errors(user).keys())
+
+
+def validate_user_field_errors(user: KeycloakUserInput) -> dict[str, str]:
+    """Trả map field -> thông báo lỗi tiếng Việt."""
     user = finalize_user(user)
-    missing: list[str] = []
+    errors: dict[str, str] = {}
     data = user.model_dump()
+    labels = settings.field_labels_vi
 
     for field in settings.user_required_fields_list:
         val = _field_value(data, field)
         if not val:
-            missing.append(field)
+            label = labels.get(field, field)
+            errors[field] = f"Thiếu {label}"
+
+    # Keycloak profile hard-requirement in production realm.
+    for field in ("branch_code", "phone", "cccd"):
+        if not _field_value(data, field):
+            label = labels.get(field, field)
+            errors[field] = f"Thiếu {label}"
 
     if user.role and user.role not in settings.keycloak_valid_roles:
-        if "role" not in missing:
-            missing.append("role")
+        errors["role"] = "Vai trò không hợp lệ"
 
     if user.cccd and not re.fullmatch(r"\d{12}", user.cccd):
-        if "cccd" not in missing:
-            missing.append("cccd")
+        errors["cccd"] = "CCCD phải có 12 số"
 
     if user.phone and not re.fullmatch(r"0\d{8,10}", user.phone):
-        if "phone" not in missing:
-            missing.append("phone")
+        errors["phone"] = "SĐT không hợp lệ"
 
-    return missing
+    email = (user.email or "").strip()
+    if email and not email.endswith("@agribank.com.vn"):
+        errors["email"] = "Email phải thuộc @agribank.com.vn"
+
+    return errors
 
 
 def build_keycloak_attributes(user: KeycloakUserInput) -> dict[str, list[str]]:
@@ -241,6 +326,14 @@ def build_keycloak_attributes(user: KeycloakUserInput) -> dict[str, list[str]]:
             continue
         key = attr_map.get(field, field)
         attrs[key] = [str(val).strip()]
+
+    # Compatibility aliases for realms requiring these exact profile keys.
+    if field_values["branch_code"]:
+        attrs.setdefault("branchId", [str(field_values["branch_code"]).strip()])
+    if field_values["phone"]:
+        attrs.setdefault("phone", [str(field_values["phone"]).strip()])
+    if field_values["cccd"]:
+        attrs.setdefault("idNo", [str(field_values["cccd"]).strip()])
 
     if user.attributes:
         for k, v in user.attributes.items():
@@ -278,16 +371,39 @@ def map_table_to_users(
                 return _extract_cccd_from_cell(raw)
             if field == "role":
                 return normalize_role(raw) or raw
+            if field == "unit_code":
+                unit, _notes = _parse_unit_or_notes(raw)
+                return unit
             return raw
 
         username = _val("username")
         email = _val("email")
+        ipcas = _val("ipcas_code")
+
+        # SSO fallback: email column can be blank OCR-wise, but IPCAS is present.
+        if not email and ipcas:
+            email = _derive_agribank_email(ipcas)
+        if not username:
+            username = email or _derive_agribank_email(ipcas)
         if not username and not email:
             continue
 
         first_name = _val("first_name")
         last_name = _val("last_name")
         name = _compose_name(first_name, last_name, _val("name"))
+
+        dept_raw = _val("department_name")
+        dept_name, parsed_branch_code, parsed_branch_name = _parse_department_cell(
+            dept_raw
+        )
+
+        unit_code = _val("unit_code")
+        notes = ""
+        unit_idx = col_to_field.get("unit_code")
+        if unit_idx is not None and unit_idx < len(row):
+            parsed_unit, notes = _parse_unit_or_notes(row[unit_idx])
+            if not unit_code:
+                unit_code = parsed_unit
 
         user = KeycloakUserInput(
             username=username or email,
@@ -296,13 +412,14 @@ def map_table_to_users(
             first_name=first_name,
             last_name=last_name,
             cccd=_val("cccd"),
-            branch_name=_val("branch_name"),
-            department_name=_val("department_name"),
-            branch_code=_val("branch_code"),
+            branch_name=_val("branch_name") or parsed_branch_name,
+            department_name=dept_name,
+            branch_code=_val("branch_code") or parsed_branch_code,
             agent_code=_val("agent_code"),
-            ipcas_code=_val("ipcas_code"),
+            ipcas_code=ipcas,
             phone=_val("phone"),
-            unit_code=_val("unit_code"),
+            unit_code=unit_code,
+            notes=notes,
             role=_val("role"),
             password=_val("password"),
         )
@@ -339,3 +456,104 @@ def map_result_to_users(
                 all_users.append(user)
 
     return all_users, warnings
+
+
+def _sso_col_field_map(num_cols: int) -> dict[int, str]:
+    """Map column index -> field name for SSO layout."""
+    out: dict[int, str] = {0: "stt"}
+    for col_idx, field in _SSO_DATA_COL_FIELDS.items():
+        if col_idx < num_cols:
+            out[col_idx] = field
+    return out
+
+
+def _validate_cell_for_field(field: str, text: str, confidence: float) -> str:
+    """Return error message or empty string."""
+    if field == "stt":
+        return ""
+    if not (text or "").strip():
+        label = settings.field_labels_vi.get(field, field)
+        return f"Thiếu {label}"
+    if field == "cccd" and not re.fullmatch(r"\d{12}", re.sub(r"\s", "", text)):
+        return "CCCD phải có 12 số"
+    if field == "phone" and not re.fullmatch(r"0\d{8,10}", re.sub(r"\s", "", text)):
+        return "SĐT không hợp lệ"
+    if field in ("name", "first_name") and re.search(r"\d", text):
+        return "Tên chứa chữ số"
+    if field == "email" and "@" in text and not text.lower().endswith(
+        "@agribank.com.vn"
+    ):
+        return "Email phải thuộc @agribank.com.vn"
+    if confidence < settings.ocr_confidence_threshold:
+        return "Độ tin cậy thấp"
+    return ""
+
+
+def validate_ocr_result(result: OcrResult) -> dict:
+    """Validate all cells in OCR result. Returns errors and warnings lists."""
+    from app.models.schemas import OcrCellValidationIssue
+
+    errors: list[OcrCellValidationIssue] = []
+    warnings: list[OcrCellValidationIssue] = []
+
+    for page in result.pages:
+        for table in page.tables:
+            is_sso = table.table_kind == "sso_agribank" or (
+                table.num_cols >= 7
+                and not any(
+                    c.row == 0 and "email" in (c.text or "").lower()
+                    for c in table.cells
+                )
+            )
+            col_fields = (
+                _sso_col_field_map(table.num_cols)
+                if is_sso
+                else {}
+            )
+            if not is_sso:
+                header_row = [
+                    c for c in table.cells if c.row == 0
+                ]
+                alias_map = settings.keycloak_header_map_parsed
+                for hc in header_row:
+                    norm = _normalize(hc.text)
+                    for field in _KNOWN_FIELDS:
+                        if norm in alias_map.get(field, []):
+                            col_fields[hc.col] = field
+                            break
+
+            for cell in table.cells:
+                if cell.row == 0 and not is_sso:
+                    continue
+                field = col_fields.get(cell.col, "")
+                if not field or field == "stt":
+                    continue
+                msg = _validate_cell_for_field(
+                    field, cell.text or "", cell.confidence
+                )
+                if not msg:
+                    continue
+                issue = OcrCellValidationIssue(
+                    page_number=page.page_number,
+                    table_index=table.table_index,
+                    row=cell.row,
+                    col=cell.col,
+                    field=field,
+                    message=msg,
+                    severity=(
+                        "warn"
+                        if "tin cậy" in msg.lower()
+                        else "error"
+                    ),
+                )
+                if issue.severity == "warn":
+                    warnings.append(issue)
+                else:
+                    errors.append(issue)
+
+    return {
+        "errors": errors,
+        "warnings": warnings,
+        "error_count": len(errors),
+        "warning_count": len(warnings),
+    }

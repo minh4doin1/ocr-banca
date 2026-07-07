@@ -25,6 +25,15 @@ _PREFIX_RE = re.compile(
     r"^(cn|chi nhanh|pgd|phong giao dich|phòng giao dịch)\s+",
     re.IGNORECASE,
 )
+_DEPT_CODE_RE = re.compile(r"^(\d{4})\s+(.+)$")
+
+
+def _parse_department_for_enrich(dept_name: str) -> tuple[str, str]:
+    """Parse '6900 Hội sở' -> (branch_code, branch_name)."""
+    m = _DEPT_CODE_RE.match((dept_name or "").strip())
+    if m:
+        return m.group(1), m.group(2).strip()
+    return "", ""
 
 
 def normalize_vn(text: str) -> str:
@@ -155,8 +164,17 @@ def enrich_user_row(
         row["match_status"] = MatchStatus.MANUAL.value
         return row
 
-    branch_name = row.get("branch_name") or ""
     dept_name = row.get("department_name") or ""
+    if dept_name and not row.get("branch_code"):
+        parsed_code, parsed_name = _parse_department_for_enrich(dept_name)
+        if parsed_code and not row.get("branch_code"):
+            row["branch_code"] = parsed_code
+        if parsed_name and not row.get("branch_name"):
+            row["branch_name"] = parsed_name
+
+    branch_name = row.get("branch_name") or ""
+    if not branch_name and dept_name:
+        branch_name = dept_name
 
     if branch_name and not row.get("branch_code"):
         match = match_branch_and_department(cli, branch_name, dept_name)
@@ -171,6 +189,22 @@ def enrich_user_row(
             row["department_name_matched"] = match.department_name_matched
         row["match_status"] = match.match_status.value
         row["match_confidence"] = match.match_confidence
+    elif row.get("branch_code") and not row.get("agent_code"):
+        try:
+            agencies = cli.search_agencies(row["branch_code"], size=10)
+            for a in agencies:
+                parsed = parse_agency_item(a)
+                code = (parsed.get("core_bank_code") or "").strip()
+                if code == row["branch_code"]:
+                    row["agent_code"] = parsed.get("agency_code", "") or row.get(
+                        "agent_code", ""
+                    )
+                    row["branch_name_matched"] = parsed.get("name", "")
+                    row["match_status"] = MatchStatus.AUTO.value
+                    row["enrich_source"] = "branch_code"
+                    break
+        except Exception as exc:
+            warnings.append(f"branch_code lookup: {exc}")
 
     email = (row.get("email") or "").strip()
     if email and (not row.get("branch_code") or not row.get("agent_code")):

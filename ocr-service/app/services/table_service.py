@@ -70,6 +70,7 @@ _jobs: dict[str, JobInfo] = {}
 _results: dict[str, OcrResult] = {}
 _job_remote_tokens: dict[str, str] = {}
 _jobs_lock = threading.RLock()
+_results_lock = threading.RLock()
 _pdf_prep_executor: ThreadPoolExecutor | None = None
 
 
@@ -256,19 +257,34 @@ def set_result(job_id: str, result: OcrResult) -> OcrResult:
 
 def _save_partial_result(job: JobInfo, pages: list[PageResult]) -> OcrResult:
     """Persist incremental OCR result after each page completes."""
-    is_complete = job.status == JobStatus.COMPLETED
-    result = OcrResult(
-        job_id=job.job_id,
-        filename=job.filename,
-        total_pages=job.total_pages,
-        pages=sorted(pages, key=lambda p: p.page_number),
-        is_complete=is_complete,
-        created_at=job.created_at,
-        updated_at=datetime.now(),
-    )
-    _results[job.job_id] = result
-    _save_result_to_disk(result)
-    return result
+    with _results_lock:
+        is_complete = job.status == JobStatus.COMPLETED
+        existing = get_result(job.job_id)
+
+        incoming_by_page = {p.page_number: p for p in pages}
+        merged_by_page: dict[int, PageResult] = {}
+
+        # Keep latest in-memory/disk page versions first (includes manual edits/re-ocr),
+        # then append newly processed pages from the running OCR pipeline.
+        if existing is not None:
+            for p in existing.pages:
+                merged_by_page[p.page_number] = p
+        for pn, page in incoming_by_page.items():
+            if pn not in merged_by_page:
+                merged_by_page[pn] = page
+
+        result = OcrResult(
+            job_id=job.job_id,
+            filename=job.filename,
+            total_pages=job.total_pages,
+            pages=[merged_by_page[pn] for pn in sorted(merged_by_page)],
+            is_complete=is_complete,
+            created_at=job.created_at,
+            updated_at=datetime.now(),
+        )
+        _results[job.job_id] = result
+        _save_result_to_disk(result)
+        return result
 
 
 def _process_local_page_standard(
@@ -847,26 +863,27 @@ def update_result(job_id: str, updates: list[UpdateCellRequest]) -> OcrResult:
 
     Only pages that have been OCR'd can be updated.
     """
-    result = get_result(job_id)
-    if result is None:
-        raise ValueError(f"Result not found for job: {job_id}")
+    with _results_lock:
+        result = get_result(job_id)
+        if result is None:
+            raise ValueError(f"Result not found for job: {job_id}")
 
-    for update in updates:
-        for page in result.pages:
-            if page.page_number != update.page_number:
-                continue
-            for table in page.tables:
-                if table.table_index != update.table_index:
+        for update in updates:
+            for page in result.pages:
+                if page.page_number != update.page_number:
                     continue
-                for cell in table.cells:
-                    if cell.row == update.row and cell.col == update.col:
-                        cell.text = update.text
-                        cell.confidence = 1.0
-                        break
+                for table in page.tables:
+                    if table.table_index != update.table_index:
+                        continue
+                    for cell in table.cells:
+                        if cell.row == update.row and cell.col == update.col:
+                            cell.text = update.text
+                            cell.confidence = 1.0
+                            break
 
-    result.updated_at = datetime.now()
-    _results[job_id] = result
-    _save_result_to_disk(result)
+        result.updated_at = datetime.now()
+        _results[job_id] = result
+        _save_result_to_disk(result)
 
     job = get_job(job_id)
     if job and job.remote_job_id and job.remote_url:

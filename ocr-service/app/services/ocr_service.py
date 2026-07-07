@@ -641,12 +641,14 @@ def _extract_table(
         if not cell_data_list and not html_str:
             return None
 
+        table_kind = ""
         if (
             cell_data_list
             and settings.ocr_sso_enhance
             and _looks_like_sso_cells(cell_data_list)
         ):
             cell_data_list = _postprocess_sso_cells(cell_data_list)
+            table_kind = "sso_agribank"
 
         max_row = max((c.row for c in cell_data_list), default=0)
         max_col = max((c.col for c in cell_data_list), default=0)
@@ -657,6 +659,7 @@ def _extract_table(
             num_cols=max_col + 1,
             cells=cell_data_list,
             html=html_str,
+            table_kind=table_kind,
         )
 
     except Exception as e:
@@ -969,10 +972,17 @@ def _reconstruct_table_from_lines(
 
     grid = _assign_lines_to_grid(lines, row_anchors)
 
+    max_col = max((col for (_, col) in grid.keys()), default=0)
+    email_col = _resolve_sso_email_col(max_col + 1)
+
     cells: list[CellData] = []
     for (row, col), members in grid.items():
         members.sort(key=lambda m: (m["y1"], m["x1"]))
-        text = _normalize_cell_text(" ".join(m["text"] for m in members))
+        text = _normalize_cell_text(
+            " ".join(m["text"] for m in members),
+            col=col,
+            email_col=email_col,
+        )
         conf = float(np.mean([m["conf"] for m in members])) if members else 0.0
         gx1 = tx1 + min(m["x1"] for m in members)
         gy1 = ty1 + min(m["y1"] for m in members)
@@ -992,6 +1002,8 @@ def _reconstruct_table_from_lines(
     cells = _fix_cccd_email_columns(cells)
     if settings.ocr_sso_enhance and settings.ocr_sso_row_merge:
         cells = _merge_fragment_sso_rows(cells)
+    if settings.ocr_sso_email_fixed_domain and cells:
+        cells = _apply_fixed_email_domain(cells)
     cells.sort(key=lambda c: (c.row, c.col))
     return cells
 
@@ -1128,10 +1140,6 @@ def _row_looks_like_fragment_continuation(
     if not lower_cols:
         return False
 
-    # Dòng dữ liệu đầy đủ (nhiều cột) — không gộp
-    if len(lower_cols) >= 4:
-        return False
-
     lower_texts = list(lower_cols.values())
 
     frag_hits = sum(
@@ -1140,7 +1148,19 @@ def _row_looks_like_fragment_continuation(
         if _is_email_domain_fragment(t) or _is_cccd_date_fragment(t)
     )
     if frag_hits >= 1:
+        non_frag_cols = [
+            col
+            for col, t in lower_cols.items()
+            if not _is_email_domain_fragment(t)
+            and not _is_cccd_date_fragment(t)
+        ]
+        if all(col in (1, 2, 7, 8) for col in non_frag_cols):
+            return True
         return len(lower_cols) <= 2
+
+    # Dòng dữ liệu đầy đủ (nhiều cột) — không gộp
+    if len(lower_cols) >= 4:
+        return False
 
     name_cols = {c for c in lower_cols if c in (1, 2)}
     other = set(lower_cols.keys()) - name_cols - {0}
@@ -1202,7 +1222,11 @@ def _merge_row_cells_into(
             )
 
 
-def _merge_fragment_sso_rows(cells: list[CellData]) -> list[CellData]:
+def _merge_fragment_sso_rows(
+    cells: list[CellData],
+    *,
+    email_col: int | None = None,
+) -> list[CellData]:
     """Merge OCR rows that are line-wrap continuations (email, CCCD, tên)."""
     from collections import defaultdict
 
@@ -1223,6 +1247,9 @@ def _merge_fragment_sso_rows(cells: list[CellData]) -> list[CellData]:
         else:
             merged_groups.append({col: c for col, c in cols.items()})
 
+    if email_col is None and cells:
+        email_col = _resolve_sso_email_col(max(c.col for c in cells) + 1, cells)
+
     result: list[CellData] = []
     for new_row, group in enumerate(merged_groups):
         for col, cell in sorted(group.items()):
@@ -1230,7 +1257,9 @@ def _merge_fragment_sso_rows(cells: list[CellData]) -> list[CellData]:
                 CellData(
                     row=new_row,
                     col=col,
-                    text=_normalize_cell_text(cell.text),
+                    text=_normalize_cell_text(
+                        cell.text, col=col, email_col=email_col
+                    ),
                     confidence=cell.confidence,
                     bbox=cell.bbox,
                 )
@@ -1346,7 +1375,9 @@ def _fix_cccd_email_columns(cells: list[CellData]) -> list[CellData]:
                     email_cell.text = (
                         _format_sso_email(remainder)
                         if settings.ocr_sso_email_fixed_domain
-                        else _normalize_cell_text(remainder)
+                        else _normalize_cell_text(
+                            remainder, col=email_col, email_col=email_col
+                        )
                     )
                     if cccd_cell:
                         cccd_cell.text = _normalize_cccd_text(cccd_part)
@@ -1444,9 +1475,69 @@ def _apply_fixed_email_domain(cells: list[CellData]) -> list[CellData]:
     return out
 
 
+_VN_DIACRITICS = (
+    "àáảãạăắằẳẵặâấầẩẫậèéẻẽẹêếềểễệìíỉĩịòóỏõọôốồổỗộơớờởỡợùúủũụưứừửữựỳýỷỹỵđ"
+)
+
+
+def _has_vietnamese_diacritic(text: str) -> bool:
+    low = (text or "").lower()
+    return any(c in _VN_DIACRITICS for c in low)
+
+
+def _is_hallucinated_ocr_line(text: str) -> bool:
+    """
+    VietOCR hay sinh từ tiếng Anh dài trên dải ảnh gần trống (nhiễu kẻ bảng).
+
+    Ví dụ: Concrementation, Lateralization, Incontercententalized.
+    """
+    import re
+
+    t = (text or "").strip()
+    if len(t) < 10:
+        return False
+    low = t.lower()
+    if "ribank" in low or "agribank" in low or low.endswith(".vn"):
+        return False
+    if "@" in t or re.search(r"\d{4,}", t):
+        return False
+    if _has_vietnamese_diacritic(t):
+        return False
+    if not all(ord(c) < 128 or c.isspace() for c in t):
+        return False
+    letters = sum(c.isalpha() for c in t)
+    return letters >= 10
+
+
+def _strip_leading_english_hallucination(text: str) -> str:
+    """Bỏ tiền tố tiếng Anh ảo giác trước họ tên tiếng Việt trong cùng một ô."""
+    t = " ".join((text or "").split())
+    if not t or not _has_vietnamese_diacritic(t):
+        return t
+
+    parts = t.split()
+    first_vn = next(
+        (i for i, part in enumerate(parts) if _has_vietnamese_diacritic(part)),
+        None,
+    )
+    if first_vn is None or first_vn == 0:
+        return t
+
+    prefix = " ".join(parts[:first_vn])
+    if _is_hallucinated_ocr_line(prefix) or (
+        prefix.replace(" ", "").isascii() and len(prefix) >= 8
+    ):
+        return " ".join(parts[first_vn:]).strip()
+    return t
+
+
 def _join_multiline_ocr_lines(lines: list[str]) -> str:
     """Join OCR lines from one cell (email wrap, tên 2 dòng, ngày trong ngoặc)."""
-    cleaned = [ln.strip() for ln in lines if ln and ln.strip()]
+    cleaned = [
+        ln.strip()
+        for ln in lines
+        if ln and ln.strip() and not _is_hallucinated_ocr_line(ln.strip())
+    ]
     if not cleaned:
         return ""
     if len(cleaned) == 1:
@@ -1498,25 +1589,52 @@ def _repair_agribank_email(text: str) -> str:
     return f"{local}@agribank.com.vn"
 
 
-def _normalize_cell_text(text: str) -> str:
+def _looks_like_email_content(text: str) -> bool:
+    """True when OCR text is likely an email cell, not a branch/department name."""
+    import re
+
+    t = text.strip()
+    if not t:
+        return False
+    low = t.lower()
+    if "@" in t:
+        return True
+    if "ribank.com" in low or "agribank.com" in low:
+        return True
+    compact = re.sub(r"\s+", "", low)
+    if "agribank" in low and re.fullmatch(r"[a-z0-9._+\-@]+", compact):
+        return True
+    return False
+
+
+def _normalize_cell_text(
+    text: str,
+    *,
+    col: int | None = None,
+    email_col: int | None = None,
+) -> str:
     """Clean common OCR artefacts (@/&/. misreads, Agribank email domain)."""
     import re
 
     t = " ".join(text.split())
-    low = t.lower()
+    is_email_col = (
+        email_col is not None and col is not None and col == email_col
+    )
+    email_like = _looks_like_email_content(t)
 
-    if settings.ocr_sso_email_fixed_domain and (
-        "agribank" in low or "ribank.com" in low or "@" in t
-    ):
-        return _format_sso_email(t)
-
-    if "agribank" in low or "ribank.com" in low or "@" in t:
-        return _repair_agribank_email(t).strip()
+    if is_email_col or (email_col is None and email_like):
+        if settings.ocr_sso_email_fixed_domain and (is_email_col or email_like):
+            return _format_sso_email(t)
+        if email_like:
+            return _repair_agribank_email(t).strip()
 
     if settings.ocr_symbol_normalize:
         t = re.sub(r"\bKT\s*[8B&\s]+\s*NQ\b", "KT&NQ", t, flags=re.IGNORECASE)
         t = re.sub(r"\bKT8NQ\b", "KT&NQ", t, flags=re.IGNORECASE)
         t = re.sub(r"\bKT[ÁÀAáà&8\s]+NQ\b", "KT&NQ", t, flags=re.IGNORECASE)
+
+    if settings.ocr_sso_enhance:
+        t = _strip_leading_english_hallucination(t)
 
     return t.strip()
 
@@ -2230,7 +2348,7 @@ def _split_cell_text_lines(crop: np.ndarray) -> list[np.ndarray]:
         cy1 = max(0, y1 - pad)
         cy2 = min(h, y2 + pad)
         sub = crop[cy1:cy2, :]
-        if sub.size > 0:
+        if sub.size > 0 and _cell_has_ink(sub):
             line_crops.append(sub)
 
     return line_crops if len(line_crops) > 1 else [crop]
@@ -2341,14 +2459,6 @@ def _ocr_table_grid(
                 line_crops = _split_cell_text_lines(crop)
             else:
                 line_crops = [crop]
-            # Email SSO: domain cố định — chỉ OCR dòng 1 (username), bỏ ribank.com.vn
-            if (
-                email_col is not None
-                and ci == email_col
-                and settings.ocr_sso_email_fixed_domain
-                and line_crops
-            ):
-                line_crops = line_crops[:1]
             for li, line_crop in enumerate(line_crops):
                 crops.append(line_crop)
                 metas.append((ri, ci, x1, y1, x2, y2, li))
@@ -2374,13 +2484,17 @@ def _ocr_table_grid(
         confs: list[float] = []
         for text, conf, _li, *_bbox in parts:
             raw = text.strip()
-            if raw:
+            if raw and not _is_hallucinated_ocr_line(raw):
                 line_texts.append(raw)
                 confs.append(conf)
         if email_col is not None and ci == email_col and settings.ocr_sso_email_fixed_domain:
             text = _format_sso_email(_join_multiline_ocr_lines(line_texts))
         else:
-            text = _normalize_cell_text(_join_multiline_ocr_lines(line_texts))
+            text = _normalize_cell_text(
+                _join_multiline_ocr_lines(line_texts),
+                col=ci,
+                email_col=email_col,
+            )
         if not text:
             continue
         conf = float(np.mean(confs)) if confs else 0.0
@@ -2395,6 +2509,8 @@ def _ocr_table_grid(
                 bbox=[x1, y1, x2, y2],
             )
         )
+    if settings.ocr_sso_email_fixed_domain and cells:
+        cells = _apply_fixed_email_domain(cells)
     return cells
 
 
@@ -2482,6 +2598,7 @@ def _recognize_sso_grid_draft(draft: SsoGridDraft) -> TableData | None:
         num_cols=max_col + 1,
         cells=cells,
         html="",
+        table_kind="sso_agribank",
     )
 
 
@@ -2668,6 +2785,31 @@ def _is_valid_data_row(cols: dict[int, CellData]) -> bool:
     return gib == 0 and len(texts) >= 2
 
 
+_SSO_TARGET_COLS = 9
+
+
+def _enforce_sso_nine_columns(cells: list[CellData]) -> list[CellData]:
+    """Pad or trim SSO grid to exactly 9 columns (0..8)."""
+    if not cells:
+        return cells
+    max_col = max(c.col for c in cells)
+    if max_col + 1 == _SSO_TARGET_COLS:
+        return cells
+    if max_col + 1 > _SSO_TARGET_COLS:
+        logger.warning(
+            "SSO table has %d columns — trimming to %d",
+            max_col + 1,
+            _SSO_TARGET_COLS,
+        )
+        return [c for c in cells if c.col < _SSO_TARGET_COLS]
+    logger.info(
+        "SSO table has %d columns — padding to %d",
+        max_col + 1,
+        _SSO_TARGET_COLS,
+    )
+    return cells
+
+
 def _postprocess_sso_cells(cells: list[CellData]) -> list[CellData]:
     """Chuẩn hóa lưới SSO: bỏ dòng rác, tách STT, sửa cột email/CCCD."""
     import re
@@ -2678,8 +2820,11 @@ def _postprocess_sso_cells(cells: list[CellData]) -> list[CellData]:
 
     cells = _merge_annotation_header_rows(cells)
     cells = _fix_cccd_email_columns(cells)
+    email_col = _resolve_sso_email_col(
+        max((c.col for c in cells), default=0) + 1, cells
+    )
     if settings.ocr_sso_enhance and settings.ocr_sso_row_merge:
-        cells = _merge_fragment_sso_rows(cells)
+        cells = _merge_fragment_sso_rows(cells, email_col=email_col)
     cells = _apply_fixed_email_domain(cells)
 
     by_row: dict[int, dict[int, CellData]] = defaultdict(dict)
@@ -2731,7 +2876,9 @@ def _postprocess_sso_cells(cells: list[CellData]) -> list[CellData]:
                 CellData(
                     row=new_idx,
                     col=col,
-                    text=_normalize_cell_text(text),
+                    text=_normalize_cell_text(
+                        text, col=col, email_col=email_col
+                    ),
                     confidence=cell.confidence,
                     bbox=cell.bbox,
                 )
@@ -2739,6 +2886,7 @@ def _postprocess_sso_cells(cells: list[CellData]) -> list[CellData]:
         new_idx += 1
 
     renumbered = _fix_cccd_email_columns(renumbered)
+    renumbered = _enforce_sso_nine_columns(renumbered)
     renumbered.sort(key=lambda c: (c.row, c.col))
     return renumbered
 
@@ -2816,6 +2964,7 @@ def _fallback_sso_table_ocr(
         num_cols=max_col + 1,
         cells=cells,
         html="",
+        table_kind="sso_agribank",
     )
 
 

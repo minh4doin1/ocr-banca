@@ -364,16 +364,45 @@ class KeycloakClient:
         for key, vals in attributes.items():
             if vals:
                 existing[key] = vals
+        base_payload = {
+            "username": user.get("username", ""),
+            "email": user.get("email", ""),
+            "firstName": user.get("firstName", ""),
+            "lastName": user.get("lastName", ""),
+            "enabled": user.get("enabled", True),
+        }
         update_resp = self._request(
             "PUT",
             self._admin_url(f"/users/{user_id}"),
-            json={"attributes": existing},
+            json={**base_payload, "attributes": existing},
         )
-        if update_resp.status_code not in (200, 204):
-            raise KeycloakError(
-                f"Cập nhật attributes (user {user_id}) thất bại "
-                f"(HTTP {update_resp.status_code})"
-            )
+        if update_resp.status_code in (200, 204):
+            return
+
+        # Some strict User Profile realms reject unknown keys. Retry with
+        # required compatibility keys only.
+        if update_resp.status_code == 400:
+            strict_keys = {"branchId", "phone", "idNo"}
+            strict_attrs = {
+                k: v for k, v in attributes.items() if k in strict_keys and v
+            }
+            if strict_attrs:
+                retry_resp = self._request(
+                    "PUT",
+                    self._admin_url(f"/users/{user_id}"),
+                    json={**base_payload, "attributes": strict_attrs},
+                )
+                if retry_resp.status_code in (200, 204):
+                    return
+                raise KeycloakError(
+                    f"Cập nhật attributes (strict fallback, user {user_id}) thất bại "
+                    f"(HTTP {retry_resp.status_code}): {_safe_body(retry_resp)}"
+                )
+
+        raise KeycloakError(
+            f"Cập nhật attributes (user {user_id}) thất bại "
+            f"(HTTP {update_resp.status_code}): {_safe_body(update_resp)}"
+        )
 
     # ──────────────────────────────────────────────────────────
     # Client role operations

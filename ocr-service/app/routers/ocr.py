@@ -21,6 +21,7 @@ from app.models.schemas import (
     JobStatus,
     OcrResult,
     OcrRuntimeConfig,
+    OcrValidationResponse,
     ProcessingMode,
     RemoteProvider,
     RemoteWorkerHealth,
@@ -451,6 +452,20 @@ async def reocr_single_page(job_id: str, page_number: int):
     except Exception as e:
         logger.error("Re-OCR page failed: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/result/{job_id}/validation", response_model=OcrValidationResponse)
+async def get_ocr_validation(job_id: str):
+    result = get_result(job_id)
+    if result is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Kết quả OCR không tìm thấy cho job: {job_id}",
+        )
+    from app.services.user_mapping import validate_ocr_result
+
+    data = validate_ocr_result(result)
+    return OcrValidationResponse(**data)
 
 
 @router.get("/result/{job_id}/export")

@@ -259,6 +259,13 @@
                                     </svg>
                                     <span id="alert-summary-text"></span>
                                 </div>
+                                <div class="validation-panel hidden" id="validation-panel">
+                                    <div class="validation-panel-header">
+                                        <strong>Chi tiết lỗi toàn bộ tài liệu</strong>
+                                        <button type="button" class="btn btn-xs btn-ghost" id="btn-toggle-validation-panel">Thu gọn</button>
+                                    </div>
+                                    <ul class="validation-list" id="validation-list"></ul>
+                                </div>
                                 <div class="table-scroller" id="table-scroller-zone"></div>
                             </div>
                             <div class="pane-footer">
@@ -316,6 +323,22 @@
                 </label>
                 <button type="button" class="btn btn-outline btn-sm" id="btn-batch-re-enrich">Enrich lại</button>
             </div>
+            <div class="batch-summary-bar hidden" id="batch-summary-bar"></div>
+            <div class="batch-bulk-toolbar">
+                <label>Mã CN <input type="text" id="bulk-branch-code" class="bulk-inp" placeholder="VD: 6900">
+                    <button type="button" class="btn btn-xs btn-outline" data-bulk="branch_code" data-scope="all">Tất cả</button>
+                    <button type="button" class="btn btn-xs btn-ghost" data-bulk="branch_code" data-scope="error">Dòng lỗi</button>
+                </label>
+                <label>Mã ĐV <input type="text" id="bulk-unit-code" class="bulk-inp" placeholder="VD: 82204001">
+                    <button type="button" class="btn btn-xs btn-outline" data-bulk="unit_code" data-scope="all">Tất cả</button>
+                    <button type="button" class="btn btn-xs btn-ghost" data-bulk="unit_code" data-scope="error">Dòng lỗi</button>
+                </label>
+                <label>Vai trò
+                    <select id="bulk-role" class="bulk-inp"></select>
+                    <button type="button" class="btn btn-xs btn-outline" data-bulk="role" data-scope="all">Tất cả</button>
+                </label>
+                <button type="button" class="btn btn-xs btn-ghost" id="btn-batch-filter-errors">Chỉ hiện dòng lỗi</button>
+            </div>
             <div class="batch-review-scroll">
                 <table class="ocr-table batch-review-table">
                     <thead>
@@ -342,7 +365,7 @@
         <button type="button" class="btn btn-sm btn-ghost" id="btn-replace-skip">Bỏ qua</button>
     </div>
 
-    <script src="app.js?v=8"></script>
-    <script src="batch-users.js?v=1"></script>
+    <script src="app.js?v=12"></script>
+    <script src="batch-users.js?v=3"></script>
 </body>
 </html>

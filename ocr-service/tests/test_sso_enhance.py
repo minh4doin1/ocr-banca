@@ -8,6 +8,7 @@ from app.services.ocr_service import (
     _assign_lines_to_grid,
     _extract_sso_email_local,
     _format_sso_email,
+    _is_hallucinated_ocr_line,
     _join_multiline_ocr_lines,
     _looks_like_sso_cells,
     _merge_fragment_sso_rows,
@@ -15,6 +16,7 @@ from app.services.ocr_service import (
     _repair_agribank_email,
     _row_looks_like_fragment_continuation,
     _split_cell_text_lines,
+    _strip_leading_english_hallucination,
 )
 
 
@@ -65,17 +67,42 @@ def test_format_sso_email_fixed_domain():
 
 
 def test_normalize_cell_text_agribank_email():
+    email_col = 5
     assert (
-        _normalize_cell_text("luongnguyenthiphu@ag ribank.com.vn")
+        _normalize_cell_text(
+            "luongnguyenthiphu@ag ribank.com.vn",
+            col=email_col,
+            email_col=email_col,
+        )
         == "luongnguyenthiphu@agribank.com.vn"
     )
     assert (
-        _normalize_cell_text("luongnguyenthiphu ag@ag@ag@ag@agribank.com.vn")
+        _normalize_cell_text(
+            "luongnguyenthiphu ag@ag@ag@ag@agribank.com.vn",
+            col=email_col,
+            email_col=email_col,
+        )
         == "luongnguyenthiphu@agribank.com.vn"
     )
     assert _normalize_cell_text("KT 8 NQ") == "KT&NQ"
     assert _normalize_cell_text("KT8NQ") == "KT&NQ"
     assert _normalize_cell_text("KTÁNQ") == "KT&NQ"
+
+
+def test_normalize_cell_text_department_not_email():
+    """Phòng/Đơn vị must not be forced into email format."""
+    assert _normalize_cell_text("6900 Hội sở", col=2, email_col=5) == "6900 Hội sở"
+    assert (
+        _normalize_cell_text("Chi nhánh Agribank Hà Nội", col=2, email_col=5)
+        == "Chi nhánh Agribank Hà Nội"
+    )
+
+
+def test_normalize_cell_text_email_column():
+    assert (
+        _normalize_cell_text("luongnguyenthiphu", col=5, email_col=5)
+        == "luongnguyenthiphu@agribank.com.vn"
+    )
 
 
 def test_join_multiline_email():
@@ -91,6 +118,36 @@ def test_join_multiline_email():
 def test_join_multiline_name():
     joined = _join_multiline_ocr_lines(["Nguyễn Thị", "Phú Lương"])
     assert joined == "Nguyễn Thị Phú Lương"
+
+
+def test_strip_english_hallucination_before_vietnamese_name():
+    assert (
+        _strip_leading_english_hallucination("Concrementation Trịnh Lan Anh")
+        == "Trịnh Lan Anh"
+    )
+    assert (
+        _strip_leading_english_hallucination("Lateralization Lê Thị Thủy")
+        == "Lê Thị Thủy"
+    )
+    assert (
+        _strip_leading_english_hallucination(
+            "Incontercententalized Đàm Văn Đồng"
+        )
+        == "Đàm Văn Đồng"
+    )
+    assert (
+        _strip_leading_english_hallucination("Nguyễn Thị Phú Lương")
+        == "Nguyễn Thị Phú Lương"
+    )
+
+
+def test_join_multiline_skips_hallucinated_band():
+    joined = _join_multiline_ocr_lines(
+        ["Concrementation", "Trịnh Lan Anh"]
+    )
+    assert joined == "Trịnh Lan Anh"
+    assert _is_hallucinated_ocr_line("Concrementation")
+    assert not _is_hallucinated_ocr_line("Trịnh Lan Anh")
 
 
 def test_repair_agribank_email_collapses_at_ag():

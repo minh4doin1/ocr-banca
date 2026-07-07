@@ -59,6 +59,9 @@ def _make_result(table: TableData) -> OcrResult:
 def test_normalize_role_vn_label():
     assert normalize_role("Phê duyệt viên") == "banca-accounting-controller"
     assert normalize_role("banca-seller") == "banca-seller"
+    assert normalize_role("Phê duyệt viên Đại lý viên") == "banca-accounting-controller"
+    assert normalize_role("Kê toán viên Đại lý viên") == "banca-accounting-operator"
+    assert normalize_role("Quản trị; Đại lý VIÊN") == "banca-admin"
 
 
 def test_map_result_basic():
@@ -111,6 +114,83 @@ def test_map_sso_data_without_header_row():
     assert users[0].role == "banca-accounting-controller"
     assert users[0].first_name == "Lương"
     assert users[0].last_name == "Nguyễn Thị Phú"
+    assert users[0].notes == "Cấp mới"
+
+
+def test_map_sso_standard_form_with_unit_code():
+    """Form chuẩn: Phòng/Đơn vị lặp + Ghi chú là mã ĐV."""
+    from app.services.user_mapping import _parse_department_cell, _parse_unit_or_notes
+
+    assert _parse_department_cell("6900 Hội sở") == (
+        "6900 Hội sở",
+        "6900",
+        "Hội sở",
+    )
+    assert _parse_unit_or_notes("82204001") == ("82204001", "")
+    assert _parse_unit_or_notes("Cấp mới") == ("", "Cấp mới")
+
+    table = _make_table(
+        [
+            "1",
+            "Lê Mai Phương",
+            "6900 Hội sở",
+            "TGILMP",
+            "081234567890",
+            "phuongle@agribank.com.vn",
+            "0907809680",
+            "Quản trị",
+            "82204001",
+        ],
+        [],
+    )
+    users, _ = map_result_to_users(_make_result(table))
+    assert len(users) == 1
+    assert users[0].branch_code == "6900"
+    assert users[0].branch_name == "Hội sở"
+    assert users[0].department_name == "6900 Hội sở"
+    assert users[0].unit_code == "82204001"
+
+
+def test_map_sso_fallback_email_from_ipcas_when_email_blank():
+    table = _make_table(
+        [
+            "1",
+            "Lê Mai Phương",
+            "6900 Hội sở",
+            "TGILMP",
+            "082180011286",
+            "",
+            "0907809680",
+            "Quản trị",
+            "82204001",
+        ],
+        [],
+    )
+    users, warnings = map_result_to_users(_make_result(table))
+    assert warnings == []
+    assert len(users) == 1
+    assert users[0].email == "tgilmp@agribank.com.vn"
+    assert users[0].username == "tgilmp@agribank.com.vn"
+    assert users[0].ipcas_code == "TGILMP"
+
+
+def test_map_sso_not_derive_email_from_domain_fragment_seed():
+    table = _make_table(
+        [
+            "1",
+            "User Test",
+            "6900 Hội sở",
+            "bank.com.vn",
+            "082180011286",
+            "",
+            "0907809680",
+            "Quản trị",
+            "82204001",
+        ],
+        [],
+    )
+    users, _ = map_result_to_users(_make_result(table))
+    assert len(users) == 0
 
 
 def _client_new_user() -> MagicMock:
@@ -215,6 +295,23 @@ def test_provision_fails_without_role():
     assert "role" in result.error
 
 
+def test_provision_created_when_role_assignment_forbidden():
+    client = _client_new_user()
+    client.get_client_by_client_id.side_effect = users_router.KeycloakError(
+        "Tra client 'banca' thất bại (HTTP 403)"
+    )
+    user = _user(password="Pass@123")
+    result = _provision_one(
+        client,
+        user,
+        temporary=True,
+        on_conflict=OnConflictAction.SKIP,
+        default_required_actions=[],
+    )
+    assert result.status == ProvisionStatus.CREATED
+    assert "assign_role_skipped:banca-seller" in result.actions_applied
+
+
 def test_build_keycloak_attributes_sop_fields():
     from app.services.user_mapping import build_keycloak_attributes
 
@@ -223,4 +320,7 @@ def test_build_keycloak_attributes_sop_fields():
     assert attrs["ipcasCode"] == ["HQPTEST"]
     assert attrs["phoneNumber"] == ["0982867163"]
     assert attrs["unitCode"] == ["95204001"]
+    assert attrs["branchId"] == ["1500"]
+    assert attrs["phone"] == ["0982867163"]
+    assert attrs["idNo"] == ["001234567890"]
     assert attrs["branchCode"] == ["1500"]

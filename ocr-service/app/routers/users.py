@@ -28,6 +28,9 @@ from app.models.schemas import (
     ProvisionStatus,
     UserPreviewResponse,
     UserProvisionResult,
+    UserValidationItem,
+    ValidateUsersRequest,
+    ValidateUsersResponse,
 )
 from app.services.banca_core_service import (
     BancaCoreClient,
@@ -47,8 +50,10 @@ from app.services.keycloak_service import (
 from app.services.user_mapping import (
     build_keycloak_attributes,
     finalize_user,
+    get_sso_column_labels,
     map_result_to_users,
     normalize_role,
+    validate_user_field_errors,
     validate_user_fields,
 )
 
@@ -122,20 +127,28 @@ def _assign_client_role(
     if role_name not in settings.keycloak_valid_roles:
         raise KeycloakError(f"Role không hợp lệ: '{role_name}'.")
 
-    client_uuid = _resolve_roles_client_uuid(client)
-    role_repr = client.get_client_role(client_uuid, role_name)
-    if not role_repr:
-        raise KeycloakError(
-            f"Role '{role_name}' không tồn tại trên client "
-            f"'{settings.keycloak_roles_client_id}'."
-        )
+    try:
+        client_uuid = _resolve_roles_client_uuid(client)
+        role_repr = client.get_client_role(client_uuid, role_name)
+        if not role_repr:
+            raise KeycloakError(
+                f"Role '{role_name}' không tồn tại trên client "
+                f"'{settings.keycloak_roles_client_id}'."
+            )
 
-    existing = client.get_user_client_roles(user_id, client_uuid)
-    if any(str(r.get("name", "")) == role_name for r in existing):
-        return [f"role_already:{role_name}"]
+        existing = client.get_user_client_roles(user_id, client_uuid)
+        if any(str(r.get("name", "")) == role_name for r in existing):
+            return [f"role_already:{role_name}"]
 
-    client.assign_client_roles(user_id, client_uuid, [role_repr])
-    return [f"assign_role:{role_name}"]
+        client.assign_client_roles(user_id, client_uuid, [role_repr])
+        return [f"assign_role:{role_name}"]
+    except KeycloakError as exc:
+        # Some realms deny role-client lookup for service account; do not block
+        # user creation/update if profile attributes were already saved.
+        if "403" in str(exc):
+            logger.warning("Skip role assignment for '%s': %s", user_id, exc)
+            return [f"assign_role_skipped:{role_name}"]
+        raise
 
 
 def _save_existing_user(
@@ -192,13 +205,21 @@ def _resolve_users_list(
     return list(users), []
 
 
-def _enrich_users(users: list[KeycloakUserInput]) -> EnrichResponse:
+def _enrich_users(
+    users: list[KeycloakUserInput],
+    defaults: dict[str, str] | None = None,
+) -> EnrichResponse:
     client = get_client()
     warnings: list[str] = []
     enriched: list[KeycloakUserInput] = []
+    defaults = defaults or {}
 
     for user in users:
-        row = enrich_user_row(user.model_dump(), client)
+        row = user.model_dump()
+        for key, val in defaults.items():
+            if val and not str(row.get(key) or "").strip():
+                row[key] = val
+        row = enrich_user_row(row, client)
         updated = KeycloakUserInput.model_validate(row)
         updated = finalize_user(updated)
         updated.missing_fields = validate_user_fields(updated)
@@ -357,11 +378,37 @@ async def field_config():
     return FieldConfigResponse(
         required_fields=settings.user_required_fields_list,
         header_map=settings.keycloak_header_map_parsed,
+        field_labels=settings.field_labels_vi,
+        sso_columns=get_sso_column_labels(),
         banca_core_enabled=settings.banca_core_configured,
         roles=roles,
         attribute_keys=settings.keycloak_attribute_map_parsed,
         roles_client_id=settings.keycloak_roles_client_id,
         default_temp_password=settings.keycloak_default_temp_password,
+    )
+
+
+@router.post("/validate", response_model=ValidateUsersResponse)
+async def validate_users(request: ValidateUsersRequest):
+    items: list[UserValidationItem] = []
+    valid = 0
+    for idx, user in enumerate(request.users):
+        errors = validate_user_field_errors(user)
+        missing = list(errors.keys())
+        if not missing:
+            valid += 1
+        items.append(
+            UserValidationItem(
+                index=idx,
+                username=user.username or user.email,
+                missing_fields=missing,
+                field_errors=errors,
+            )
+        )
+    return ValidateUsersResponse(
+        users=items,
+        valid_count=valid,
+        invalid_count=len(request.users) - valid,
     )
 
 
@@ -373,7 +420,7 @@ async def enrich_users(request: EnrichRequest):
         if warnings:
             detail += " " + " ".join(warnings)
         raise HTTPException(status_code=400, detail=detail)
-    resp = _enrich_users(users)
+    resp = _enrich_users(users, defaults=request.defaults or None)
     resp.warnings = warnings + resp.warnings
     return resp
 

@@ -34,12 +34,11 @@ client = TestClient(app)
 
 
 def test_root():
-    """Test health check endpoint."""
+    """Root serves the OCR frontend (HTML)."""
     response = client.get("/")
     assert response.status_code == 200
-    data = response.json()
-    assert data["service"] == "Banca OCR Service"
-    assert data["status"] == "running"
+    assert "text/html" in response.headers.get("content-type", "")
+    assert "OCR" in response.text or "Agribank" in response.text
 
 
 def test_health():
@@ -73,8 +72,8 @@ def test_upload_rejects_no_filename():
         "/api/ocr/upload",
         files={"file": ("", fake_file, "application/pdf")},
     )
-    # Empty filename should be rejected
-    assert response.status_code == 400
+    # FastAPI returns 422 when multipart filename is empty
+    assert response.status_code == 422
 
 
 @patch("app.routers.ocr.process_job")

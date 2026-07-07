@@ -110,6 +110,10 @@ class TableData(BaseModel):
     num_cols: int = Field(..., description="Number of columns")
     cells: list[CellData] = Field(default_factory=list)
     html: str = Field(default="", description="Table as HTML (from PP-Structure)")
+    table_kind: str = Field(
+        default="",
+        description="sso_agribank when Agribank SSO 9-column form detected",
+    )
 
 
 class PageResult(BaseModel):
@@ -250,6 +254,7 @@ class KeycloakUserInput(BaseModel):
     ipcas_code: str = Field(default="", description="Mã IPCAS")
     phone: str = Field(default="", description="Số điện thoại")
     unit_code: str = Field(default="", description="Mã đơn vị")
+    notes: str = Field(default="", description="Ghi chú (form SSO, không bắt buộc)")
     role: str = Field(default="", description="Client role Keycloak (banca-*)")
     branch_name_matched: str = Field(default="", description="Tên CN khớp từ banca-core")
     department_name_matched: str = Field(default="", description="Tên PGD khớp")
@@ -340,6 +345,10 @@ class EnrichRequest(BaseModel):
 
     job_id: str = ""
     users: list[KeycloakUserInput] = Field(default_factory=list)
+    defaults: dict[str, str] = Field(
+        default_factory=dict,
+        description="Giá trị mặc định áp dụng mọi dòng trước enrich (branch_code, unit_code, role).",
+    )
 
 
 class BranchAgentMatchResult(BaseModel):
@@ -390,8 +399,44 @@ class EnrichResponse(BaseModel):
 class FieldConfigResponse(BaseModel):
     required_fields: list[str] = Field(default_factory=list)
     header_map: dict[str, list[str]] = Field(default_factory=dict)
+    field_labels: dict[str, str] = Field(default_factory=dict)
+    sso_columns: list[dict[str, str]] = Field(default_factory=list)
     banca_core_enabled: bool = False
     roles: list[dict[str, str]] = Field(default_factory=list)
     attribute_keys: dict[str, str] = Field(default_factory=dict)
     roles_client_id: str = ""
     default_temp_password: str = ""
+
+
+class UserValidationItem(BaseModel):
+    index: int = 0
+    username: str = ""
+    missing_fields: list[str] = Field(default_factory=list)
+    field_errors: dict[str, str] = Field(default_factory=dict)
+
+
+class ValidateUsersRequest(BaseModel):
+    users: list[KeycloakUserInput] = Field(default_factory=list)
+
+
+class ValidateUsersResponse(BaseModel):
+    users: list[UserValidationItem] = Field(default_factory=list)
+    valid_count: int = 0
+    invalid_count: int = 0
+
+
+class OcrCellValidationIssue(BaseModel):
+    page_number: int = 0
+    table_index: int = 0
+    row: int = 0
+    col: int = 0
+    field: str = ""
+    message: str = ""
+    severity: str = "error"
+
+
+class OcrValidationResponse(BaseModel):
+    errors: list[OcrCellValidationIssue] = Field(default_factory=list)
+    warnings: list[OcrCellValidationIssue] = Field(default_factory=list)
+    error_count: int = 0
+    warning_count: int = 0

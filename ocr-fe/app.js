@@ -22,6 +22,9 @@ let lastLogCount = 0;
 let workspaceEntered = false;
 let runtimeConfig = null;
 let pendingReplace = null;
+let jobValidationCache = null;
+let validationPanelExpanded = false;
+let pauseResultRefreshUntil = 0;
 
 // ── DOM refs ──
 const $ = (sel) => document.querySelector(sel);
@@ -85,6 +88,8 @@ const btnRestart = $('#btn-restart');
 const btnConfirmBatch = $('#btn-confirm-batch');
 const alertsSummary = $('#alerts-summary');
 const alertSummaryText = $('#alert-summary-text');
+const validationPanel = $('#validation-panel');
+const validationList = $('#validation-list');
 const tableScrollerZone = $('#table-scroller-zone');
 
 const successBatchCode = $('#success-batch-code');
@@ -103,6 +108,17 @@ document.addEventListener('DOMContentLoaded', async () => {
     setupKeyboard();
     setupBatchReviewModal();
     syncModeUi();
+    $('#btn-toggle-validation-panel')?.addEventListener('click', () => {
+        validationPanelExpanded = !validationPanelExpanded;
+        validationPanel?.classList.toggle('collapsed', !validationPanelExpanded);
+        $('#btn-toggle-validation-panel').textContent = validationPanelExpanded ? 'Thu gọn' : 'Mở rộng';
+    });
+    alertsSummary?.addEventListener('click', () => {
+        validationPanelExpanded = true;
+        validationPanel?.classList.remove('collapsed', 'hidden');
+        const btn = $('#btn-toggle-validation-panel');
+        if (btn) btn.textContent = 'Thu gọn';
+    });
 });
 
 async function loadRuntimeConfig() {
@@ -504,15 +520,24 @@ async function pollTick() {
         if (resultRes.ok) {
             const partial = await resultRes.json().catch(() => null);
             if (!partial) return;
-            ocrData = partial;
-            const doneCount = (partial.pages || []).length;
+            const activeEl = document.activeElement;
+            const isEditingNow =
+                activeEl &&
+                (activeEl.classList?.contains('cell-input') ||
+                 activeEl.classList?.contains('batch-inp'));
+            const shouldSkipResultRefresh =
+                isEditingNow || Date.now() < pauseResultRefreshUntil;
+            if (!shouldSkipResultRefresh) {
+                ocrData = partial;
+                const doneCount = (partial.pages || []).length;
 
-            if (doneCount > 0) {
-                btnGoReviewEarly.classList.remove('hidden');
-                if (!workspaceEntered && currentStep === 1) {
-                    enterWorkspace();
-                } else if (workspaceEntered) {
-                    refreshWorkspaceFromPoll();
+                if (doneCount > 0) {
+                    btnGoReviewEarly.classList.remove('hidden');
+                    if (!workspaceEntered && currentStep === 1) {
+                        enterWorkspace();
+                    } else if (workspaceEntered) {
+                        refreshWorkspaceFromPoll();
+                    }
                 }
             }
         }
@@ -612,7 +637,18 @@ function enterWorkspace() {
     if (currentPageNumber > 1 && !getPageData(currentPageNumber)) {
         currentPageNumber = ocrData.pages[0]?.page_number || 1;
     }
-    renderWorkspace();
+    loadJobValidation().then(() => renderWorkspace());
+}
+
+async function loadJobValidation() {
+    if (!jobId) return null;
+    try {
+        const res = await fetch(`${API_BASE}/api/ocr/result/${jobId}/validation`);
+        if (res.ok) jobValidationCache = await res.json();
+    } catch {
+        jobValidationCache = null;
+    }
+    return jobValidationCache;
 }
 
 function refreshWorkspaceFromPoll() {
@@ -631,8 +667,15 @@ function refreshWorkspaceFromPoll() {
     pagePendingOverlay.classList.toggle('hidden', pageReady);
 
     if (pageReady) {
-        renderTableGrid();
-        renderBoundingBoxes();
+        const activeEl = document.activeElement;
+        const isEditingWorkspaceCell =
+            activeEl &&
+            activeEl.classList?.contains('cell-input') &&
+            activeEl.closest('#table-scroller-zone');
+        if (!isEditingWorkspaceCell && Date.now() >= pauseResultRefreshUntil) {
+            renderTableGrid();
+            renderBoundingBoxes();
+        }
     } else {
         tableScrollerZone.innerHTML = `<div style="padding:40px;text-align:center;color:var(--text-muted)">
             <div class="overlay-spinner" style="margin:0 auto 12px;border-color:var(--red-bg-soft);border-top-color:var(--red-primary)"></div>
@@ -867,6 +910,161 @@ window.addEventListener('resize', () => {
 });
 
 // ── Table grid ──
+async function applyColumnBulk(tIdx, col, mode) {
+    const page = getPageData(currentPageNumber);
+    if (!page?.tables[tIdx]) return;
+    const table = page.tables[tIdx];
+    const fieldMap = getTableColFieldMap(table);
+    const field = fieldMap[col] || '';
+
+    let value = '';
+    if (mode === 'fill_first') {
+        for (let r = 1; r < table.num_rows; r++) {
+            const cell = table.cells.find(c => c.row === r && c.col === col);
+            if (cell?.text?.trim()) { value = cell.text.trim(); break; }
+        }
+    }
+    if (!value) {
+        const label = getColumnHeaderLabel(table, col);
+        value = prompt(`Nhập giá trị cho cột "${label}":`, '') ?? '';
+        if (!value.trim()) return;
+        value = value.trim();
+    }
+
+    const updates = [];
+    for (let r = 1; r < table.num_rows; r++) {
+        const cell = table.cells.find(c => c.row === r && c.col === col);
+        const text = cell?.text || '';
+        const err = validateCellText(r, col, text, cell?.confidence ?? 1, table, tIdx);
+        if (mode === 'empty' && text.trim()) continue;
+        if (mode === 'error' && !err) continue;
+        if (cell) { cell.text = value; cell.confidence = 1.0; }
+        updates.push({
+            page_number: currentPageNumber,
+            table_index: tIdx,
+            row: r,
+            col,
+            text: value,
+        });
+    }
+    if (!updates.length) return;
+
+    try {
+        await fetch(`${API_BASE}/api/ocr/result/${jobId}`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ updates }),
+        });
+    } catch (e) { console.warn('Bulk sync failed:', e); }
+
+    await loadJobValidation();
+    renderTableGrid();
+}
+
+async function reocrSelectedColumn(tIdx, col) {
+    const page = getPageData(currentPageNumber);
+    if (!page?.tables?.[tIdx]) return;
+    const tableBefore = page.tables[tIdx];
+    const label = getColumnHeaderLabel(tableBefore, col);
+
+    const ok = confirm(`OCR lại riêng cột "${label}"?\nHệ thống sẽ OCR lại trang, sau đó giữ nguyên các cột khác.`);
+    if (!ok) return;
+
+    const backup = {};
+    for (let r = 0; r < tableBefore.num_rows; r++) {
+        for (let c = 0; c < tableBefore.num_cols; c++) {
+            if (c === col) continue;
+            const cell = tableBefore.cells.find(x => x.row === r && x.col === c);
+            backup[`${r}_${c}`] = cell?.text || '';
+        }
+    }
+
+    try {
+        pauseResultRefreshUntil = Date.now() + 10000;
+        const reocrRes = await fetch(
+            `${API_BASE}/api/ocr/result/${jobId}/page/${currentPageNumber}/reocr`,
+            { method: 'POST' }
+        );
+        const reocrData = await reocrRes.json().catch(() => ({}));
+        if (!reocrRes.ok) throw new Error(reocrData.detail || 'OCR lại cột thất bại');
+        ocrData = reocrData;
+
+        const pageAfter = getPageData(currentPageNumber);
+        const tableAfter = pageAfter?.tables?.[tIdx];
+        if (!tableAfter) {
+            throw new Error('Không tìm thấy bảng sau khi OCR lại');
+        }
+
+        const restoreUpdates = [];
+        for (let r = 0; r < tableAfter.num_rows; r++) {
+            for (let c = 0; c < tableAfter.num_cols; c++) {
+                if (c === col) continue;
+                const key = `${r}_${c}`;
+                if (!(key in backup)) continue;
+                restoreUpdates.push({
+                    page_number: currentPageNumber,
+                    table_index: tIdx,
+                    row: r,
+                    col: c,
+                    text: backup[key],
+                });
+            }
+        }
+
+        if (restoreUpdates.length) {
+            const putRes = await fetch(`${API_BASE}/api/ocr/result/${jobId}`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ updates: restoreUpdates }),
+            });
+            if (putRes.ok) {
+                const updated = await putRes.json().catch(() => null);
+                if (updated) ocrData = updated;
+            }
+        }
+
+        await loadJobValidation();
+        renderWorkspace();
+        alert(`Đã OCR lại cột "${label}" thành công.`);
+    } catch (e) {
+        alert(`Lỗi OCR lại cột: ${e.message}`);
+    } finally {
+        setTimeout(() => { pauseResultRefreshUntil = 0; }, 3000);
+    }
+}
+
+function showColumnBulkMenu(btn, tIdx, col) {
+    const existing = document.getElementById('col-bulk-menu');
+    existing?.remove();
+    const menu = document.createElement('div');
+    menu.id = 'col-bulk-menu';
+    menu.className = 'replace-popover';
+    menu.style.position = 'fixed';
+    const rect = btn.getBoundingClientRect();
+    menu.style.top = `${rect.bottom + 4}px`;
+    menu.style.left = `${rect.left}px`;
+    menu.innerHTML = `
+        <p><strong>Sửa đồng loạt cột</strong></p>
+        <button type="button" class="btn btn-sm btn-ghost btn-block" data-m="fill_first">Điền tất cả dòng (từ ô đầu)</button>
+        <button type="button" class="btn btn-sm btn-ghost btn-block" data-m="empty">Chỉ điền ô trống</button>
+        <button type="button" class="btn btn-sm btn-ghost btn-block" data-m="error">Chỉ điền ô lỗi</button>
+        <button type="button" class="btn btn-sm btn-outline btn-block" data-m="reocr_col">OCR lại cột này</button>`;
+    document.body.appendChild(menu);
+    const close = () => menu.remove();
+    menu.querySelectorAll('[data-m]').forEach(b => {
+        b.addEventListener('click', () => {
+            if (b.dataset.m === 'reocr_col') reocrSelectedColumn(tIdx, col);
+            else applyColumnBulk(tIdx, col, b.dataset.m);
+            close();
+        });
+    });
+    setTimeout(() => {
+        document.addEventListener('click', function h(e) {
+            if (!menu.contains(e.target)) { close(); document.removeEventListener('click', h); }
+        });
+    }, 0);
+}
+
 function renderTableGrid() {
     tableScrollerZone.innerHTML = '';
     const page = getPageData(currentPageNumber);
@@ -895,8 +1093,21 @@ function renderTableGrid() {
 
         const thead = document.createElement('thead');
         const headerRow = document.createElement('tr');
-        for (let c = 1; c <= table.num_cols; c++) {
-            headerRow.innerHTML += `<th>Cột ${c}</th>`;
+        for (let c = 0; c < table.num_cols; c++) {
+            const th = document.createElement('th');
+            const label = getColumnHeaderLabel(table, c);
+            const field = getTableColFieldMap(table)[c];
+            const bulkable = c > 0;
+            th.innerHTML = `<div class="col-header-wrap"><span>${escapeAttr(label)}</span>${
+                bulkable ? `<button type="button" class="col-bulk-btn" title="Sửa đồng loạt">▾</button>` : ''
+            }</div>`;
+            if (bulkable) {
+                th.querySelector('.col-bulk-btn')?.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    showColumnBulkMenu(e.target, tIdx, c);
+                });
+            }
+            headerRow.appendChild(th);
         }
         thead.appendChild(headerRow);
         grid.appendChild(thead);
@@ -913,9 +1124,10 @@ function renderTableGrid() {
                 td.id = `cell-${tIdx}-${r}-${c}`;
 
                 const err = validateCellText(r, c, cell.text, cell.confidence, table, tIdx);
+                const isWarn = err && (err.includes('tin cậy') || err.includes('Tin cậy'));
                 if (err) {
-                    allErrors.push({ tIdx, r, c, msg: err });
-                    td.className = (err.includes('dấu') || cell.confidence < 0.85) ? 'cell-warn' : 'cell-err';
+                    allErrors.push({ tIdx, r, c, msg: err, severity: isWarn ? 'warn' : 'error' });
+                    td.className = isWarn ? 'cell-warn' : 'cell-err';
                 } else if (cell.confidence < 0.85) {
                     td.className = 'cell-warn';
                 }
@@ -924,7 +1136,8 @@ function renderTableGrid() {
                 td.innerHTML = `
                     <div class="cell-container">
                         <input type="text" class="cell-input" value="${escapeAttr(cell.text)}"
-                            data-table="${tIdx}" data-row="${r}" data-col="${c}">
+                            data-table="${tIdx}" data-row="${r}" data-col="${c}"
+                            ${err ? `title="${escapeAttr(err)}"` : ''}>
                         <div class="cell-zoom-tooltip">
                             <div class="tooltip-title">Ảnh gốc đối chiếu:</div>
                             <div class="tooltip-image-crop">
@@ -943,6 +1156,12 @@ function renderTableGrid() {
                     focusCell(tIdx, r, c);
                 });
                 input.addEventListener('blur', () => td.classList.remove('cell-focus'));
+                input.addEventListener('keydown', (e) => {
+                    if (e.key === 'Enter') {
+                        e.preventDefault();
+                        input.blur();
+                    }
+                });
                 input.addEventListener('change', (e) => {
                     handleCellChange(tIdx, r, c, e.target.value, e.target.dataset.lastVal);
                     e.target.dataset.lastVal = e.target.value;
@@ -959,6 +1178,48 @@ function renderTableGrid() {
     });
 
     updateValidationAlerts(allErrors);
+    renderValidationPanel();
+}
+
+function renderValidationPanel() {
+    if (!validationList || !validationPanel) return;
+    const data = jobValidationCache;
+    if (!data || (!data.error_count && !data.warning_count)) {
+        validationPanel.classList.add('hidden');
+        return;
+    }
+    validationPanel.classList.remove('hidden');
+    if (!validationPanelExpanded) validationPanel.classList.add('collapsed');
+    const toggleBtn = document.getElementById('btn-toggle-validation-panel');
+    if (toggleBtn) toggleBtn.textContent = validationPanelExpanded ? 'Thu gọn' : 'Mở rộng';
+
+    const items = [
+        ...(data.errors || []).map(e => ({ ...e, severity: 'error' })),
+        ...(data.warnings || []).map(e => ({ ...e, severity: 'warn' })),
+    ];
+    validationList.innerHTML = items.map(item => {
+        const label = fieldLabel(item.field) || `Cột ${item.col + 1}`;
+        return `<li class="sev-${item.severity}" data-page="${item.page_number}" data-t="${item.table_index}" data-r="${item.row}" data-c="${item.col}">
+            Trang ${item.page_number} · Dòng ${item.row + 1} · ${escapeAttr(label)}: ${escapeAttr(item.message)}
+        </li>`;
+    }).join('');
+
+    validationList.querySelectorAll('li').forEach(li => {
+        li.addEventListener('click', () => {
+            const pg = +li.dataset.page;
+            const t = +li.dataset.t;
+            const r = +li.dataset.r;
+            const c = +li.dataset.c;
+            if (pg !== currentPageNumber) {
+                currentPageNumber = pg;
+                renderWorkspace();
+            }
+            setTimeout(() => {
+                document.querySelector(`.cell-input[data-table="${t}"][data-row="${r}"][data-col="${c}"]`)?.focus();
+                focusCell(t, r, c);
+            }, 80);
+        });
+    });
 }
 
 function escapeAttr(str) {
@@ -984,30 +1245,72 @@ function focusCell(tIdx, r, c) {
     if (box) { box.classList.add('active'); box.scrollIntoView({ behavior: 'smooth', block: 'center' }); }
 }
 
+function updateCellDisplay(tIdx, r, c) {
+    const page = getPageData(currentPageNumber);
+    const table = page?.tables?.[tIdx];
+    const td = document.getElementById(`cell-${tIdx}-${r}-${c}`);
+    if (!table || !td) return;
+
+    const cell = table.cells.find(cl => cl.row === r && cl.col === c) || { text: '', confidence: 1.0 };
+    const err = validateCellText(r, c, cell.text, cell.confidence, table, tIdx);
+    const isWarn = err && (err.includes('tin cậy') || err.includes('Tin cậy'));
+
+    td.classList.remove('cell-err', 'cell-warn');
+    if (err) td.classList.add(isWarn ? 'cell-warn' : 'cell-err');
+    else if (cell.confidence < 0.85) td.classList.add('cell-warn');
+
+    const input = td.querySelector('.cell-input');
+    if (input && document.activeElement !== input) input.value = cell.text || '';
+    if (input) {
+        if (err) input.title = err;
+        else input.removeAttribute('title');
+    }
+
+    const tooltipMeta = td.querySelector('.tooltip-meta');
+    if (tooltipMeta) {
+        const confSpan = tooltipMeta.querySelector('span');
+        if (confSpan) confSpan.textContent = `Tin cậy: ${(cell.confidence * 100).toFixed(0)}%`;
+        let msgEl = tooltipMeta.querySelector('.tooltip-err-msg');
+        if (err) {
+            if (!msgEl) {
+                msgEl = document.createElement('span');
+                msgEl.className = 'tooltip-err-msg';
+                tooltipMeta.appendChild(msgEl);
+            }
+            msgEl.textContent = err;
+        } else if (msgEl) {
+            msgEl.remove();
+        }
+    }
+}
+
 function validateCellText(row, col, text, confidence, table, tIdx) {
     if (row === 0) return '';
-    const colMap = table ? headerFieldMap(table) : {};
+    const colMap = table ? getTableColFieldMap(table) : {};
     const field = colMap[col] || '';
     if (field) {
         return validateCellByField(field, text, confidence, false);
     }
-    if (col === 1 && text) {
-        if (/\d/.test(text)) return 'Tên chứa chữ số';
-    }
-    if (col === 2 && text && /cccd|cmnd|căn cước/i.test(
-        (table?.cells?.find(c => c.row === 0 && c.col === col)?.text || '')
-    )) {
-        if (!/^\d{12}$/.test(text.replace(/\s+/g, ''))) return 'CCCD phải có 12 số';
-    }
+    if (col === 1 && text && /\d/.test(text)) return 'Tên chứa chữ số';
     if (!text?.trim()) return 'Không được trống';
     if (confidence < 0.85) return 'Độ tin cậy thấp';
     return '';
 }
 
-function updateValidationAlerts(errors) {
-    if (errors.length) {
+function updateValidationAlerts(pageErrors) {
+    const jobErr = jobValidationCache?.error_count || 0;
+    const jobWarn = jobValidationCache?.warning_count || 0;
+    const pageErr = pageErrors.filter(e => e.severity !== 'warn').length;
+    const pageWarn = pageErrors.filter(e => e.severity === 'warn').length;
+    const totalErr = Math.max(jobErr, pageErr);
+    const totalWarn = Math.max(jobWarn, pageWarn);
+
+    if (totalErr || totalWarn) {
         alertsSummary.classList.remove('hidden');
-        alertSummaryText.innerHTML = `Phát hiện <strong>${errors.length}</strong> cảnh báo / lỗi định dạng cần kiểm tra.`;
+        const parts = [];
+        if (totalErr) parts.push(`<strong>${totalErr}</strong> lỗi`);
+        if (totalWarn) parts.push(`<strong>${totalWarn}</strong> cảnh báo`);
+        alertSummaryText.innerHTML = `Phát hiện ${parts.join(', ')} cần kiểm tra. Click để xem chi tiết.`;
     } else {
         alertsSummary.classList.add('hidden');
     }
@@ -1049,14 +1352,42 @@ async function handleCellChange(tIdx, r, c, val, oldVal) {
     }
 
     try {
-        await fetch(`${API_BASE}/api/ocr/result/${jobId}`, {
+        pauseResultRefreshUntil = Date.now() + 5000;
+        const res = await fetch(`${API_BASE}/api/ocr/result/${jobId}`, {
             method: 'PUT',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ updates }),
         });
+        if (res.ok) {
+            const updated = await res.json().catch(() => null);
+            if (updated) ocrData = updated;
+        }
     } catch (e) { console.warn('Sync failed:', e); }
 
-    renderTableGrid();
+    await loadJobValidation();
+    updates.forEach(u => {
+        if (u.page_number === currentPageNumber && u.table_index === tIdx) {
+            updateCellDisplay(tIdx, u.row, u.col);
+        }
+    });
+    const pageNow = getPageData(currentPageNumber);
+    const pageErrors = [];
+    pageNow?.tables?.forEach((tbl, ti) => {
+        const cellMap = {};
+        tbl.cells.forEach(cc => { cellMap[`${cc.row}_${cc.col}`] = cc; });
+        for (let rr = 0; rr < tbl.num_rows; rr++) {
+            for (let cc = 0; cc < tbl.num_cols; cc++) {
+                const cellNow = cellMap[`${rr}_${cc}`] || { text: '', confidence: 1.0 };
+                const msg = validateCellText(rr, cc, cellNow.text, cellNow.confidence, tbl, ti);
+                if (msg) {
+                    const warn = msg.includes('tin cậy') || msg.includes('Tin cậy');
+                    pageErrors.push({ severity: warn ? 'warn' : 'error' });
+                }
+            }
+        }
+    });
+    updateValidationAlerts(pageErrors);
+    renderValidationPanel();
 }
 
 function showReplacePopover(matches, tIdx, oldVal, newVal) {
