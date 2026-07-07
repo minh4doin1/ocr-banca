@@ -102,7 +102,28 @@ class Settings(BaseSettings):
     keycloak_default_temporary: bool = True
     keycloak_default_required_actions: str = "UPDATE_PASSWORD,CONFIGURE_TOTP"
     # Mật khẩu tạm mặc định khi input không cung cấp password
-    keycloak_default_temp_password: str = ""
+    keycloak_default_temp_password: str = "Agribank@123"
+
+    # Client chứa các role banca-* (public clientId, không phải UUID)
+    keycloak_roles_client_id: str = ""
+
+    # Map vai trò nghiệp vụ / alias -> tên client role Keycloak
+    keycloak_role_map: str = (
+        "quản trị:banca-admin;admin:banca-admin;"
+        "đại lý viên:banca-seller;dai ly vien:banca-seller;seller:banca-seller;"
+        "kế toán viên:banca-accounting-operator;ke toan vien:banca-accounting-operator;"
+        "phê duyệt viên:banca-accounting-controller;phe duyet vien:banca-accounting-controller;"
+        "banca-admin:banca-admin;banca-seller:banca-seller;"
+        "banca-accounting-operator:banca-accounting-operator;"
+        "banca-accounting-controller:banca-accounting-controller"
+    )
+
+    # Map field nội bộ -> Keycloak attribute key
+    keycloak_attribute_map: str = (
+        "cccd:cccd;name:fullName;branch_code:branchCode;agent_code:agentCode;"
+        "branch_name:branchName;department_name:departmentName;"
+        "ipcas_code:ipcasCode;phone:phoneNumber;unit_code:unitCode"
+    )
 
     # Map tiêu đề cột (Excel/OCR, chữ thường không dấu cách thừa) -> field Keycloak.
     # Định dạng: "field:alias1|alias2;field2:aliasA|aliasB"
@@ -117,6 +138,10 @@ class Settings(BaseSettings):
         "department_name:phòng giao dịch|phong giao dich|pgd|phòng gd|phong gd|đơn vị|don vi;"
         "branch_code:mã chi nhánh|ma chi nhanh|mã cn|ma cn|branch code;"
         "agent_code:mã đại lý|ma dai ly|mã đl|ma dl|agent code|agency code;"
+        "ipcas_code:mã ipcas|ma ipcas|ipcas|user ipcas|mã ipcas;"
+        "phone:số điện thoại|so dien thoai|sdt|sđt|phone|điện thoại|dien thoai|sđt;"
+        "unit_code:mã đơn vị|ma don vi|mã dv|ma dv|mã đv|ma dv|unit code;"
+        "role:vai trò|vai tro|role|quyền|quyen|chức danh|chuc danh;"
         "password:mật khẩu|mat khau|password|matkhau"
     )
 
@@ -135,7 +160,9 @@ class Settings(BaseSettings):
     banca_core_match_min_gap: float = 0.08
 
     # Trường bắt buộc khi tạo user (comma-separated)
-    user_required_fields: str = "username,name,cccd"
+    user_required_fields: str = (
+        "email,first_name,last_name,branch_code,ipcas_code,cccd,phone,unit_code,role"
+    )
 
     class Config:
         env_file = ".env"
@@ -249,6 +276,42 @@ class Settings(BaseSettings):
     @property
     def user_required_fields_list(self) -> list[str]:
         return [f.strip() for f in self.user_required_fields.split(",") if f.strip()]
+
+    @property
+    def keycloak_role_map_parsed(self) -> dict[str, str]:
+        """{alias_normalized: role_name}"""
+        result: dict[str, str] = {}
+        for group in self.keycloak_role_map.split(";"):
+            group = group.strip()
+            if not group or ":" not in group:
+                continue
+            alias, role = group.split(":", 1)
+            alias = alias.strip().lower()
+            role = role.strip()
+            if alias and role:
+                result[alias] = role
+        return result
+
+    @property
+    def keycloak_valid_roles(self) -> list[str]:
+        return sorted(set(self.keycloak_role_map_parsed.values()))
+
+    @property
+    def keycloak_attribute_map_parsed(self) -> dict[str, str]:
+        result: dict[str, str] = {}
+        for group in self.keycloak_attribute_map.split(";"):
+            group = group.strip()
+            if not group or ":" not in group:
+                continue
+            field, attr = group.split(":", 1)
+            field, attr = field.strip(), attr.strip()
+            if field and attr:
+                result[field] = attr
+        return result
+
+    @property
+    def keycloak_roles_configured(self) -> bool:
+        return bool(self.keycloak_roles_client_id.strip())
 
     @property
     def banca_core_configured(self) -> bool:

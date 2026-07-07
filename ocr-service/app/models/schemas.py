@@ -247,6 +247,10 @@ class KeycloakUserInput(BaseModel):
     department_name: str = Field(default="", description="Tên phòng GD/PGD")
     branch_code: str = Field(default="", description="Mã chi nhánh")
     agent_code: str = Field(default="", description="Mã đại lý")
+    ipcas_code: str = Field(default="", description="Mã IPCAS")
+    phone: str = Field(default="", description="Số điện thoại")
+    unit_code: str = Field(default="", description="Mã đơn vị")
+    role: str = Field(default="", description="Client role Keycloak (banca-*)")
     branch_name_matched: str = Field(default="", description="Tên CN khớp từ banca-core")
     department_name_matched: str = Field(default="", description="Tên PGD khớp")
     match_status: MatchStatus | None = Field(default=None)
@@ -387,3 +391,7 @@ class FieldConfigResponse(BaseModel):
     required_fields: list[str] = Field(default_factory=list)
     header_map: dict[str, list[str]] = Field(default_factory=dict)
     banca_core_enabled: bool = False
+    roles: list[dict[str, str]] = Field(default_factory=list)
+    attribute_keys: dict[str, str] = Field(default_factory=dict)
+    roles_client_id: str = ""
+    default_temp_password: str = ""

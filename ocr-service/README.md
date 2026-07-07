@@ -118,9 +118,36 @@ Luồng enrich (`POST /api/users/enrich`):
 2. Nếu thiếu mã, **tra cứu đại lý theo email** (`GET /api/v1/agents/email`).
 3. Người dùng có thể chọn thủ công qua lookup API hoặc UI picker trên frontend.
 
-Attributes ghi lên Keycloak: `cccd`, `fullName`, `branchCode`, `agentCode`,
-`branchName`, `departmentName`.
+Attributes ghi lên Keycloak: `cccd`, `fullName`, `branchCode`, `ipcasCode`,
+`phoneNumber`, `unitCode`, `agentCode`, `branchName`, `departmentName`.
 
+## Tạo lô User theo SOP manual
+
+Luồng tự động hoá SOP khởi tạo/phân quyền Keycloak:
+
+| SOP | Field hệ thống | Keycloak |
+| --- | --- | --- |
+| Email | `email` | `username` + `email` |
+| First name / Last name | `first_name`, `last_name` | `firstName`, `lastName` |
+| Mã chi nhánh | `branch_code` | attribute `branchCode` |
+| Mã IPCAS | `ipcas_code` | attribute `ipcasCode` |
+| CCCD | `cccd` | attribute `cccd` |
+| Số điện thoại | `phone` | attribute `phoneNumber` |
+| Mã đơn vị | `unit_code` | attribute `unitCode` |
+| Vai trò | `role` | **client role** trên `KEYCLOAK_ROLES_CLIENT_ID` |
+
+**Client role mapping:**
+
+| Vai trò nghiệp vụ | Role Keycloak |
+| --- | --- |
+| Quản trị | `banca-admin` |
+| Đại lý viên | `banca-seller` |
+| Kế toán viên | `banca-accounting-operator` |
+| Phê duyệt viên | `banca-accounting-controller` |
+
+- Mật khẩu mặc định: `Agribank@123` (Temporary=ON)
+- Required actions: `UPDATE_PASSWORD`, `CONFIGURE_TOTP`
+- User đã tồn tại: Save Details + cập nhật attributes + gán client role (password/OTP chỉ khi `on_conflict` yêu cầu)
 
 Module này tạo/đồng bộ user lên Keycloak 24 qua Admin REST API bằng
 **Service Account** (grant `client_credentials`) — KHÔNG dùng tài khoản admin.
@@ -139,14 +166,18 @@ Module này tạo/đồng bộ user lên Keycloak 24 qua Admin REST API bằng
 
 - `manage-users`
 - `view-users`
+- `view-clients` (tra client UUID và role definition để gán client role)
 
 ### 3. Cấu hình `.env`
 
 ```env
-KEYCLOAK_BASE_URL=https://keycloak-domain
-KEYCLOAK_REALM=myrealm
+KEYCLOAK_BASE_URL=https://admin-sso.agribank.com
+KEYCLOAK_REALM=agribank
 KEYCLOAK_CLIENT_ID=user-provisioning-tool
 KEYCLOAK_CLIENT_SECRET=YOUR_SECRET
+KEYCLOAK_ROLES_CLIENT_ID=banca-app
+KEYCLOAK_DEFAULT_TEMP_PASSWORD=Agribank@123
+USER_REQUIRED_FIELDS=email,first_name,last_name,branch_code,ipcas_code,cccd,phone,unit_code,role
 ```
 
 ### 4. Gọi API
@@ -162,13 +193,16 @@ Khi user đã tồn tại, xử lý theo `on_conflict` (per-user hoặc mặc đ
   "default_on_conflict": "skip",
   "users": [
     {
-      "username": "nguyenvana",
-      "name": "Nguyễn Văn A",
-      "cccd": "001234567890",
-      "email": "a@example.com",
-      "branch_code": "001",
-      "agent_code": "DL001",
-      "on_conflict": "reset_both"   // ghi đè mặc định của lô cho user này
+      "email": "hungphamtuan2@agribank.com.vn",
+      "first_name": "Hùng",
+      "last_name": "Phạm Tuấn",
+      "branch_code": "1500",
+      "ipcas_code": "HQPTHUNG",
+      "cccd": "002409012027",
+      "phone": "0982867163",
+      "unit_code": "95204001",
+      "role": "banca-seller",
+      "on_conflict": "skip"
     }
   ]
 }

@@ -304,7 +304,7 @@
                 <h3>Review & Tạo lô User Keycloak</h3>
                 <button type="button" class="btn btn-ghost btn-sm" id="btn-batch-cancel">✕</button>
             </div>
-            <p class="text-muted modal-hint">Kiểm tra mã chi nhánh/đại lý. Dùng nút Tìm để chọn thủ công hoặc Enrich lại sau khi sửa tên CN/PGD.</p>
+            <p class="text-muted modal-hint">Kiểm tra thông tin theo SOP. Mật khẩu mặc định: <strong id="batch-default-pwd-hint">Agribank@123</strong> (Temporary). Chọn Vai trò và mã CN/ĐL trước khi xác nhận.</p>
             <div class="modal-toolbar">
                 <label>Mặc định khi trùng:
                     <select id="batch-default-conflict">
@@ -320,8 +320,9 @@
                 <table class="ocr-table batch-review-table">
                     <thead>
                         <tr>
-                            <th>Username</th><th>Họ tên</th><th>CCCD</th><th>Email</th>
-                            <th>Tên CN</th><th>Mã CN</th><th>Mã ĐL</th><th>Khớp</th><th>Trùng</th><th>TT</th>
+                            <th>Email</th><th>Họ</th><th>Tên</th><th>CCCD</th>
+                            <th>Mã CN</th><th>IPCAS</th><th>SĐT</th><th>Mã ĐV</th>
+                            <th>Vai trò</th><th>Mã ĐL</th><th>Khớp</th><th>Trùng</th><th>TT</th>
                         </tr>
                     </thead>
                     <tbody id="batch-review-tbody"></tbody>

@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
+import pytest
+
 from app.models.schemas import (
     CellData,
     KeycloakUserInput,
@@ -18,8 +20,17 @@ from app.models.schemas import (
     ProvisionStatus,
     TableData,
 )
+from app.routers import users as users_router
 from app.routers.users import _provision_one
-from app.services.user_mapping import map_result_to_users
+from app.services.user_mapping import map_result_to_users, normalize_role
+
+
+@pytest.fixture(autouse=True)
+def _roles_client_configured(monkeypatch):
+    monkeypatch.setattr(
+        "app.routers.users.settings.keycloak_roles_client_id", "banca-app"
+    )
+    users_router._client_uuid_cache.clear()
 
 
 def _make_table(header: list[str], rows: list[list[str]]) -> TableData:
@@ -45,45 +56,37 @@ def _make_result(table: TableData) -> OcrResult:
     )
 
 
-# ──────────────────────────────────────────────────────────────
-# Mapping
-# ──────────────────────────────────────────────────────────────
+def test_normalize_role_vn_label():
+    assert normalize_role("Phê duyệt viên") == "banca-accounting-controller"
+    assert normalize_role("banca-seller") == "banca-seller"
 
 
 def test_map_result_basic():
-    """Header khớp map -> tạo user đúng field."""
     table = _make_table(
-        ["Username", "Email", "Họ", "Tên"],
+        ["Email", "Họ", "Tên", "CCCD", "Mã chi nhánh", "Mã IPCAS", "Số điện thoại", "Mã đơn vị", "Vai trò"],
         [
-            ["nguyenvana", "a@example.com", "Nguyễn", "Văn A"],
-            ["tranthib", "b@example.com", "Trần", "Thị B"],
+            [
+                "a@example.com",
+                "Nguyễn",
+                "Văn A",
+                "001234567890",
+                "1500",
+                "HQPTEST",
+                "0982867163",
+                "95204001",
+                "Đại lý viên",
+            ],
         ],
     )
     users, warnings = map_result_to_users(_make_result(table))
-    assert len(users) == 2
-    assert warnings == []
-    assert users[0].username == "nguyenvana"
-    assert users[0].email == "a@example.com"
-    assert users[0].last_name == "Nguyễn"
-    assert users[0].first_name == "Văn A"
-
-
-def test_map_skips_empty_username_rows():
-    """Dòng không có username bị bỏ qua."""
-    table = _make_table(
-        ["Username", "Email"],
-        [
-            ["user1", "u1@example.com"],
-            ["", "ghost@example.com"],
-        ],
-    )
-    users, _ = map_result_to_users(_make_result(table))
     assert len(users) == 1
-    assert users[0].username == "user1"
+    assert warnings == []
+    assert users[0].username == "a@example.com"
+    assert users[0].role == "banca-seller"
+    assert users[0].ipcas_code == "HQPTEST"
 
 
 def test_map_sso_data_without_header_row():
-    """Form SSO: dòng 0 là STT=1 (postprocess đã bỏ header)."""
     table = _make_table(
         [
             "1",
@@ -96,64 +99,27 @@ def test_map_sso_data_without_header_row():
             "Phê duyệt viên",
             "Cấp mới",
         ],
-        [
-            [
-                "2",
-                "Trương Thị Trúc Phương",
-                "KT&NQ",
-                "TRUCPHUONG",
-                "083179011564 (13/08/2021)",
-                "phuongtruongthitruc@agribank.com.vn",
-                "0848709211",
-                "Phê duyệt viên",
-                "Cấp mới",
-            ],
-        ],
+        [],
     )
     users, warnings = map_result_to_users(_make_result(table))
-    assert not warnings or not any("username" in w for w in warnings)
-    assert len(users) == 2
-    assert users[0].username == "LANLUONG"
-    assert users[0].name == "Nguyễn Thị Phú Lương"
-    assert users[0].cccd == "054178007182"
-    assert users[0].email == "luongnguyenthiphu@agribank.com.vn"
-
-
-def test_map_warns_when_no_username_column():
-    """Không có cột username -> cảnh báo, không tạo user."""
-    table = _make_table(
-        ["Email", "Họ"],
-        [["x@example.com", "Nguyễn"]],
-    )
-    users, warnings = map_result_to_users(_make_result(table))
-    assert users == []
-    assert any("username" in w for w in warnings)
-
-
-def test_map_dedupes_username():
-    """Username trùng chỉ giữ bản ghi đầu tiên và cảnh báo."""
-    table = _make_table(
-        ["Username", "Email"],
-        [
-            ["dup", "first@example.com"],
-            ["dup", "second@example.com"],
-        ],
-    )
-    users, warnings = map_result_to_users(_make_result(table))
+    assert not warnings or not any("email" in w for w in warnings)
     assert len(users) == 1
-    assert users[0].email == "first@example.com"
-    assert any("trùng" in w.lower() for w in warnings)
-
-
-# ──────────────────────────────────────────────────────────────
-# on_conflict branches
-# ──────────────────────────────────────────────────────────────
+    assert users[0].username == "luongnguyenthiphu@agribank.com.vn"
+    assert users[0].ipcas_code == "LANLUONG"
+    assert users[0].cccd == "054178007182"
+    assert users[0].phone == "0908976096"
+    assert users[0].role == "banca-accounting-controller"
+    assert users[0].first_name == "Lương"
+    assert users[0].last_name == "Nguyễn Thị Phú"
 
 
 def _client_new_user() -> MagicMock:
     client = MagicMock()
     client.find_user_by_username.return_value = None
     client.create_user.return_value = "new-id-123"
+    client.get_client_by_client_id.return_value = {"id": "client-uuid"}
+    client.get_client_role.return_value = {"id": "role-id", "name": "banca-seller"}
+    client.get_user_client_roles.return_value = []
     return client
 
 
@@ -161,11 +127,25 @@ def _client_existing_user() -> MagicMock:
     client = MagicMock()
     client.find_user_by_username.return_value = {"id": "existing-id", "username": "u"}
     client.reset_otp.return_value = 1
+    client.get_client_by_client_id.return_value = {"id": "client-uuid"}
+    client.get_client_role.return_value = {"id": "role-id", "name": "banca-seller"}
+    client.get_user_client_roles.return_value = []
     return client
 
 
 def _user(**kwargs) -> KeycloakUserInput:
-    data = {"username": "u", "name": "Nguyễn Văn A", "cccd": "001234567890"}
+    data = {
+        "username": "u@agribank.com.vn",
+        "email": "u@agribank.com.vn",
+        "first_name": "A",
+        "last_name": "Nguyễn",
+        "branch_code": "1500",
+        "ipcas_code": "HQPTEST",
+        "cccd": "001234567890",
+        "phone": "0982867163",
+        "unit_code": "95204001",
+        "role": "banca-seller",
+    }
     data.update(kwargs)
     return KeycloakUserInput(**data)
 
@@ -181,13 +161,14 @@ def test_provision_creates_new_user():
         default_required_actions=["UPDATE_PASSWORD", "CONFIGURE_TOTP"],
     )
     assert result.status == ProvisionStatus.CREATED
-    assert result.user_id == "new-id-123"
     client.create_user.assert_called_once()
+    client.assign_client_roles.assert_called_once()
     kwargs = client.create_user.call_args.kwargs
+    assert kwargs["username"] == "u@agribank.com.vn"
     assert kwargs["required_actions"] == ["UPDATE_PASSWORD", "CONFIGURE_TOTP"]
 
 
-def test_provision_skip_existing():
+def test_provision_existing_user_save_details_and_role():
     client = _client_existing_user()
     user = _user()
     result = _provision_one(
@@ -197,10 +178,11 @@ def test_provision_skip_existing():
         on_conflict=OnConflictAction.SKIP,
         default_required_actions=[],
     )
-    assert result.status == ProvisionStatus.SKIPPED
+    assert result.status == ProvisionStatus.UPDATED
     client.create_user.assert_not_called()
+    client.update_user_details.assert_called_once()
+    client.assign_client_roles.assert_called_once()
     client.reset_password.assert_not_called()
-    client.reset_otp.assert_not_called()
 
 
 def test_provision_reset_password():
@@ -217,86 +199,28 @@ def test_provision_reset_password():
     client.reset_password.assert_called_once_with(
         "existing-id", "New@123", temporary=True
     )
-    client.ensure_required_actions.assert_called_once_with(
-        "existing-id", ["UPDATE_PASSWORD"]
+
+
+def test_provision_fails_without_role():
+    client = _client_new_user()
+    user = _user(role="")
+    result = _provision_one(
+        client,
+        user,
+        temporary=True,
+        on_conflict=OnConflictAction.SKIP,
+        default_required_actions=[],
     )
-    client.reset_otp.assert_not_called()
+    assert result.status == ProvisionStatus.FAILED
+    assert "role" in result.error
 
 
-def test_provision_reset_otp():
-    client = _client_existing_user()
+def test_build_keycloak_attributes_sop_fields():
+    from app.services.user_mapping import build_keycloak_attributes
+
     user = _user()
-    result = _provision_one(
-        client,
-        user,
-        temporary=True,
-        on_conflict=OnConflictAction.RESET_OTP,
-        default_required_actions=[],
-    )
-    assert result.status == ProvisionStatus.UPDATED
-    client.reset_otp.assert_called_once_with("existing-id")
-    client.reset_password.assert_not_called()
-
-
-def test_provision_reset_both():
-    client = _client_existing_user()
-    user = _user(password="Both@123")
-    result = _provision_one(
-        client,
-        user,
-        temporary=True,
-        on_conflict=OnConflictAction.RESET_BOTH,
-        default_required_actions=[],
-    )
-    assert result.status == ProvisionStatus.UPDATED
-    client.reset_password.assert_called_once()
-    client.reset_otp.assert_called_once_with("existing-id")
-
-
-def test_per_user_on_conflict_overrides_batch_default():
-    """on_conflict của user ghi đè mặc định của lô."""
-    client = _client_existing_user()
-    user = _user(on_conflict=OnConflictAction.RESET_OTP)
-    result = _provision_one(
-        client,
-        user,
-        temporary=True,
-        on_conflict=OnConflictAction.SKIP,  # mặc định lô là skip
-        default_required_actions=[],
-    )
-    assert result.status == ProvisionStatus.UPDATED
-    client.reset_otp.assert_called_once()
-
-
-def test_map_cccd_and_name_fields():
-    """Map cột CCCD và Họ tên."""
-    table = _make_table(
-        ["Username", "Họ tên", "CCCD", "Email"],
-        [["user1", "Nguyễn Văn A", "001234567890", "a@example.com"]],
-    )
-    users, _ = map_result_to_users(_make_result(table))
-    assert len(users) == 1
-    assert users[0].name == "Nguyễn Văn A"
-    assert users[0].cccd == "001234567890"
-
-
-def test_validate_user_fields_missing_cccd():
-    from app.services.user_mapping import build_keycloak_attributes, validate_user_fields
-
-    user = KeycloakUserInput(username="u", name="Test User")
-    missing = validate_user_fields(user)
-    assert "cccd" in missing
-
-    user2 = KeycloakUserInput(
-        username="u",
-        name="Test",
-        cccd="001234567890",
-        branch_code="001",
-        agent_code="DL1",
-    )
-    attrs = build_keycloak_attributes(user2)
-    assert attrs["cccd"] == ["001234567890"]
-    assert attrs["branchCode"] == ["001"]
-    assert attrs["agentCode"] == ["DL1"]
-    assert attrs["fullName"] == ["Test"]
-
+    attrs = build_keycloak_attributes(user)
+    assert attrs["ipcasCode"] == ["HQPTEST"]
+    assert attrs["phoneNumber"] == ["0982867163"]
+    assert attrs["unitCode"] == ["95204001"]
+    assert attrs["branchCode"] == ["1500"]

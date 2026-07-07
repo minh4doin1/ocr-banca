@@ -46,11 +46,22 @@ from app.services.keycloak_service import (
 )
 from app.services.user_mapping import (
     build_keycloak_attributes,
+    finalize_user,
     map_result_to_users,
+    normalize_role,
     validate_user_fields,
 )
 
 logger = logging.getLogger(__name__)
+
+_ROLE_LABELS: dict[str, str] = {
+    "banca-admin": "Quản trị",
+    "banca-seller": "Đại lý viên",
+    "banca-accounting-operator": "Kế toán viên",
+    "banca-accounting-controller": "Phê duyệt viên",
+}
+
+_client_uuid_cache: dict[str, str] = {}
 
 router = APIRouter(
     prefix="/api/users",
@@ -87,6 +98,75 @@ def _build_kc_client(realm: str) -> KeycloakClient:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
+def _resolve_roles_client_uuid(client: KeycloakClient) -> str:
+    client_id = settings.keycloak_roles_client_id.strip()
+    if not client_id:
+        raise KeycloakError("KEYCLOAK_ROLES_CLIENT_ID chưa cấu hình.")
+    if client_id in _client_uuid_cache:
+        return _client_uuid_cache[client_id]
+    kc_client = client.get_client_by_client_id(client_id)
+    if not kc_client or not kc_client.get("id"):
+        raise KeycloakError(f"Không tìm thấy Keycloak client '{client_id}'.")
+    uuid = str(kc_client["id"])
+    _client_uuid_cache[client_id] = uuid
+    return uuid
+
+
+def _assign_client_role(
+    client: KeycloakClient, user_id: str, role_name: str
+) -> list[str]:
+    """Gán client role nếu user chưa có. Trả actions applied."""
+    if not role_name:
+        return []
+    role_name = normalize_role(role_name)
+    if role_name not in settings.keycloak_valid_roles:
+        raise KeycloakError(f"Role không hợp lệ: '{role_name}'.")
+
+    client_uuid = _resolve_roles_client_uuid(client)
+    role_repr = client.get_client_role(client_uuid, role_name)
+    if not role_repr:
+        raise KeycloakError(
+            f"Role '{role_name}' không tồn tại trên client "
+            f"'{settings.keycloak_roles_client_id}'."
+        )
+
+    existing = client.get_user_client_roles(user_id, client_uuid)
+    if any(str(r.get("name", "")) == role_name for r in existing):
+        return [f"role_already:{role_name}"]
+
+    client.assign_client_roles(user_id, client_uuid, [role_repr])
+    return [f"assign_role:{role_name}"]
+
+
+def _save_existing_user(
+    client: KeycloakClient,
+    user_id: str,
+    user: KeycloakUserInput,
+    attrs: dict,
+) -> list[str]:
+    """Save Details + attributes theo SOP manual."""
+    applied: list[str] = []
+    display_name = user.name.strip()
+    first = user.first_name.strip() or (
+        display_name.split()[-1] if display_name else ""
+    )
+    last = user.last_name.strip() or (
+        " ".join(display_name.split()[:-1]) if display_name else ""
+    )
+    client.update_user_details(
+        user_id,
+        email=user.email or user.username,
+        first_name=first,
+        last_name=last,
+    )
+    applied.append("save_details")
+    if attrs:
+        client.update_user_attributes(user_id, attrs)
+        applied.append("set_attributes")
+    applied.extend(_assign_client_role(client, user_id, user.role))
+    return applied
+
+
 def _require_banca() -> BancaCoreClient:
     client = get_client()
     if client is None:
@@ -120,6 +200,7 @@ def _enrich_users(users: list[KeycloakUserInput]) -> EnrichResponse:
     for user in users:
         row = enrich_user_row(user.model_dump(), client)
         updated = KeycloakUserInput.model_validate(row)
+        updated = finalize_user(updated)
         updated.missing_fields = validate_user_fields(updated)
         if updated.warnings:
             warnings.extend(updated.warnings)
@@ -136,12 +217,17 @@ def _provision_one(
     on_conflict: OnConflictAction,
     default_required_actions: list[str],
 ) -> UserProvisionResult:
+    user = finalize_user(user)
     username = user.username.strip()
     result = UserProvisionResult(username=username, status=ProvisionStatus.FAILED)
 
     missing = validate_user_fields(user)
     if missing:
-        result.error = f"Thiếu trường bắt buộc: {', '.join(missing)}"
+        result.error = f"Thiếu/không hợp lệ: {', '.join(missing)}"
+        return result
+
+    if not settings.keycloak_roles_configured:
+        result.error = "KEYCLOAK_ROLES_CLIENT_ID chưa cấu hình."
         return result
 
     attrs = build_keycloak_attributes(user)
@@ -164,7 +250,7 @@ def _provision_one(
             )
             user_id = client.create_user(
                 username=username,
-                email=user.email,
+                email=user.email or username,
                 first_name=first,
                 last_name=last,
                 password=_resolve_temp_password(user),
@@ -172,27 +258,21 @@ def _provision_one(
                 required_actions=required_actions,
                 attributes=attrs,
             )
+            applied = ["create"] + list(required_actions)
+            if attrs:
+                applied.append("set_attributes")
+            applied.extend(_assign_client_role(client, user_id, user.role))
             result.status = ProvisionStatus.CREATED
             result.user_id = user_id
-            result.actions_applied = ["create"] + list(required_actions)
-            if attrs:
-                result.actions_applied.append("set_attributes")
+            result.actions_applied = applied
             return result
 
         user_id = str(existing.get("id", ""))
         result.user_id = user_id
         action = user.on_conflict or on_conflict
 
-        if action == OnConflictAction.SKIP:
-            if attrs:
-                client.update_user_attributes(user_id, attrs)
-                result.actions_applied = ["skip", "set_attributes"]
-            else:
-                result.actions_applied = ["skip"]
-            result.status = ProvisionStatus.SKIPPED
-            return result
+        applied = _save_existing_user(client, user_id, user, attrs)
 
-        applied: list[str] = []
         if action in (OnConflictAction.RESET_PASSWORD, OnConflictAction.RESET_BOTH):
             client.reset_password(
                 user_id, _resolve_temp_password(user), temporary=temporary
@@ -205,10 +285,6 @@ def _provision_one(
         if action in (OnConflictAction.RESET_OTP, OnConflictAction.RESET_BOTH):
             deleted = client.reset_otp(user_id)
             applied.append(f"reset_otp(deleted={deleted})")
-
-        if attrs:
-            client.update_user_attributes(user_id, attrs)
-            applied.append("set_attributes")
 
         result.status = ProvisionStatus.UPDATED
         result.actions_applied = applied
@@ -271,10 +347,21 @@ async def lookup_agents(
 
 @router.get("/field-config", response_model=FieldConfigResponse)
 async def field_config():
+    roles = [
+        {
+            "value": role,
+            "label": _ROLE_LABELS.get(role, role),
+        }
+        for role in settings.keycloak_valid_roles
+    ]
     return FieldConfigResponse(
         required_fields=settings.user_required_fields_list,
         header_map=settings.keycloak_header_map_parsed,
         banca_core_enabled=settings.banca_core_configured,
+        roles=roles,
+        attribute_keys=settings.keycloak_attribute_map_parsed,
+        roles_client_id=settings.keycloak_roles_client_id,
+        default_temp_password=settings.keycloak_default_temp_password,
     )
 
 

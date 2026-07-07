@@ -12,7 +12,21 @@ async function loadFieldConfig() {
         const res = await fetch(`${API_BASE}/api/users/field-config`);
         if (res.ok) fieldConfig = await res.json();
     } catch {
-        fieldConfig = { required_fields: ['username', 'name', 'cccd'], banca_core_enabled: false };
+        fieldConfig = {
+            required_fields: ['email', 'first_name', 'last_name', 'branch_code', 'ipcas_code', 'cccd', 'phone', 'unit_code', 'role'],
+            roles: [
+                { value: 'banca-admin', label: 'Quản trị' },
+                { value: 'banca-seller', label: 'Đại lý viên' },
+                { value: 'banca-accounting-operator', label: 'Kế toán viên' },
+                { value: 'banca-accounting-controller', label: 'Phê duyệt viên' },
+            ],
+            default_temp_password: 'Agribank@123',
+            banca_core_enabled: false,
+        };
+    }
+    const hint = document.getElementById('batch-default-pwd-hint');
+    if (hint && fieldConfig?.default_temp_password) {
+        hint.textContent = fieldConfig.default_temp_password;
     }
 }
 
@@ -42,11 +56,21 @@ function validateCellByField(field, text, confidence, isHeader) {
     if (field === 'cccd' && !/^\d{12}$/.test(text.replace(/\s+/g, ''))) {
         return 'CCCD phải có 12 số';
     }
+    if (field === 'phone' && !/^0\d{8,10}$/.test(text.replace(/\s+/g, ''))) {
+        return 'SĐT không hợp lệ';
+    }
     if ((field === 'name' || field === 'first_name') && text && /\d/.test(text)) {
         return 'Tên chứa chữ số';
     }
     if (confidence < 0.85) return 'Độ tin cậy thấp';
     return '';
+}
+
+function roleOptionsHtml(selected) {
+    const roles = fieldConfig?.roles || [];
+    return roles.map(r =>
+        `<option value="${escapeAttr(r.value)}"${r.value === selected ? ' selected' : ''}>${escapeAttr(r.label)}</option>`
+    ).join('');
 }
 
 async function enrichBatchUsers() {
@@ -91,16 +115,24 @@ function renderBatchReviewTable(users) {
         const tr = document.createElement('tr');
         const missing = (u.missing_fields || []).join(', ');
         tr.innerHTML = `
-            <td>${escapeAttr(u.username)}</td>
-            <td><input class="batch-inp" data-idx="${idx}" data-f="name" value="${escapeAttr(u.name || '')}"></td>
+            <td><input class="batch-inp" data-idx="${idx}" data-f="email" value="${escapeAttr(u.email || u.username || '')}"></td>
+            <td><input class="batch-inp" data-idx="${idx}" data-f="last_name" value="${escapeAttr(u.last_name || '')}"></td>
+            <td><input class="batch-inp" data-idx="${idx}" data-f="first_name" value="${escapeAttr(u.first_name || '')}"></td>
             <td><input class="batch-inp" data-idx="${idx}" data-f="cccd" value="${escapeAttr(u.cccd || '')}"></td>
-            <td><input class="batch-inp" data-idx="${idx}" data-f="email" value="${escapeAttr(u.email || '')}"></td>
-            <td><input class="batch-inp branch-name-inp" data-idx="${idx}" data-f="branch_name" value="${escapeAttr(u.branch_name || '')}"></td>
             <td>
                 <div class="picker-wrap">
                     <input class="batch-inp branch-code-inp" data-idx="${idx}" data-f="branch_code" value="${escapeAttr(u.branch_code || '')}" placeholder="Mã CN">
                     <button type="button" class="btn btn-xs btn-ghost btn-pick-branch" data-idx="${idx}">Tìm</button>
                 </div>
+            </td>
+            <td><input class="batch-inp" data-idx="${idx}" data-f="ipcas_code" value="${escapeAttr(u.ipcas_code || '')}"></td>
+            <td><input class="batch-inp" data-idx="${idx}" data-f="phone" value="${escapeAttr(u.phone || '')}"></td>
+            <td><input class="batch-inp" data-idx="${idx}" data-f="unit_code" value="${escapeAttr(u.unit_code || '')}"></td>
+            <td>
+                <select class="batch-inp" data-idx="${idx}" data-f="role">
+                    <option value="">-- Chọn --</option>
+                    ${roleOptionsHtml(u.role || '')}
+                </select>
             </td>
             <td>
                 <div class="picker-wrap">
@@ -111,7 +143,7 @@ function renderBatchReviewTable(users) {
             <td>${matchBadge(u.match_status)} ${u.match_confidence ? (u.match_confidence * 100).toFixed(0) + '%' : ''}</td>
             <td>
                 <select class="batch-inp" data-idx="${idx}" data-f="on_conflict">
-                    <option value="skip">Bỏ qua nếu trùng</option>
+                    <option value="skip">Bỏ qua MK/OTP</option>
                     <option value="reset_password">Đổi MK</option>
                     <option value="reset_otp">Đổi OTP</option>
                     <option value="reset_both">Đổi cả 2</option>
@@ -127,6 +159,7 @@ function renderBatchReviewTable(users) {
             const f = el.dataset.f;
             if (f === 'on_conflict') enrichedUsers[i].on_conflict = el.value;
             else enrichedUsers[i][f] = el.value;
+            if (f === 'email') enrichedUsers[i].username = el.value;
         });
     });
 
@@ -166,13 +199,18 @@ async function openAgentPicker(idx) {
     if (n >= 1 && n <= items.length) {
         enrichedUsers[idx].agent_code = items[n - 1].agent_code;
         if (items[n - 1].branch_code) enrichedUsers[idx].branch_code = items[n - 1].branch_code;
+        if (items[n - 1].ipcas_code) enrichedUsers[idx].ipcas_code = items[n - 1].ipcas_code;
         enrichedUsers[idx].match_status = 'manual';
         renderBatchReviewTable(enrichedUsers);
     }
 }
 
 function showBatchReviewModal(users) {
-    enrichedUsers = users.map(u => ({ ...u, on_conflict: u.on_conflict || 'skip' }));
+    enrichedUsers = users.map(u => ({
+        ...u,
+        username: u.username || u.email,
+        on_conflict: u.on_conflict || 'skip',
+    }));
     const modal = document.getElementById('batch-review-modal');
     if (!modal) return;
     renderBatchReviewTable(enrichedUsers);
@@ -185,17 +223,31 @@ function hideBatchReviewModal() {
     batchReviewOpen = false;
 }
 
+function validateBeforeProvision() {
+    const missingUsers = enrichedUsers.filter(u => (u.missing_fields || []).length > 0 || !u.role);
+    if (missingUsers.length) {
+        alert('Còn user thiếu trường bắt buộc hoặc chưa chọn Vai trò. Vui lòng kiểm tra cột TT.');
+        return false;
+    }
+    return true;
+}
+
 async function confirmBatchProvision() {
+    if (!validateBeforeProvision()) return;
     const defaultConflict = document.getElementById('batch-default-conflict')?.value || 'skip';
     const btn = document.getElementById('btn-batch-confirm');
     if (btn) { btn.disabled = true; btn.textContent = 'Đang tạo lô...'; }
 
     try {
+        const payloadUsers = enrichedUsers.map(u => ({
+            ...u,
+            username: u.email || u.username,
+        }));
         const res = await fetch(`${API_BASE}/api/users/provision-batch`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
-                users: enrichedUsers,
+                users: payloadUsers,
                 default_on_conflict: defaultConflict,
             }),
         });

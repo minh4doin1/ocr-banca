@@ -375,6 +375,103 @@ class KeycloakClient:
                 f"(HTTP {update_resp.status_code})"
             )
 
+    # ──────────────────────────────────────────────────────────
+    # Client role operations
+    # ──────────────────────────────────────────────────────────
+
+    def get_client_by_client_id(self, client_id: str) -> dict | None:
+        """Tra client theo public clientId, trả representation đầy đủ."""
+        resp = self._request(
+            "GET",
+            self._admin_url("/clients"),
+            params={"clientId": client_id},
+            json_body=False,
+        )
+        if resp.status_code != 200:
+            raise KeycloakError(
+                f"Tra client '{client_id}' thất bại "
+                f"(HTTP {resp.status_code}): {_safe_body(resp)}"
+            )
+        clients = resp.json() or []
+        return clients[0] if clients else None
+
+    def get_client_role(self, client_uuid: str, role_name: str) -> dict | None:
+        resp = self._request(
+            "GET",
+            self._admin_url(f"/clients/{client_uuid}/roles/{role_name}"),
+            json_body=False,
+        )
+        if resp.status_code == 404:
+            return None
+        if resp.status_code != 200:
+            raise KeycloakError(
+                f"Lấy role '{role_name}' thất bại "
+                f"(HTTP {resp.status_code}): {_safe_body(resp)}"
+            )
+        return resp.json()
+
+    def get_user_client_roles(self, user_id: str, client_uuid: str) -> list[dict]:
+        resp = self._request(
+            "GET",
+            self._admin_url(
+                f"/users/{user_id}/role-mappings/clients/{client_uuid}"
+            ),
+            json_body=False,
+        )
+        if resp.status_code != 200:
+            raise KeycloakError(
+                f"Lấy client roles (user {user_id}) thất bại "
+                f"(HTTP {resp.status_code}): {_safe_body(resp)}"
+            )
+        return resp.json() or []
+
+    def assign_client_roles(
+        self, user_id: str, client_uuid: str, roles: list[dict]
+    ) -> None:
+        if not roles:
+            return
+        resp = self._request(
+            "POST",
+            self._admin_url(
+                f"/users/{user_id}/role-mappings/clients/{client_uuid}"
+            ),
+            json=roles,
+        )
+        if resp.status_code not in (200, 204):
+            raise KeycloakError(
+                f"Gán client role (user {user_id}) thất bại "
+                f"(HTTP {resp.status_code}): {_safe_body(resp)}"
+            )
+
+    def update_user_details(
+        self,
+        user_id: str,
+        *,
+        email: str = "",
+        first_name: str = "",
+        last_name: str = "",
+    ) -> None:
+        """Cập nhật thông tin General tab (Save Details)."""
+        payload: dict = {}
+        if email:
+            payload["email"] = email
+        if first_name:
+            payload["firstName"] = first_name
+        if last_name:
+            payload["lastName"] = last_name
+        if not payload:
+            return
+        resp = self._request(
+            "PUT",
+            self._admin_url(f"/users/{user_id}"),
+            json=payload,
+        )
+        if resp.status_code not in (200, 204):
+            raise KeycloakError(
+                f"Cập nhật user {user_id} thất bại "
+                f"(HTTP {resp.status_code}): {_safe_body(resp)}"
+            )
+
 
 def _safe_body(resp: requests.Response) -> str:
     """Trích nội dung lỗi ngắn gọn, không lộ dữ liệu nhạy cảm."""
