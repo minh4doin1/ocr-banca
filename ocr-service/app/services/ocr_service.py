@@ -12,6 +12,7 @@ from __future__ import annotations
 import inspect
 import logging
 import os
+import re
 import threading
 from dataclasses import dataclass
 from pathlib import Path
@@ -1004,6 +1005,29 @@ def _reconstruct_table_from_lines(
         cells = _merge_fragment_sso_rows(cells)
     if settings.ocr_sso_email_fixed_domain and cells:
         cells = _apply_fixed_email_domain(cells)
+    if cells:
+        resolved = _resolve_sso_email_col(max_col + 1, cells)
+        if resolved is not None:
+            header_rows = {c.row for c in cells if c.row <= 1}
+            fixed = []
+            for c in cells:
+                if c.col == resolved and c.row not in header_rows and c.text.strip():
+                    formatted = _format_sso_email(c.text)
+                    if formatted:
+                        fixed.append(
+                            CellData(
+                                row=c.row,
+                                col=c.col,
+                                text=formatted,
+                                confidence=c.confidence,
+                                bbox=c.bbox,
+                            )
+                        )
+                    else:
+                        fixed.append(c)
+                else:
+                    fixed.append(c)
+            cells = fixed
     cells.sort(key=lambda c: (c.row, c.col))
     return cells
 
@@ -1417,6 +1441,188 @@ def _resolve_sso_email_col(num_cols: int, cells: list[CellData] | None = None) -
     return None
 
 
+def _find_role_col(cells: list[CellData]) -> int | None:
+    """Locate role column from header rows."""
+    for c in cells:
+        if c.row > 1:
+            break
+        low = _normalize_match_text(c.text)
+        if any(k in low for k in ("phan quyen", "vai tro", "role", "quyen")):
+            return c.col
+    max_col = max((c.col for c in cells), default=0)
+    if max_col + 1 >= 8:
+        return 7
+    return None
+
+
+def _enhance_cell_for_ocr(crop: np.ndarray, *, col_kind: str = "default") -> np.ndarray:
+    """Upscale + CLAHE for small SSO cells (email/role)."""
+    import cv2
+
+    if crop is None or crop.size == 0:
+        return crop
+    scale = settings.ocr_sso_critical_col_upscale
+    if col_kind == "role":
+        scale = max(scale, 3.0)
+    h, w = crop.shape[:2]
+    new_w = max(int(w * scale), w + 8)
+    new_h = max(int(h * scale), h + 4)
+    up = cv2.resize(crop, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
+    if col_kind == "email":
+        pad = 4
+        up = cv2.copyMakeBorder(up, pad, pad, pad, pad, cv2.BORDER_CONSTANT, value=(255, 255, 255))
+    gray = cv2.cvtColor(up, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    enhanced = clahe.apply(gray)
+    return cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
+
+
+def _score_email_ocr_text(text: str) -> float:
+    """Higher score = more likely valid email local part."""
+    import re
+
+    t = (text or "").strip()
+    if not t or _is_hallucinated_ocr_line(t):
+        return 0.0
+    local = _extract_sso_email_local(t)
+    if not local:
+        if re.search(r"[a-z]{3,}", t.lower()):
+            return 0.3
+        return 0.0
+    if any(x in local for x in ("agribank", "ribank", "comvn")):
+        return 0.1
+    if len(local) < 3:
+        return 0.2
+    return min(1.0, 0.5 + len(local) * 0.02)
+
+
+def _recognize_critical_cell(
+    crop: np.ndarray,
+    *,
+    col_kind: str,
+) -> tuple[str, float]:
+    """Second-pass ensemble OCR for email/role columns."""
+    enhanced = _enhance_cell_for_ocr(crop, col_kind=col_kind)
+    candidates: list[tuple[str, float]] = []
+
+    v_text, v_conf = _recognize_with_vietocr(enhanced)
+    if v_text.strip():
+        candidates.append((v_text.strip(), v_conf))
+
+    p_text, p_conf = _recognize_with_paddle_cell(enhanced)
+    if p_text.strip():
+        candidates.append((p_text.strip(), p_conf))
+
+    if not candidates:
+        return "", 0.0
+
+    if col_kind == "email":
+        best = max(candidates, key=lambda c: _score_email_ocr_text(c[0]))
+        lines = [c[0] for c in candidates if c[0]]
+        if settings.ocr_sso_email_fixed_domain and lines:
+            formatted, _, _ = _email_from_first_line(lines)
+            return formatted or best[0], max(c[1] for c in candidates)
+        lines = [c[0] for c in candidates if c[0]]
+        if settings.ocr_sso_email_fixed_domain and lines:
+            formatted, _, _ = _email_from_first_line(lines)
+            return formatted or best[0], max(c[1] for c in candidates)
+        joined = _join_multiline_ocr_lines(lines)
+        return joined, max(c[1] for c in candidates)
+
+    best = max(candidates, key=lambda c: (len(c[0]), c[1]))
+    return best[0], best[1]
+
+
+def _refine_sso_critical_columns(
+    image: np.ndarray,
+    cells: list[CellData],
+) -> list[CellData]:
+    """Re-OCR email and role columns with upscale (pass 2)."""
+    if not settings.ocr_sso_pass2_enabled or not cells:
+        return cells
+
+    max_col = max(c.col for c in cells)
+    email_col = _resolve_sso_email_col(max_col + 1, cells)
+    role_col = _find_role_col(cells)
+    critical = {c for c in (email_col, role_col) if c is not None}
+    if not critical:
+        return cells
+
+    header_rows = {c.row for c in cells if c.row <= 1}
+    out: list[CellData] = []
+    for c in cells:
+        if c.col not in critical or c.row in header_rows or not c.bbox or len(c.bbox) < 4:
+            out.append(c)
+            continue
+        x1, y1, x2, y2 = [int(v) for v in c.bbox[:4]]
+        pad = 2
+        cy1 = max(0, y1 - pad)
+        cy2 = min(image.shape[0], y2 + pad)
+        cx1 = max(0, x1 - pad)
+        cx2 = min(image.shape[1], x2 + pad)
+        crop = image[cy1:cy2, cx1:cx2]
+        if crop.size == 0 or not _cell_has_ink(crop):
+            out.append(c)
+            continue
+
+        kind = "email" if c.col == email_col else "role"
+        text, conf = _recognize_critical_cell(crop, col_kind=kind)
+        if not text.strip():
+            out.append(c)
+            continue
+
+        if kind == "email" and settings.ocr_sso_email_fixed_domain:
+            text = _format_sso_email(text) or text
+        elif kind == "role":
+            text = text.strip()
+        else:
+            text = _normalize_cell_text(text, col=c.col, email_col=email_col)
+
+        out.append(
+            CellData(
+                row=c.row,
+                col=c.col,
+                text=text,
+                confidence=max(c.confidence, conf),
+                bbox=c.bbox,
+            )
+        )
+    return out
+
+
+_EMAIL_LOCAL_RE = re.compile(r"^[a-z][a-z0-9._-]{2,24}$")
+_EMAIL_UNCERTAIN_PREFIX = "[?] "
+
+
+def _email_from_first_line(lines: list[str]) -> tuple[str, str, bool]:
+    """
+    Read first OCR line only up to '@', append fixed domain when confident.
+
+    Returns (display_text, raw_joined, confident).
+    """
+    cleaned = [
+        ln.strip()
+        for ln in lines
+        if ln and ln.strip() and not _is_hallucinated_ocr_line(ln.strip())
+    ]
+    raw = " ".join(cleaned) if cleaned else ""
+    if not cleaned:
+        return "", "", False
+
+    first = cleaned[0]
+    local_part = first.split("@", 1)[0] if "@" in first else first
+    local = re.sub(r"\s+", "", local_part.lower())
+    local = re.sub(r"[^a-z0-9._+-]", "", local)
+
+    if _EMAIL_LOCAL_RE.fullmatch(local):
+        return f"{local}{_sso_email_domain()}", raw, True
+
+    fallback = first.strip() or raw
+    if fallback and not fallback.startswith(_EMAIL_UNCERTAIN_PREFIX):
+        fallback = f"{_EMAIL_UNCERTAIN_PREFIX}{fallback}"
+    return fallback, raw, False
+
+
 def _extract_sso_email_local(text: str) -> str:
     """Lấy phần username từ OCR (bỏ domain cố định @agribank.com.vn)."""
     import re
@@ -1428,17 +1634,29 @@ def _extract_sso_email_local(text: str) -> str:
     t = re.sub(r"ribank\.com\.vn.*$", "", t, flags=re.IGNORECASE)
     t = re.sub(r"(?:@ag)+$", "", t, flags=re.IGNORECASE)
     t = t.rstrip("@")
-    if len(t) > 4 and t.endswith("ag"):
+    if len(t) > 4 and t.endswith("ag") and re.search(r"@ag|agribank|ribank", text, re.I):
         t = t[:-2]
     return re.sub(r"[^a-z0-9._+-]", "", t)
 
 
 def _format_sso_email(text: str) -> str:
-    """Ghép username OCR + domain SSO cố định."""
+    """Ghép username OCR + domain SSO cố định (first-line khi multi-line)."""
+    import re
+
     if not settings.ocr_sso_email_fixed_domain:
         return _repair_agribank_email(text)
+    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+    if len(lines) > 1:
+        formatted, _, confident = _email_from_first_line(lines)
+        if confident:
+            return formatted
+        if formatted:
+            return formatted
     local = _extract_sso_email_local(text)
     if not local:
+        raw = " ".join((text or "").split()).strip()
+        if raw and re.search(r"[a-zA-Z0-9]", raw):
+            return raw
         return ""
     return f"{local}{_sso_email_domain()}"
 
@@ -2426,13 +2644,6 @@ def _ocr_table_grid(
     """OCR each grid cell with VietOCR (skip empty cells to avoid hallucinations)."""
     from collections import defaultdict
 
-    num_cols = max(len(col_lines) - 1, 0)
-    email_col = (
-        _resolve_sso_email_col(num_cols)
-        if settings.ocr_sso_email_fixed_domain
-        else None
-    )
-
     crops: list[np.ndarray] = []
     # ri, ci, x1, y1, x2, y2, line_idx_in_cell
     metas: list[tuple[int, int, int, int, int, int, int]] = []
@@ -2487,14 +2698,19 @@ def _ocr_table_grid(
             if raw and not _is_hallucinated_ocr_line(raw):
                 line_texts.append(raw)
                 confs.append(conf)
-        if email_col is not None and ci == email_col and settings.ocr_sso_email_fixed_domain:
-            text = _format_sso_email(_join_multiline_ocr_lines(line_texts))
-        else:
-            text = _normalize_cell_text(
-                _join_multiline_ocr_lines(line_texts),
-                col=ci,
-                email_col=email_col,
+        is_email_cell = (
+            settings.ocr_sso_email_fixed_domain
+            and line_texts
+            and (
+                (settings.ocr_sso_email_col >= 0 and ci == settings.ocr_sso_email_col)
+                or any(_looks_like_email_content(ln) for ln in line_texts)
             )
+        )
+        if is_email_cell and len(line_texts) > 1:
+            text, _, confident = _email_from_first_line(line_texts)
+            text = text if (confident or text) else _join_multiline_ocr_lines(line_texts)
+        else:
+            text = _join_multiline_ocr_lines(line_texts)
         if not text:
             continue
         conf = float(np.mean(confs)) if confs else 0.0
@@ -2509,8 +2725,43 @@ def _ocr_table_grid(
                 bbox=[x1, y1, x2, y2],
             )
         )
+
+    if not cells:
+        return []
+
+    cells = _merge_annotation_header_rows(cells)
+    max_col = max(c.col for c in cells)
+    email_col = _resolve_sso_email_col(max_col + 1, cells)
+    header_rows = {c.row for c in cells if c.row <= 1}
+
+    normalized: list[CellData] = []
+    for c in cells:
+        if c.row in header_rows:
+            normalized.append(c)
+            continue
+        if email_col is not None and c.col == email_col:
+            text = _format_sso_email(c.text) if settings.ocr_sso_email_fixed_domain else _normalize_cell_text(
+                c.text, col=c.col, email_col=email_col
+            )
+        else:
+            text = _normalize_cell_text(c.text, col=c.col, email_col=email_col)
+        if not text:
+            continue
+        normalized.append(
+            CellData(
+                row=c.row,
+                col=c.col,
+                text=text,
+                confidence=c.confidence,
+                bbox=c.bbox,
+            )
+        )
+    cells = normalized
+
     if settings.ocr_sso_email_fixed_domain and cells:
         cells = _apply_fixed_email_domain(cells)
+
+    cells = _refine_sso_critical_columns(image, cells)
     return cells
 
 

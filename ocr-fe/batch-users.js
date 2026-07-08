@@ -1,24 +1,30 @@
 /**
- * Batch user provisioning — enrich, review, provision Keycloak.
- * Phụ thuộc biến global từ app.js: API_BASE, jobId, setStep, stopPolling.
+ * Batch user provisioning — enrich, review full-page, provision Keycloak.
+ * Phụ thuộc app.js: API_BASE, jobId, setStep, stopPolling, notify, escapeAttr, btnCreateBatch, successBatchCode, successTotalRecords
  */
 
 const SSO_COL_FIELDS = {
-    0: 'stt',
-    1: 'name',
-    2: 'department_name',
-    3: 'ipcas_code',
-    4: 'cccd',
-    5: 'email',
-    6: 'phone',
-    7: 'role',
-    8: 'unit_code',
+    0: 'stt', 1: 'name', 2: 'department_name', 3: 'ipcas_code',
+    4: 'cccd', 5: 'email', 6: 'phone', 7: 'role', 8: 'unit_code',
 };
 
 let fieldConfig = null;
 let enrichedUsers = [];
-let batchReviewOpen = false;
 let batchShowErrorsOnly = false;
+let reviewSearchQuery = '';
+let lastProvisionResponse = null;
+let followUpActions = {};
+let followUpFinalized = false;
+let followUpApplied = {};
+let successShowUpdatedOnly = false;
+let successSearchQuery = '';
+
+const CONFLICT_OPTIONS = [
+    { value: 'skip', label: 'Bỏ qua' },
+    { value: 'reset_password', label: 'Reset mật khẩu' },
+    { value: 'reset_otp', label: 'Reset OTP' },
+    { value: 'reset_both', label: 'Cả hai' },
+];
 
 async function loadFieldConfig() {
     try {
@@ -43,14 +49,7 @@ async function loadFieldConfig() {
             banca_core_enabled: false,
         };
     }
-    const hint = document.getElementById('batch-default-pwd-hint');
-    if (hint && fieldConfig?.default_temp_password) {
-        hint.textContent = fieldConfig.default_temp_password;
-    }
-    const bulkRole = document.getElementById('bulk-role');
-    if (bulkRole) {
-        bulkRole.innerHTML = '<option value="">-- Chọn --</option>' + roleOptionsHtml('');
-    }
+    renderBulkRoleChips();
 }
 
 function fieldLabel(field) {
@@ -79,9 +78,7 @@ function getColumnHeaderLabel(table, col) {
         const sso = fieldConfig.sso_columns.find(c => c.field === field);
         if (sso) return sso.label;
     }
-    if (field && fieldConfig?.field_labels?.[field]) {
-        return fieldConfig.field_labels[field];
-    }
+    if (field && fieldConfig?.field_labels?.[field]) return fieldConfig.field_labels[field];
     return `Cột ${col + 1}`;
 }
 
@@ -93,12 +90,17 @@ function headerFieldMap(table) {
     for (const cell of headerCells) {
         const norm = normalizeHeader(cell.text);
         for (const [field, list] of Object.entries(aliases)) {
-            if ((list || []).includes(norm)) {
-                map[cell.col] = field;
-            }
+            if ((list || []).includes(norm)) map[cell.col] = field;
         }
     }
     return map;
+}
+
+function parseRolesText(text) {
+    return String(text || '')
+        .split(/[;,/|]+/)
+        .map(s => s.trim())
+        .filter(Boolean);
 }
 
 function validateCellByField(field, text, confidence, isHeader) {
@@ -107,17 +109,18 @@ function validateCellByField(field, text, confidence, isHeader) {
         const label = fieldLabel(field);
         return label ? `Thiếu ${label}` : 'Không được trống';
     }
-    if (field === 'cccd' && !/^\d{12}$/.test(text.replace(/\s+/g, ''))) {
-        return 'CCCD phải có 12 số';
-    }
-    if (field === 'phone' && !/^0\d{8,10}$/.test(text.replace(/\s+/g, ''))) {
-        return 'SĐT không hợp lệ';
-    }
-    if ((field === 'name' || field === 'first_name') && text && /\d/.test(text)) {
-        return 'Tên chứa chữ số';
-    }
+    if (field === 'cccd' && !/^\d{12}$/.test(text.replace(/\s+/g, ''))) return 'CCCD phải có 12 số';
+    if (field === 'phone' && !/^0\d{8,10}$/.test(text.replace(/\s+/g, ''))) return 'SĐT không hợp lệ';
+    if ((field === 'name' || field === 'first_name') && text && /\d/.test(text)) return 'Tên chứa chữ số';
     if (field === 'email' && text.includes('@') && !text.toLowerCase().endsWith('@agribank.com.vn')) {
         return 'Email phải thuộc @agribank.com.vn';
+    }
+    if (field === 'role') {
+        const valid = (fieldConfig?.roles || []).map(r => r.value);
+        const roles = parseRolesText(text);
+        if (!roles.length) return 'Thiếu vai trò';
+        const bad = roles.filter(r => !valid.includes(r));
+        if (bad.length) return `Vai trò không hợp lệ: ${bad.join(', ')}`;
     }
     if (confidence < 0.85) return 'Độ tin cậy thấp';
     return '';
@@ -127,31 +130,105 @@ function validateUserClient(user) {
     const errors = {};
     const required = fieldConfig?.required_fields || [];
     required.forEach(field => {
+        if (field === 'role') {
+            const roles = user.roles?.length ? user.roles : parseRolesText(user.role);
+            if (!roles.length) errors.role = 'Thiếu vai trò';
+            return;
+        }
         const val = String(user[field] || '').trim();
         if (!val) errors[field] = `Thiếu ${fieldLabel(field)}`;
     });
-    if (user.cccd && !/^\d{12}$/.test(String(user.cccd).replace(/\s/g, ''))) {
-        errors.cccd = 'CCCD phải có 12 số';
-    }
-    if (user.phone && !/^0\d{8,10}$/.test(String(user.phone).replace(/\s/g, ''))) {
-        errors.phone = 'SĐT không hợp lệ';
-    }
+    if (user.cccd && !/^\d{12}$/.test(String(user.cccd).replace(/\s/g, ''))) errors.cccd = 'CCCD phải có 12 số';
+    if (user.phone && !/^0\d{8,10}$/.test(String(user.phone).replace(/\s/g, ''))) errors.phone = 'SĐT không hợp lệ';
     const email = String(user.email || user.username || '');
-    if (email && !email.toLowerCase().endsWith('@agribank.com.vn')) {
-        errors.email = 'Email phải thuộc @agribank.com.vn';
-    }
-    if (user.role && fieldConfig?.roles?.length) {
+    if (email && !email.toLowerCase().endsWith('@agribank.com.vn')) errors.email = 'Email phải thuộc @agribank.com.vn';
+    const roles = user.roles?.length ? user.roles : parseRolesText(user.role);
+    if (roles.length && fieldConfig?.roles?.length) {
         const valid = fieldConfig.roles.map(r => r.value);
-        if (!valid.includes(user.role)) errors.role = 'Vai trò không hợp lệ';
+        const bad = roles.filter(r => !valid.includes(r));
+        if (bad.length) errors.role = `Vai trò không hợp lệ: ${bad.join(', ')}`;
     }
     return errors;
 }
 
-function roleOptionsHtml(selected) {
-    const roles = fieldConfig?.roles || [];
+function roleOptionsHtml(selectedRoles) {
+    const selected = new Set(selectedRoles || []);
+    const roles = fieldConfig?.roles || [
+        { value: 'banca-admin', label: 'Quản trị' },
+        { value: 'banca-seller', label: 'Đại lý viên' },
+        { value: 'banca-accounting-operator', label: 'Kế toán viên' },
+        { value: 'banca-accounting-controller', label: 'Phê duyệt viên' },
+    ];
     return roles.map(r =>
-        `<option value="${escapeAttr(r.value)}"${r.value === selected ? ' selected' : ''}>${escapeAttr(r.label)}</option>`
+        `<option value="${escapeAttr(r.value)}"${selected.has(r.value) ? ' selected' : ''}>${escapeAttr(r.label || r.value)}</option>`
     ).join('');
+}
+
+function getRoleCatalog() {
+    return fieldConfig?.roles || [
+        { value: 'banca-admin', label: 'Quản trị' },
+        { value: 'banca-seller', label: 'Đại lý viên' },
+        { value: 'banca-accounting-operator', label: 'Kế toán viên' },
+        { value: 'banca-accounting-controller', label: 'Phê duyệt viên' },
+    ];
+}
+
+function renderRoleCell(u, idx, errors) {
+    const roles = u.roles?.length ? u.roles : parseRolesText(u.role);
+    const selected = new Set(roles);
+    const chips = getRoleCatalog().map(r => {
+        const on = selected.has(r.value);
+        const errCls = errors.role && !on ? ' role-chip-warn' : '';
+        return `<label class="role-chip${on ? ' role-chip-on' : ''}${errCls}">
+            <input type="checkbox" class="role-chip-inp" data-idx="${idx}" value="${escapeAttr(r.value)}"${on ? ' checked' : ''}>
+            <span>${escapeAttr(r.label || r.value)}</span>
+        </label>`;
+    }).join('');
+    const rawHint = u.role_raw
+        ? `<div class="role-ocr-hint" title="${escapeAttr(u.role_raw)}">OCR: ${escapeAttr(u.role_raw)}</div>`
+        : '';
+    const unmapped = roles.length === 0 && u.role_raw
+        ? '<div class="role-unmapped">Chưa map được</div>'
+        : '';
+    return `<div class="role-chips" data-idx="${idx}">${chips}${rawHint}${unmapped}</div>`;
+}
+
+function readRoleChips(container) {
+    if (!container) return [];
+    return Array.from(container.querySelectorAll('.role-chip-inp:checked')).map(el => el.value);
+}
+
+function renderBulkRoleChips() {
+    const wrap = document.getElementById('bulk-role-chips');
+    if (!wrap) return;
+    wrap.innerHTML = getRoleCatalog().map(r =>
+        `<label class="role-chip">
+            <input type="checkbox" class="bulk-role-chip" value="${escapeAttr(r.value)}">
+            <span>${escapeAttr(r.label || r.value)}</span>
+        </label>`
+    ).join('') + `<button type="button" class="btn btn-xs btn-outline" id="btn-bulk-apply-roles">Áp dụng tất cả</button>`;
+    document.getElementById('btn-bulk-apply-roles')?.addEventListener('click', () => {
+        const roles = Array.from(document.querySelectorAll('.bulk-role-chip:checked')).map(el => el.value);
+        if (!roles.length) {
+            notify('warn', 'Chọn vai trò', 'Tick ít nhất một vai trò trước khi áp dụng.');
+            return;
+        }
+        enrichedUsers.forEach(u => {
+            u.roles = [...roles];
+            u.role = roles[0] || '';
+        });
+        renderBatchReviewTable(enrichedUsers);
+        notify('success', 'Đã áp dụng vai trò', `${roles.length} role cho ${enrichedUsers.length} user`);
+    });
+}
+
+function roleDisplayText(user) {
+    if (user.roles?.length) return user.roles.join('; ');
+    return user.role || '';
+}
+
+function readRoleSelect(el) {
+    return Array.from(el.selectedOptions).map(o => o.value).filter(Boolean);
 }
 
 async function enrichBatchUsers(defaults) {
@@ -176,8 +253,7 @@ function matchBadge(status) {
 async function searchAgencies(q) {
     const res = await fetch(`${API_BASE}/api/users/lookup/agencies?search=${encodeURIComponent(q)}&size=15`);
     if (!res.ok) return [];
-    const data = await res.json();
-    return data.items || [];
+    return (await res.json()).items || [];
 }
 
 async function searchAgents(q, agencyId) {
@@ -185,13 +261,19 @@ async function searchAgents(q, agencyId) {
     if (agencyId) url += `&agency_id=${encodeURIComponent(agencyId)}`;
     const res = await fetch(url);
     if (!res.ok) return [];
-    const data = await res.json();
-    return data.items || [];
+    return (await res.json()).items || [];
+}
+
+function rowMatchesSearch(u, q) {
+    if (!q) return true;
+    const hay = [
+        u.email, u.username, u.ipcas_code, u.first_name, u.last_name,
+        u.cccd, u.branch_code, u.phone, roleDisplayText(u), u.role_raw,
+    ].join(' ').toLowerCase();
+    return hay.includes(q);
 }
 
 function updateBatchSummary() {
-    const bar = document.getElementById('batch-summary-bar');
-    if (!bar) return;
     let valid = 0;
     enrichedUsers.forEach(u => {
         const errs = validateUserClient(u);
@@ -199,19 +281,45 @@ function updateBatchSummary() {
         u.missing_fields = Object.keys(errs);
         if (!Object.keys(errs).length) valid += 1;
     });
-    const invalid = enrichedUsers.length - valid;
-    bar.classList.remove('hidden');
-    bar.textContent = `${valid}/${enrichedUsers.length} user đủ dữ liệu · ${invalid} user còn thiếu/sai trường`;
+    const total = enrichedUsers.length;
+    const errors = total - valid;
+    const pct = total ? Math.round((valid / total) * 100) : 0;
+
+    const statTotal = document.getElementById('stat-total');
+    const statValid = document.getElementById('stat-valid');
+    const statErrors = document.getElementById('stat-errors');
+    const progressFill = document.getElementById('review-progress-fill');
+    const progressText = document.getElementById('review-progress-text');
+    if (statTotal) statTotal.textContent = String(total);
+    if (statValid) statValid.textContent = String(valid);
+    if (statErrors) statErrors.textContent = String(errors);
+    if (progressFill) progressFill.style.width = `${pct}%`;
+    if (progressText) progressText.textContent = `${pct}% hoàn tất`;
+
+    const bar = document.getElementById('batch-summary-bar');
+    if (bar) {
+        bar.classList.add('hidden');
+        bar.textContent = `${valid}/${total} user đủ dữ liệu`;
+    }
+}
+
+function renderStatusCell(errors) {
+    const keys = Object.keys(errors);
+    if (!keys.length) {
+        return '<span class="status-pill status-ok" title="Đủ dữ liệu">OK</span>';
+    }
+    const tips = keys.map(f => `${fieldLabel(f)}: ${errors[f]}`).join('\n');
+    const labels = keys.map(f => fieldLabel(f)).slice(0, 3).join(', ');
+    const more = keys.length > 3 ? ` +${keys.length - 3}` : '';
+    return `<span class="status-pill status-err" title="${escapeAttr(tips)}">${escapeAttr(labels)}${more}</span>`;
 }
 
 function updateBatchRowState(tr, user) {
     const errors = validateUserClient(user);
     user._field_errors = errors;
     user.missing_fields = Object.keys(errors);
-    const hasErr = user.missing_fields.length > 0;
-    tr.classList.toggle('row-error', hasErr);
-    tr.classList.toggle('row-warn', !hasErr);
-
+    tr.classList.toggle('row-error', user.missing_fields.length > 0);
+    tr.classList.toggle('row-ok', !user.missing_fields.length);
     tr.querySelectorAll('.batch-inp').forEach(el => {
         const f = el.dataset.f;
         const msg = errors[f];
@@ -219,13 +327,14 @@ function updateBatchRowState(tr, user) {
         if (msg) el.title = msg;
         else el.removeAttribute('title');
     });
-
+    tr.querySelectorAll('.role-chip').forEach(chip => {
+        const inp = chip.querySelector('.role-chip-inp');
+        const val = inp?.value;
+        chip.classList.toggle('role-chip-on', !!inp?.checked);
+        chip.classList.toggle('role-chip-warn', !!errors.role && !inp?.checked);
+    });
     const statusCol = tr.querySelector('.status-col');
-    if (statusCol) {
-        statusCol.innerHTML = Object.keys(errors).map(f =>
-            `<span class="field-chip" title="${escapeAttr(errors[f])}">${escapeAttr(fieldLabel(f))}</span>`
-        ).join('') || 'OK';
-    }
+    if (statusCol) statusCol.innerHTML = renderStatusCell(errors);
 }
 
 function renderBatchReviewTable(users) {
@@ -234,80 +343,72 @@ function renderBatchReviewTable(users) {
     tbody.innerHTML = '';
     updateBatchSummary();
 
+    const q = reviewSearchQuery.trim().toLowerCase();
+    let displayIdx = 0;
+
     users.forEach((u, idx) => {
         if (batchShowErrorsOnly && !(u.missing_fields || []).length) return;
+        if (!rowMatchesSearch(u, q)) return;
 
+        displayIdx += 1;
         const errors = u._field_errors || validateUserClient(u);
         const tr = document.createElement('tr');
-        const hasErr = Object.keys(errors).length > 0;
-        tr.className = hasErr ? 'row-error' : 'row-warn';
-
-        const errChips = Object.keys(errors).map(f =>
-            `<span class="field-chip" title="${escapeAttr(errors[f])}">${escapeAttr(fieldLabel(f))}</span>`
-        ).join('') || 'OK';
+        tr.className = Object.keys(errors).length ? 'row-error' : 'row-ok';
+        tr.dataset.idx = String(idx);
 
         const inpCls = (f) => errors[f] ? 'batch-inp input-err' : 'batch-inp';
         const inpTitle = (f) => errors[f] ? ` title="${escapeAttr(errors[f])}"` : '';
 
         tr.innerHTML = `
-            <td><input class="${inpCls('email')}" data-idx="${idx}" data-f="email" value="${escapeAttr(u.email || u.username || '')}"${inpTitle('email')}></td>
-            <td><input class="${inpCls('last_name')}" data-idx="${idx}" data-f="last_name" value="${escapeAttr(u.last_name || '')}"${inpTitle('last_name')}></td>
-            <td><input class="${inpCls('first_name')}" data-idx="${idx}" data-f="first_name" value="${escapeAttr(u.first_name || '')}"${inpTitle('first_name')}></td>
-            <td><input class="${inpCls('cccd')}" data-idx="${idx}" data-f="cccd" value="${escapeAttr(u.cccd || '')}"${inpTitle('cccd')}></td>
-            <td>
-                <div class="picker-wrap">
-                    <input class="${inpCls('branch_code')} branch-code-inp" data-idx="${idx}" data-f="branch_code" value="${escapeAttr(u.branch_code || '')}" placeholder="Mã CN"${inpTitle('branch_code')}>
-                    <button type="button" class="btn btn-xs btn-ghost btn-pick-branch" data-idx="${idx}">Tìm</button>
+            <td class="col-stt">${displayIdx}</td>
+            <td class="col-email"><input class="${inpCls('email')}" data-idx="${idx}" data-f="email" value="${escapeAttr(u.email || u.username || '')}"${inpTitle('email')}></td>
+            <td class="col-name"><input class="${inpCls('last_name')}" data-idx="${idx}" data-f="last_name" value="${escapeAttr(u.last_name || '')}"${inpTitle('last_name')}></td>
+            <td class="col-name"><input class="${inpCls('first_name')}" data-idx="${idx}" data-f="first_name" value="${escapeAttr(u.first_name || '')}"${inpTitle('first_name')}></td>
+            <td class="col-cccd"><input class="${inpCls('cccd')}" data-idx="${idx}" data-f="cccd" value="${escapeAttr(u.cccd || '')}"${inpTitle('cccd')}></td>
+            <td class="col-code">
+                <div class="picker-inline">
+                    <input class="${inpCls('branch_code')} branch-code-inp" data-idx="${idx}" data-f="branch_code" value="${escapeAttr(u.branch_code || '')}" placeholder="CN"${inpTitle('branch_code')}>
+                    <button type="button" class="btn-icon btn-pick-branch" data-idx="${idx}" title="Tìm chi nhánh">⌕</button>
                 </div>
             </td>
-            <td><input class="${inpCls('ipcas_code')}" data-idx="${idx}" data-f="ipcas_code" value="${escapeAttr(u.ipcas_code || '')}"${inpTitle('ipcas_code')}></td>
-            <td><input class="${inpCls('phone')}" data-idx="${idx}" data-f="phone" value="${escapeAttr(u.phone || '')}"${inpTitle('phone')}></td>
-            <td><input class="${inpCls('unit_code')}" data-idx="${idx}" data-f="unit_code" value="${escapeAttr(u.unit_code || '')}"${inpTitle('unit_code')}></td>
-            <td>
-                <select class="${inpCls('role')}" data-idx="${idx}" data-f="role"${inpTitle('role')}>
-                    <option value="">-- Chọn --</option>
-                    ${roleOptionsHtml(u.role || '')}
-                </select>
-            </td>
-            <td>
-                <div class="picker-wrap">
-                    <input class="batch-inp agent-code-inp" data-idx="${idx}" data-f="agent_code" value="${escapeAttr(u.agent_code || '')}" placeholder="Mã ĐL">
-                    <button type="button" class="btn btn-xs btn-ghost btn-pick-agent" data-idx="${idx}">Tìm</button>
+            <td class="col-code"><input class="${inpCls('ipcas_code')}" data-idx="${idx}" data-f="ipcas_code" value="${escapeAttr(u.ipcas_code || '')}"${inpTitle('ipcas_code')}></td>
+            <td class="col-phone"><input class="${inpCls('phone')}" data-idx="${idx}" data-f="phone" value="${escapeAttr(u.phone || '')}"${inpTitle('phone')}></td>
+            <td class="col-code"><input class="${inpCls('unit_code')}" data-idx="${idx}" data-f="unit_code" value="${escapeAttr(u.unit_code || '')}"${inpTitle('unit_code')}></td>
+            <td class="col-role">${renderRoleCell(u, idx, errors)}</td>
+            <td class="col-code">
+                <div class="picker-inline">
+                    <input class="batch-inp agent-code-inp" data-idx="${idx}" data-f="agent_code" value="${escapeAttr(u.agent_code || '')}" placeholder="ĐL">
+                    <button type="button" class="btn-icon btn-pick-agent" data-idx="${idx}" title="Tìm đại lý">⌕</button>
                 </div>
             </td>
-            <td>${matchBadge(u.match_status)} ${u.match_confidence ? (u.match_confidence * 100).toFixed(0) + '%' : ''}</td>
-            <td>
-                <select class="batch-inp conflict-sel" data-idx="${idx}" data-f="on_conflict">
-                    <option value="skip">Bỏ qua MK/OTP</option>
-                    <option value="reset_password">Đổi MK</option>
-                    <option value="reset_otp">Đổi OTP</option>
-                    <option value="reset_both">Đổi cả 2</option>
-                </select>
-            </td>
-            <td class="status-col">${errChips}</td>`;
+            <td class="status-col col-status">${renderStatusCell(errors)}</td>`;
         tbody.appendChild(tr);
-        const conflictSel = tr.querySelector('.conflict-sel');
-        if (conflictSel) conflictSel.value = u.on_conflict || document.getElementById('batch-default-conflict')?.value || 'skip';
     });
 
     tbody.querySelectorAll('.batch-inp').forEach(el => {
         const handler = () => {
             const i = +el.dataset.idx;
             const f = el.dataset.f;
-            if (f === 'on_conflict') enrichedUsers[i].on_conflict = el.value;
-            else {
-                enrichedUsers[i][f] = el.value;
-                if (f === 'email') enrichedUsers[i].username = el.value;
-            }
+            enrichedUsers[i][f] = el.value;
+            if (f === 'email') enrichedUsers[i].username = el.value;
             updateBatchSummary();
             const row = el.closest('tr');
             if (row) updateBatchRowState(row, enrichedUsers[i]);
-
-            // Không tự ẩn dòng ngay khi vừa sửa xong để tránh cảm giác "bị mất".
-            // Danh sách lọc chỉ cập nhật khi user bấm lại nút lọc/re-render thủ công.
         };
         el.addEventListener('change', handler);
         if (el.tagName === 'INPUT') el.addEventListener('input', handler);
+    });
+
+    tbody.querySelectorAll('.role-chip-inp').forEach(el => {
+        el.addEventListener('change', () => {
+            const i = +el.dataset.idx;
+            const wrap = el.closest('.role-chips');
+            enrichedUsers[i].roles = readRoleChips(wrap);
+            enrichedUsers[i].role = enrichedUsers[i].roles[0] || '';
+            updateBatchSummary();
+            const row = el.closest('tr');
+            if (row) updateBatchRowState(row, enrichedUsers[i]);
+        });
     });
 
     tbody.querySelectorAll('.btn-pick-branch').forEach(btn => {
@@ -322,26 +423,32 @@ function applyBulkBatchField(field, scope) {
     let value = '';
     if (field === 'branch_code') value = document.getElementById('bulk-branch-code')?.value?.trim() || '';
     else if (field === 'unit_code') value = document.getElementById('bulk-unit-code')?.value?.trim() || '';
-    else if (field === 'role') value = document.getElementById('bulk-role')?.value || '';
     if (!value) {
-        alert(`Nhập/chọn giá trị ${fieldLabel(field)} trước.`);
+        notify('warn', 'Thiếu giá trị', `Nhập ${fieldLabel(field)} trước khi áp dụng hàng loạt.`);
         return;
     }
     enrichedUsers.forEach(u => {
         const errs = validateUserClient(u);
-        const isError = !!errs[field] || (fieldConfig?.required_fields || []).includes(field) && !String(u[field] || '').trim();
+        const isError = !!errs[field] || ((fieldConfig?.required_fields || []).includes(field) && !String(u[field] || '').trim());
         if (scope === 'error' && !isError) return;
-        u[field] = value;
-        if (field === 'email') u.username = value;
+        if (field === 'role') {
+            const roles = parseRolesText(value);
+            u.role = roles[0] || '';
+            u.roles = roles;
+        } else {
+            u[field] = value;
+            if (field === 'email') u.username = value;
+        }
     });
     renderBatchReviewTable(enrichedUsers);
+    notify('success', 'Đã áp dụng hàng loạt', `${fieldLabel(field)} → ${value}`);
 }
 
 async function openAgencyPicker(idx) {
     const q = prompt('Tìm chi nhánh (tên hoặc mã):', enrichedUsers[idx].branch_name || enrichedUsers[idx].department_name || '');
     if (q === null) return;
     const items = await searchAgencies(q);
-    if (!items.length) { alert('Không tìm thấy chi nhánh.'); return; }
+    if (!items.length) { notify('warn', 'Không tìm thấy chi nhánh'); return; }
     const list = items.map((a, i) => `${i + 1}. ${a.core_bank_code} — ${a.name}`).join('\n');
     const pick = prompt(`Chọn số (1-${items.length}):\n${list}`, '1');
     const n = parseInt(pick, 10);
@@ -358,7 +465,7 @@ async function openAgentPicker(idx) {
     const q = prompt('Tìm đại lý (tên/email/mã):', enrichedUsers[idx].email || '');
     if (q === null) return;
     const items = await searchAgents(q, enrichedUsers[idx].agency_id || '');
-    if (!items.length) { alert('Không tìm thấy đại lý.'); return; }
+    if (!items.length) { notify('warn', 'Không tìm thấy đại lý'); return; }
     const list = items.map((a, i) => `${i + 1}. ${a.agent_code || '—'} — ${a.name} (${a.email})`).join('\n');
     const pick = prompt(`Chọn số (1-${items.length}):\n${list}`, '1');
     const n = parseInt(pick, 10);
@@ -371,23 +478,44 @@ async function openAgentPicker(idx) {
     }
 }
 
-function showBatchReviewModal(users) {
+function renderReviewPage(users) {
+    if (!users?.length) {
+        notify('warn', 'Không có dữ liệu', 'Không có user để kiểm tra.');
+        return;
+    }
     enrichedUsers = users.map(u => ({
         ...u,
         username: u.username || u.email,
-        on_conflict: u.on_conflict || document.getElementById('batch-default-conflict')?.value || 'skip',
+        role_raw: u.role_raw || u.role || '',
+        roles: u.roles?.length ? u.roles : parseRolesText(u.role),
+        role: u.role || (u.roles?.[0] ?? ''),
     }));
     batchShowErrorsOnly = false;
-    const modal = document.getElementById('batch-review-modal');
-    if (!modal) return;
+    reviewSearchQuery = '';
+    const searchInp = document.getElementById('review-search');
+    if (searchInp) searchInp.value = '';
+    const filterCb = document.getElementById('btn-batch-filter-errors');
+    if (filterCb) filterCb.checked = false;
+    renderBulkRoleChips();
     renderBatchReviewTable(enrichedUsers);
-    modal.classList.remove('hidden');
-    batchReviewOpen = true;
+    setStep(2);
 }
 
-function hideBatchReviewModal() {
-    document.getElementById('batch-review-modal')?.classList.add('hidden');
-    batchReviewOpen = false;
+function hideReviewPage() {
+    enrichedUsers = [];
+    batchShowErrorsOnly = false;
+    reviewSearchQuery = '';
+    const tbody = document.getElementById('batch-review-tbody');
+    if (tbody) tbody.innerHTML = '';
+    ['stat-total', 'stat-valid', 'stat-errors'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.textContent = '0';
+    });
+    const progressFill = document.getElementById('review-progress-fill');
+    const progressText = document.getElementById('review-progress-text');
+    if (progressFill) progressFill.style.width = '0%';
+    if (progressText) progressText.textContent = '0%';
+    document.getElementById('review-bulk-panel')?.classList.add('hidden');
 }
 
 function validateBeforeProvision() {
@@ -395,118 +523,421 @@ function validateBeforeProvision() {
     const missingUsers = enrichedUsers.filter(u => (u.missing_fields || []).length > 0);
     if (missingUsers.length) {
         batchShowErrorsOnly = true;
-        const btnFilter = document.getElementById('btn-batch-filter-errors');
-        if (btnFilter) btnFilter.textContent = 'Hiện tất cả dòng';
+        const filterCb = document.getElementById('btn-batch-filter-errors');
+        if (filterCb) filterCb.checked = true;
         renderBatchReviewTable(enrichedUsers);
-        setTimeout(() => {
-            const firstErr = document.querySelector('#batch-review-tbody .row-error .batch-inp.input-err');
-            firstErr?.focus();
-        }, 0);
-        const sample = missingUsers.slice(0, 3).map(u => {
+        setTimeout(() => document.querySelector('#batch-review-tbody .row-error .batch-inp.input-err')?.focus(), 0);
+        const sample = missingUsers.slice(0, 5).map(u => {
             const labels = (u.missing_fields || []).map(fieldLabel).join(', ');
             return `${u.email || u.username}: ${labels}`;
         }).join('\n');
-        alert(`Còn ${missingUsers.length} user thiếu/sai trường. Hệ thống đã tự lọc sang các dòng lỗi để bạn sửa.\n\n${sample}${missingUsers.length > 3 ? '\n...' : ''}`);
+        notify('error', `Còn ${missingUsers.length} user thiếu/sai trường`, sample + (missingUsers.length > 5 ? '\n...' : ''), 10000);
         return false;
     }
     return true;
 }
 
-async function confirmBatchProvision() {
+function formatActionsVi(actions) {
+    return (actions || []).map(a => {
+        if (a === 'create') return 'Đã tạo user';
+        if (a === 'save_details') return 'Đã cập nhật thông tin';
+        if (a === 'set_attributes') return 'Đã gán thuộc tính';
+        if (a === 'reset_password') return 'Đã reset mật khẩu';
+        if (a.startsWith('reset_otp')) return a.replace('reset_otp', 'Đã reset OTP').replace('deleted=', 'đã xóa ');
+        if (a.startsWith('assign_role:')) return `Đã gán role ${a.split(':')[1]}`;
+        if (a.startsWith('remove_role:')) return `Đã gỡ role ${a.split(':')[1]}`;
+        if (a.startsWith('role_already:')) return `Role ${a.split(':')[1]} đã có`;
+        if (a.startsWith('assign_role_skipped:')) return `Bỏ qua gán role ${a.split(':')[1]} (403)`;
+        if (a === 'roles_assignment_failed:403') return 'Không gán được role (403) — kiểm tra quyền Keycloak';
+        if (a === 'require_action:UPDATE_PASSWORD' || a === 'UPDATE_PASSWORD') return 'Yêu cầu đổi MK lần đăng nhập';
+        if (a === 'require_action:CONFIGURE_TOTP' || a === 'CONFIGURE_TOTP') return 'Yêu cầu cấu hình OTP mới';
+        return a;
+    }).join(' · ');
+}
+
+
+function syncRolesFromDom() {
+    document.querySelectorAll('.role-chips').forEach(wrap => {
+        const idx = +wrap.dataset.idx;
+        if (Number.isNaN(idx) || !enrichedUsers[idx]) return;
+        enrichedUsers[idx].roles = readRoleChips(wrap);
+        enrichedUsers[idx].role = enrichedUsers[idx].roles[0] || '';
+    });
+}
+
+function statusLabelVi(status) {
+    const map = { created: 'Tạo mới', updated: 'Đã có', failed: 'Lỗi', skipped: 'Bỏ qua' };
+    return map[status] || status;
+}
+
+function renderConflictSelect(username, action, disabled = false) {
+    const locked = followUpApplied[username];
+    disabled = disabled || locked;
+    const opts = CONFLICT_OPTIONS.map(o =>
+        `<option value="${o.value}"${o.value === action ? ' selected' : ''}>${o.label}</option>`
+    ).join('');
+    return `<select class="success-conflict-sel" data-username="${escapeAttr(username)}"${disabled ? ' disabled' : ''}>${opts}</select>`;
+}
+
+function initFollowUpActions(results) {
+    followUpActions = {};
+    followUpApplied = {};
+    (results || []).forEach(r => {
+        if (r.status === 'updated') followUpActions[r.username] = 'skip';
+    });
+}
+
+function countPendingFollowUps() {
+    return Object.values(followUpActions).filter(a => a && a !== 'skip').length;
+}
+
+function updateSuccessStats(data) {
+    const set = (id, val) => {
+        const el = document.getElementById(id);
+        if (el) el.textContent = String(val ?? 0);
+    };
+    set('success-stat-total', data.total);
+    set('success-stat-created', data.created);
+    set('success-stat-updated', data.updated);
+    set('success-stat-failed', data.failed);
+    const hint = document.getElementById('success-stats-hint');
+    if (hint) {
+        const parts = [];
+        if (data.skipped) parts.push(`${data.skipped} bỏ qua`);
+        if (data.updated) parts.push(`${data.updated} user đã có — chọn thao tác bổ sung bên dưới nếu cần`);
+        hint.textContent = parts.join(' · ');
+    }
+    const toolbar = document.getElementById('success-toolbar');
+    if (toolbar) toolbar.classList.toggle('hidden', !(data.updated > 0));
+}
+
+function updateFinalizeButton() {
+    const btn = document.getElementById('btn-finalize-batch');
+    if (!btn) return;
+    const pending = countPendingFollowUps();
+    const updatedCount = lastProvisionResponse?.updated || 0;
+    if (!updatedCount) {
+        btn.textContent = 'Hoàn tất';
+        btn.disabled = false;
+        return;
+    }
+    if (followUpFinalized && pending === 0) {
+        btn.textContent = 'Đã hoàn tất';
+        btn.disabled = true;
+    } else if (pending > 0) {
+        btn.textContent = `Hoàn tất (${pending})`;
+        btn.disabled = false;
+    } else {
+        btn.textContent = 'Hoàn tất';
+        btn.disabled = false;
+    }
+}
+
+function rowMatchesSuccessSearch(r, q) {
+    if (!q) return true;
+    const hay = `${r.username || ''} ${r.user_id || ''}`.toLowerCase();
+    return hay.includes(q);
+}
+
+function renderSuccessResultsTable() {
+    const tbody = document.getElementById('success-results-tbody');
+    if (!tbody || !lastProvisionResponse) return;
+    tbody.innerHTML = '';
+    const q = successSearchQuery.trim().toLowerCase();
+    let displayIdx = 0;
+
+    (lastProvisionResponse.results || []).forEach(r => {
+        if (successShowUpdatedOnly && r.status !== 'updated') return;
+        if (!rowMatchesSuccessSearch(r, q)) return;
+        displayIdx += 1;
+
+        const statusCls = r.status === 'failed' ? 'status-failed'
+            : r.status === 'created' ? 'status-created'
+                : r.status === 'updated' ? 'status-updated' : 'status-skipped';
+        const actions = formatActionsVi(r.actions_applied);
+        const isUpdated = r.status === 'updated';
+        const action = followUpActions[r.username] || 'skip';
+        const followUpCell = isUpdated
+            ? renderConflictSelect(r.username, action)
+            : '<span class="text-muted">—</span>';
+
+        const tr = document.createElement('tr');
+        tr.className = `success-row ${statusCls}`;
+        tr.innerHTML = `
+            <td class="col-stt">${displayIdx}</td>
+            <td class="col-email"><span class="success-username">${escapeAttr(r.username)}</span></td>
+            <td class="col-status"><span class="success-badge ${statusCls}">${escapeAttr(statusLabelVi(r.status))}</span></td>
+            <td class="col-actions-done">${actions ? escapeAttr(actions) : '<span class="text-muted">—</span>'}</td>
+            <td class="col-error">${r.error ? `<span class="success-error">${escapeAttr(r.error)}</span>` : '<span class="text-muted">—</span>'}</td>
+            <td class="col-followup">${followUpCell}</td>`;
+        tbody.appendChild(tr);
+    });
+
+    tbody.querySelectorAll('.success-conflict-sel').forEach(sel => {
+        sel.addEventListener('change', () => {
+            followUpActions[sel.dataset.username] = sel.value;
+            followUpFinalized = false;
+            updateFinalizeButton();
+        });
+    });
+    updateFinalizeButton();
+}
+
+function hideSuccessPage() {
+    lastProvisionResponse = null;
+    followUpActions = {};
+    followUpFinalized = false;
+    followUpApplied = {};
+    successShowUpdatedOnly = false;
+    successSearchQuery = '';
+    const tbody = document.getElementById('success-results-tbody');
+    if (tbody) tbody.innerHTML = '';
+    const searchInp = document.getElementById('success-search');
+    if (searchInp) searchInp.value = '';
+    const filterCb = document.getElementById('success-filter-updated');
+    if (filterCb) filterCb.checked = false;
+    ['success-stat-total', 'success-stat-created', 'success-stat-updated', 'success-stat-failed'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.textContent = '0';
+    });
+    const hint = document.getElementById('success-stats-hint');
+    if (hint) hint.textContent = '';
+}
+
+function buildProvisionUserPayload(u, onConflict) {
+    const payload = {
+        username: u.email || u.username,
+        email: u.email || u.username,
+        first_name: u.first_name || '',
+        last_name: u.last_name || '',
+        branch_code: u.branch_code || '',
+        ipcas_code: u.ipcas_code || '',
+        cccd: u.cccd || '',
+        phone: u.phone || '',
+        unit_code: u.unit_code || '',
+        role: u.role || (u.roles?.[0] ?? ''),
+        roles: u.roles?.length ? u.roles : parseRolesText(u.role),
+        agent_code: u.agent_code || '',
+        department_name: u.department_name || '',
+    };
+    if (onConflict) payload.on_conflict = onConflict;
+    return payload;
+}
+
+async function createBatch() {
+    syncRolesFromDom();
     if (!validateBeforeProvision()) return;
-    const defaultConflict = document.getElementById('batch-default-conflict')?.value || 'skip';
-    const btn = document.getElementById('btn-batch-confirm');
+    const btn = btnCreateBatch;
+    const orig = btn?.textContent;
     if (btn) { btn.disabled = true; btn.textContent = 'Đang tạo lô...'; }
 
     try {
-        const payloadUsers = enrichedUsers.map(u => ({
-            ...u,
-            username: u.email || u.username,
-        }));
+        const payloadUsers = enrichedUsers.map(u => buildProvisionUserPayload(u));
         const res = await fetch(`${API_BASE}/api/users/provision-batch`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                users: payloadUsers,
-                default_on_conflict: defaultConflict,
-            }),
+            body: JSON.stringify({ users: payloadUsers, default_on_conflict: 'skip' }),
         });
         const data = await res.json().catch(() => ({}));
         if (!res.ok) throw new Error(data.detail || 'Tạo lô thất bại');
-
-        hideBatchReviewModal();
         showBatchResults(data);
     } catch (e) {
-        alert(`Lỗi: ${e.message}`);
+        notify('error', 'Lỗi tạo lô', e.message);
     } finally {
-        if (btn) { btn.disabled = false; btn.textContent = 'Xác nhận tạo lô'; }
+        if (btn) { btn.disabled = false; btn.textContent = orig || 'Xác nhận & Tạo lô User'; }
     }
 }
 
 function showBatchResults(data) {
-    successBatchCode.textContent = `BATCH-${jobId.toUpperCase()}`;
-    successTotalRecords.textContent = `${data.created} tạo mới · ${data.updated} cập nhật · ${data.skipped} bỏ qua · ${data.failed} lỗi`;
+    const roleSkipped = (data.results || []).some(r =>
+        (r.actions_applied || []).some(a => a.startsWith('assign_role_skipped:') || a === 'roles_assignment_failed:403')
+    );
+    if (roleSkipped) {
+        notify('warn', 'Role Keycloak chưa được gán',
+            'Service account thiếu quyền gán client role (cần manage-users + manage-clients trên realm-management). Gọi GET /api/users/keycloak-role-check hoặc cấu hình KEYCLOAK_ROLE_ASSIGN_CLIENT_ID với client có realm-admin.',
+            12000);
+    }
 
-    const detail = document.getElementById('batch-results-detail');
-    if (detail) {
-        detail.innerHTML = (data.results || []).map(r => {
-            const cls = r.status === 'failed' ? 'text-err' : r.status === 'created' ? 'text-ok' : '';
-            return `<div class="result-row ${cls}"><strong>${escapeAttr(r.username)}</strong> — ${r.status}${r.error ? ': ' + escapeAttr(r.error) : ''}</div>`;
-        }).join('');
+    lastProvisionResponse = data;
+    followUpFinalized = false;
+    initFollowUpActions(data.results);
+
+    if (successBatchCode) successBatchCode.textContent = `BATCH-${jobId.toUpperCase()}`;
+    updateSuccessStats(data);
+    renderSuccessResultsTable();
+
+    if (data.failed > 0) {
+        notify('warn', `Tạo lô xong — ${data.failed} lỗi`, `${data.created} tạo mới, ${data.updated} đã có. Chọn thao tác bổ sung rồi bấm Hoàn tất.`, 8000);
+    } else {
+        notify('success', 'Tạo lô thành công', `${data.created} tạo mới, ${data.updated} đã có. Chọn reset MK/OTP nếu cần rồi bấm Hoàn tất.`, 8000);
     }
     stopPolling();
     setStep(3);
 }
 
-async function submitBatch() {
-    if (!jobId) { alert('Chưa có job OCR.'); return; }
-    const btn = btnConfirmBatch;
+async function finalizeBatch() {
+    const pending = Object.entries(followUpActions).filter(([, a]) => a && a !== 'skip');
+    if (!pending.length) {
+        followUpFinalized = true;
+        updateFinalizeButton();
+        notify('info', 'Không có thao tác bổ sung', 'Tất cả user đã có được chọn bỏ qua.');
+        return;
+    }
+
+    const btn = document.getElementById('btn-finalize-batch');
     const orig = btn?.textContent;
-    if (btn) { btn.disabled = true; btn.textContent = 'Đang chuẩn bị...'; }
+    if (btn) { btn.disabled = true; btn.textContent = 'Đang xử lý...'; }
+
+    try {
+        const payloadUsers = pending.map(([username, on_conflict]) => {
+            const src = enrichedUsers.find(u => (u.email || u.username) === username);
+            if (!src) return null;
+            return buildProvisionUserPayload(src, on_conflict);
+        }).filter(Boolean);
+
+        if (!payloadUsers.length) throw new Error('Không tìm thấy dữ liệu user để áp dụng thao tác.');
+
+        const res = await fetch(`${API_BASE}/api/users/provision-batch`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ users: payloadUsers, default_on_conflict: 'skip' }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.detail || 'Áp dụng thao tác thất bại');
+
+        const byUsername = Object.fromEntries((data.results || []).map(r => [r.username, r]));
+        lastProvisionResponse.results = (lastProvisionResponse.results || []).map(r => {
+            const follow = byUsername[r.username];
+            if (!follow) return r;
+            const mergedActions = [...(r.actions_applied || [])];
+            (follow.actions_applied || []).forEach(a => {
+                if (!mergedActions.includes(a)) mergedActions.push(a);
+            });
+            return {
+                ...r,
+                actions_applied: mergedActions,
+                error: follow.error || r.error,
+                status: follow.status === 'failed' ? 'failed' : r.status,
+            };
+        });
+
+        (data.results || []).forEach(r => {
+            if (!r.error) {
+                followUpActions[r.username] = 'skip';
+                followUpApplied[r.username] = true;
+            }
+        });
+        followUpFinalized = countPendingFollowUps() === 0;
+        renderSuccessResultsTable();
+
+        const ok = (data.results || []).filter(r => !r.error).length;
+        const fail = (data.results || []).filter(r => r.error).length;
+        if (fail > 0) {
+            notify('warn', `Hoàn tất — ${fail} lỗi`, `${ok} user đã áp dụng thao tác bổ sung.`, 8000);
+        } else {
+            notify('success', 'Đã hoàn tất', `${ok} user đã áp dụng reset mật khẩu/OTP.`, 6000);
+        }
+    } catch (e) {
+        notify('error', 'Lỗi hoàn tất', e.message);
+    } finally {
+        if (btn) {
+            btn.disabled = false;
+            if (!followUpFinalized || countPendingFollowUps() > 0) btn.textContent = orig || 'Hoàn tất';
+        }
+        updateFinalizeButton();
+    }
+}
+
+async function submitReview() {
+    if (!jobId) {
+        notify('error', 'Chưa có job', 'Upload PDF hoặc Excel trước.');
+        return;
+    }
+    const btn = btnCreateBatch;
+    const orig = btn?.textContent;
+    if (btn) { btn.disabled = true; btn.textContent = 'Đang tải dữ liệu...'; }
 
     try {
         const data = await enrichBatchUsers();
         if (!data.users?.length) throw new Error('Không có user để tạo lô.');
-        showBatchReviewModal(data.users);
+        if (data.warnings?.length) {
+            notify('warn', 'Cảnh báo enrich', data.warnings.slice(0, 3).join('; '), 8000);
+        }
+        renderReviewPage(data.users);
+        notify('info', 'Sẵn sàng kiểm tra', `${data.users.length} user — chỉnh sửa rồi xác nhận tạo lô.`);
     } catch (e) {
-        alert(`Lỗi: ${e.message}`);
+        notify('error', 'Lỗi tải dữ liệu', e.message);
+        throw e;
     } finally {
-        if (btn) { btn.disabled = false; btn.textContent = orig; }
+        if (btn) { btn.disabled = false; btn.textContent = orig || 'Xác nhận & Tạo lô User'; }
     }
 }
 
-function setupBatchReviewModal() {
-    document.getElementById('btn-batch-cancel')?.addEventListener('click', hideBatchReviewModal);
-    document.getElementById('btn-batch-cancel-2')?.addEventListener('click', hideBatchReviewModal);
-    document.getElementById('btn-batch-confirm')?.addEventListener('click', confirmBatchProvision);
-    document.getElementById('batch-default-conflict')?.addEventListener('change', (e) => {
-        const val = e.target.value;
-        document.querySelectorAll('.conflict-sel').forEach(sel => { sel.value = val; });
-        enrichedUsers.forEach(u => { u.on_conflict = val; });
+async function submitBatch() {
+    await createBatch();
+}
+
+function setupReviewPage() {
+    document.getElementById('btn-toggle-bulk')?.addEventListener('click', () => {
+        const panel = document.getElementById('review-bulk-panel');
+        panel?.classList.toggle('hidden');
     });
+
+    document.getElementById('review-search')?.addEventListener('input', (e) => {
+        reviewSearchQuery = e.target.value || '';
+        renderBatchReviewTable(enrichedUsers);
+    });
+
+    document.getElementById('btn-batch-filter-errors')?.addEventListener('change', (e) => {
+        batchShowErrorsOnly = e.target.checked;
+        renderBatchReviewTable(enrichedUsers);
+    });
+
     document.getElementById('btn-batch-re-enrich')?.addEventListener('click', async () => {
         try {
             const defaults = {};
             const bc = document.getElementById('bulk-branch-code')?.value?.trim();
             const uc = document.getElementById('bulk-unit-code')?.value?.trim();
-            const role = document.getElementById('bulk-role')?.value;
             if (bc) defaults.branch_code = bc;
             if (uc) defaults.unit_code = uc;
-            if (role) defaults.role = role;
             const data = await enrichBatchUsers(defaults);
-            enrichedUsers = data.users;
+            enrichedUsers = data.users.map(u => ({
+                ...u,
+                roles: u.roles?.length ? u.roles : parseRolesText(u.role),
+            }));
             renderBatchReviewTable(enrichedUsers);
-        } catch (e) { alert(e.message); }
+            notify('success', 'Enrich lại thành công', `${enrichedUsers.length} user`);
+        } catch (e) { notify('error', 'Enrich thất bại', e.message); }
     });
     document.querySelectorAll('[data-bulk]').forEach(btn => {
-        btn.addEventListener('click', () => {
-            applyBulkBatchField(btn.dataset.bulk, btn.dataset.scope);
-        });
-    });
-    document.getElementById('btn-batch-filter-errors')?.addEventListener('click', () => {
-        batchShowErrorsOnly = !batchShowErrorsOnly;
-        const btn = document.getElementById('btn-batch-filter-errors');
-        if (btn) btn.textContent = batchShowErrorsOnly ? 'Hiện tất cả dòng' : 'Chỉ hiện dòng lỗi';
-        renderBatchReviewTable(enrichedUsers);
+        btn.addEventListener('click', () => applyBulkBatchField(btn.dataset.bulk, btn.dataset.scope));
     });
 }
+
+function setupSuccessPage() {
+    document.getElementById('btn-finalize-batch')?.addEventListener('click', () => finalizeBatch());
+
+    document.getElementById('btn-success-bulk-apply')?.addEventListener('click', () => {
+        const val = document.getElementById('success-bulk-conflict')?.value || 'skip';
+        Object.keys(followUpActions).forEach(username => { followUpActions[username] = val; });
+        followUpFinalized = false;
+        renderSuccessResultsTable();
+        notify('success', 'Đã áp dụng hàng loạt', CONFLICT_OPTIONS.find(o => o.value === val)?.label || val);
+    });
+
+    document.getElementById('success-search')?.addEventListener('input', (e) => {
+        successSearchQuery = e.target.value || '';
+        renderSuccessResultsTable();
+    });
+
+    document.getElementById('success-filter-updated')?.addEventListener('change', (e) => {
+        successShowUpdatedOnly = e.target.checked;
+        renderSuccessResultsTable();
+    });
+}
+
+// Backward compat
+function hideBatchReviewModal() { hideReviewPage(); }
+function showBatchReviewModal(users) { renderReviewPage(users); }
+function setupBatchReviewModal() { setupReviewPage(); }
+function confirmBatchProvision() { return createBatch(); }

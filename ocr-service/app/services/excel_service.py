@@ -31,10 +31,31 @@ LOW_CONFIDENCE_FILL = PatternFill(
 )
 LOW_CONFIDENCE_FONT = Font(name="Arial", size=11, color="CC6600")
 
+EMAIL_MISMATCH_FILL = PatternFill(
+    start_color="FFCDD2", end_color="FFCDD2", fill_type="solid"
+)
+EMAIL_MISMATCH_FONT = Font(name="Arial", size=11, color="B71C1C")
+
+ROLE_UNMAPPED_FILL = PatternFill(
+    start_color="FFF9C4", end_color="FFF9C4", fill_type="solid"
+)
+
 NORMAL_FONT = Font(name="Arial", size=11)
 NORMAL_ALIGNMENT = Alignment(
     horizontal="left", vertical="center", wrap_text=True
 )
+
+
+SSO_HEADERS = [
+    "STT", "Ho va ten", "Phong/Don vi", "Ma CN", "User IPCAS", "So CCCD",
+    "Email tai Agribank", "So dien thoai", "Phan quyen", "Ghi chu / Ma DV",
+    "Vai tro (goi y)",
+]
+
+# OCR grid col index -> Excel export column (after Ma CN insert at col 3).
+_SSO_GRID_TO_EXCEL_COL = {
+    0: 0, 1: 1, 2: 2, 3: 4, 4: 5, 5: 6, 6: 7, 7: 8, 8: 9,
+}
 
 THIN_BORDER = Border(
     left=Side(style="thin"),
@@ -44,17 +65,107 @@ THIN_BORDER = Border(
 )
 
 
-def export_to_excel(result: OcrResult) -> Path:
+
+
+def _export_sso_sheet(ws, table, threshold: float, start_row: int = 1) -> int:
+    from app.services.email_reconcile import email_mismatch_with_ipcas, email_needs_review
+    from app.services.user_mapping import _parse_branch_code_digits, normalize_roles
+
+    grid = {}
+    for cell in table.cells:
+        grid[(cell.row, cell.col)] = (cell.text, cell.confidence)
+    row = start_row
+    for c, title in enumerate(SSO_HEADERS):
+        cell = ws.cell(row=row, column=c + 1)
+        cell.value = title
+        cell.fill = HEADER_FILL
+        cell.font = HEADER_FONT
+        cell.border = THIN_BORDER
+    row += 1
+    data_rows = max(table.num_rows, 1)
+    for r in range(data_rows):
+        dept_text, _ = grid.get((r, 2), ("", 1.0))
+        branch_code = _parse_branch_code_digits(dept_text)
+        ipcas = grid.get((r, 3), ("", 1.0))[0]
+        email_text, email_conf = grid.get((r, 5), ("", 1.0))
+        role_text, role_conf = grid.get((r, 7), ("", 1.0))
+        role_suggested = ";".join(normalize_roles(role_text)) if role_text else ""
+        email_mismatch = bool(ipcas and email_text and email_mismatch_with_ipcas(email_text, ipcas))
+        email_uncertain = bool(email_text and email_needs_review(email_text))
+        role_unmapped = bool(role_text.strip() and not role_suggested)
+
+        for excel_c in range(len(SSO_HEADERS)):
+            ws_cell = ws.cell(row=row, column=excel_c + 1)
+            ws_cell.alignment = NORMAL_ALIGNMENT
+            ws_cell.border = THIN_BORDER
+
+            if excel_c == 3:
+                ws_cell.value = branch_code
+                ws_cell.font = NORMAL_FONT
+                continue
+            if excel_c == 10:
+                ws_cell.value = role_suggested
+                if role_unmapped:
+                    ws_cell.fill = ROLE_UNMAPPED_FILL
+                    ws_cell.font = LOW_CONFIDENCE_FONT
+                else:
+                    ws_cell.font = NORMAL_FONT
+                continue
+
+            grid_c = next((g for g, e in _SSO_GRID_TO_EXCEL_COL.items() if e == excel_c), None)
+            if grid_c is None:
+                continue
+            text_val, conf = grid.get((r, grid_c), ("", 1.0))
+            ws_cell.value = text_val
+            if grid_c == 5 and (email_mismatch or email_uncertain):
+                ws_cell.fill = EMAIL_MISMATCH_FILL
+                ws_cell.font = EMAIL_MISMATCH_FONT
+            elif grid_c == 7 and role_unmapped:
+                ws_cell.fill = ROLE_UNMAPPED_FILL
+                ws_cell.font = LOW_CONFIDENCE_FONT
+            elif conf < threshold:
+                ws_cell.fill = LOW_CONFIDENCE_FILL
+                ws_cell.font = LOW_CONFIDENCE_FONT
+            else:
+                ws_cell.font = NORMAL_FONT
+        row += 1
+    return row
+
+
+def _norm_excel_header(val: str) -> str:
+    import unicodedata
+
+    s = str(val or "").strip().lower()
+    s = s.replace("đ", "d")
+    s = unicodedata.normalize("NFD", s)
+    s = "".join(c for c in s if unicodedata.category(c) != "Mn")
+    return " ".join(s.split())
+
+
+def _is_sso_header_row(row: list[str]) -> bool:
+    aliases = {
+        "stt", "ho va ten", "phong/don vi", "ma cn", "user ipcas", "so cccd",
+        "email", "email tai agribank", "so dien thoai", "phan quyen",
+        "ghi chu / ma dv", "vai tro (goi y)",
+    }
+    hits = sum(1 for cell in row[:12] if _norm_excel_header(cell) in aliases)
+    return hits >= 4
+
+
+def export_to_excel(
+    result: OcrResult,
+    *,
+    page_numbers: list[int] | None = None,
+) -> Path:
     """
     Export OCR result to an Excel file.
 
     Creates one sheet per page. Each table on a page is placed
     sequentially with a gap row between tables.
 
-    Low-confidence cells (below threshold) are highlighted in yellow.
-
     Args:
         result: The OcrResult to export
+        page_numbers: Optional subset of page numbers to include (1-based)
 
     Returns:
         Path to the generated Excel file
@@ -64,12 +175,28 @@ def export_to_excel(result: OcrResult) -> Path:
     wb.remove(wb.active)
 
     threshold = settings.ocr_confidence_threshold
+    page_filter = set(page_numbers) if page_numbers else None
+    pages = result.pages
+    if page_filter:
+        pages = [p for p in result.pages if p.page_number in page_filter]
+    if not pages:
+        raise ValueError("Không có trang nào để xuất Excel")
 
-    for page in result.pages:
+    for page in pages:
         sheet_name = f"Trang {page.page_number}"
         ws = wb.create_sheet(title=sheet_name)
 
         current_row = 1
+
+        sso_tables = [t for t in page.tables if t.table_kind == "sso_agribank"]
+        if sso_tables:
+            current_row = 1
+            for table in sso_tables:
+                if not table.cells:
+                    continue
+                current_row = _export_sso_sheet(ws, table, threshold, start_row=current_row) + 2
+            _auto_adjust_column_widths(ws)
+            continue
 
         for table in page.tables:
             if not table.cells:
@@ -123,7 +250,12 @@ def export_to_excel(result: OcrResult) -> Path:
     _add_legend_sheet(wb, threshold)
 
     # Save
-    filename = f"{result.job_id}_{result.filename.rsplit('.', 1)[0]}.xlsx"
+    base = result.filename.rsplit(".", 1)[0]
+    if page_filter:
+        page_tag = "-".join(str(p) for p in sorted(page_filter))
+        filename = f"{result.job_id}_{base}_trang-{page_tag}.xlsx"
+    else:
+        filename = f"{result.job_id}_{base}.xlsx"
     export_file = settings.export_path / filename
 
     wb.save(str(export_file))
@@ -221,6 +353,17 @@ def _find_table_title_rows(ws) -> list[int]:
     return rows
 
 
+def _excel_cell_text(v) -> str:
+    """Normalize Excel cell value to string (whole-number floats -> int text)."""
+    if v is None:
+        return ""
+    if isinstance(v, float) and v.is_integer():
+        return str(int(v))
+    if isinstance(v, int):
+        return str(v)
+    return str(v).strip()
+
+
 def _read_matrix(ws, start_row: int, end_row: int) -> list[list[str]]:
     """Read non-empty rectangular matrix from row range."""
     rows: list[list[str]] = []
@@ -231,7 +374,7 @@ def _read_matrix(ws, start_row: int, end_row: int) -> list[list[str]]:
         row_non_empty = False
         for c in range(1, ws.max_column + 1):
             v = ws.cell(row=r, column=c).value
-            txt = "" if v is None else str(v).strip()
+            txt = _excel_cell_text(v)
             vals.append(txt)
             if txt:
                 row_non_empty = True
@@ -247,6 +390,9 @@ def _read_matrix(ws, start_row: int, end_row: int) -> list[list[str]]:
 
 
 def _matrix_to_table(matrix: list[list[str]], table_index: int) -> TableData:
+    if matrix and _is_sso_header_row(matrix[0]):
+        matrix = matrix[1:]
+
     """Convert 2D string matrix to TableData."""
     num_rows = len(matrix)
     num_cols = max((len(r) for r in matrix), default=0)
@@ -265,12 +411,14 @@ def _matrix_to_table(matrix: list[list[str]], table_index: int) -> TableData:
                 )
             )
 
+    table_kind = "sso_agribank" if num_cols >= 6 else ""
     return TableData(
         table_index=table_index,
         num_rows=num_rows,
         num_cols=num_cols,
         cells=cells,
         html="",
+        table_kind=table_kind,
     )
 
 

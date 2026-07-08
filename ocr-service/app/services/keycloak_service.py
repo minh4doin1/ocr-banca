@@ -3,7 +3,7 @@ Keycloak Service — Quản lý User qua Admin REST API.
 
 Dùng Service Account (grant type client_credentials) — KHÔNG dùng tài khoản
 admin hay admin-cli. Client chỉ cần client_id + client_secret với quyền tối
-thiểu realm-management: manage-users, view-users.
+thiểu realm-management: manage-users, view-users, view-clients, manage-clients.
 
 Tham chiếu: Keycloak 24 Admin REST API
   - POST /realms/{realm}/protocol/openid-connect/token   (client_credentials)
@@ -305,8 +305,22 @@ class KeycloakClient:
                 if cred_id:
                     self.delete_credential(user_id, str(cred_id))
                     deleted += 1
-        self.ensure_required_actions(user_id, [REQUIRED_ACTION_CONFIGURE_TOTP])
+        self.set_required_actions(user_id, [REQUIRED_ACTION_CONFIGURE_TOTP])
         return deleted
+
+
+    def set_required_actions(self, user_id: str, actions: list[str]) -> list[str]:
+        """Replace required actions (used after OTP reset)."""
+        resp = self._request(
+            "PUT",
+            self._admin_url(f"/users/{user_id}"),
+            json={"requiredActions": list(actions)},
+        )
+        if resp.status_code not in (200, 204):
+            raise KeycloakError(
+                f"Cap nhat requiredActions that bai (HTTP {resp.status_code})"
+            )
+        return list(actions)
 
     def ensure_required_actions(
         self, user_id: str, actions: list[str]
@@ -408,6 +422,32 @@ class KeycloakClient:
     # Client role operations
     # ──────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _role_mapping_payload(role_repr: dict, client_uuid: str) -> dict:
+        """Payload tối thiểu cho POST role-mappings/clients."""
+        return {
+            "id": str(role_repr.get("id", "")),
+            "name": str(role_repr.get("name", "")),
+            "clientRole": True,
+            "containerId": client_uuid,
+        }
+
+    def get_service_account_user(self, client_uuid: str) -> dict | None:
+        """Lấy service-account user của một client (để chẩn đoán quyền)."""
+        resp = self._request(
+            "GET",
+            self._admin_url(f"/clients/{client_uuid}/service-account-user"),
+            json_body=False,
+        )
+        if resp.status_code == 404:
+            return None
+        if resp.status_code != 200:
+            raise KeycloakError(
+                f"Lấy service-account-user thất bại "
+                f"(HTTP {resp.status_code}): {_safe_body(resp)}"
+            )
+        return resp.json()
+
     def get_client_by_client_id(self, client_id: str) -> dict | None:
         """Tra client theo public clientId, trả representation đầy đủ."""
         resp = self._request(
@@ -439,7 +479,10 @@ class KeycloakClient:
             )
         return resp.json()
 
-    def get_user_client_roles(self, user_id: str, client_uuid: str) -> list[dict]:
+    def get_user_client_roles_optional(
+        self, user_id: str, client_uuid: str
+    ) -> tuple[list[dict], str | None]:
+        """Trả (roles, error). error=None khi OK; '403' khi forbidden."""
         resp = self._request(
             "GET",
             self._admin_url(
@@ -447,14 +490,24 @@ class KeycloakClient:
             ),
             json_body=False,
         )
+        if resp.status_code == 403:
+            return [], "403"
         if resp.status_code != 200:
             raise KeycloakError(
                 f"Lấy client roles (user {user_id}) thất bại "
                 f"(HTTP {resp.status_code}): {_safe_body(resp)}"
             )
-        return resp.json() or []
+        return resp.json() or [], None
 
-    def assign_client_roles(
+    def get_user_client_roles(self, user_id: str, client_uuid: str) -> list[dict]:
+        roles, err = self.get_user_client_roles_optional(user_id, client_uuid)
+        if err:
+            raise KeycloakError(
+                f"Lấy client roles (user {user_id}) thất bại (HTTP {err})"
+            )
+        return roles
+
+    def assign_client_roles_batch(
         self, user_id: str, client_uuid: str, roles: list[dict]
     ) -> None:
         if not roles:
@@ -469,6 +522,30 @@ class KeycloakClient:
         if resp.status_code not in (200, 204):
             raise KeycloakError(
                 f"Gán client role (user {user_id}) thất bại "
+                f"(HTTP {resp.status_code}): {_safe_body(resp)}"
+            )
+
+    def assign_client_roles(
+        self, user_id: str, client_uuid: str, roles: list[dict]
+    ) -> None:
+        self.assign_client_roles_batch(user_id, client_uuid, roles)
+
+    def remove_client_roles_batch(
+        self, user_id: str, client_uuid: str, roles: list[dict]
+    ) -> None:
+        """Gỡ (thu hồi) danh sách client role khỏi user."""
+        if not roles:
+            return
+        resp = self._request(
+            "DELETE",
+            self._admin_url(
+                f"/users/{user_id}/role-mappings/clients/{client_uuid}"
+            ),
+            json=roles,
+        )
+        if resp.status_code not in (200, 204):
+            raise KeycloakError(
+                f"Gỡ client role (user {user_id}) thất bại "
                 f"(HTTP {resp.status_code}): {_safe_body(resp)}"
             )
 

@@ -255,7 +255,12 @@ class KeycloakUserInput(BaseModel):
     phone: str = Field(default="", description="Số điện thoại")
     unit_code: str = Field(default="", description="Mã đơn vị")
     notes: str = Field(default="", description="Ghi chú (form SSO, không bắt buộc)")
-    role: str = Field(default="", description="Client role Keycloak (banca-*)")
+    role: str = Field(default="", description="Client role Keycloak (banca-*) — role đầu tiên")
+    role_raw: str = Field(default="", description="Văn bản role thô từ OCR (trước khi map)")
+    roles: list[str] = Field(
+        default_factory=list,
+        description="Danh sách client roles (hỗ trợ nhiều role/user).",
+    )
     branch_name_matched: str = Field(default="", description="Tên CN khớp từ banca-core")
     department_name_matched: str = Field(default="", description="Tên PGD khớp")
     match_status: MatchStatus | None = Field(default=None)
@@ -406,6 +411,17 @@ class FieldConfigResponse(BaseModel):
     attribute_keys: dict[str, str] = Field(default_factory=dict)
     roles_client_id: str = ""
     default_temp_password: str = ""
+
+
+class KeycloakRoleCheckResponse(BaseModel):
+    ok: bool = False
+    roles_client_id: str = ""
+    provision_client_id: str = ""
+    role_assign_client_id: str = ""
+    can_view_roles_client: bool = False
+    can_assign_test_role: bool = False
+    message: str = ""
+    fix_hint: str = ""
 
 
 class UserValidationItem(BaseModel):

@@ -1,5 +1,5 @@
 """
-Users Router — Tạo lô user, enrich, lookup chi nhánh/đại lý.
+Users Router — Tao lo user, enrich, lookup chi nhanh/dai ly.
 """
 
 from __future__ import annotations
@@ -7,6 +7,7 @@ from __future__ import annotations
 import logging
 import secrets
 import string
+from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
@@ -23,6 +24,7 @@ from app.models.schemas import (
     EnrichResponse,
     ErrorResponse,
     FieldConfigResponse,
+    KeycloakRoleCheckResponse,
     KeycloakUserInput,
     OnConflictAction,
     ProvisionStatus,
@@ -60,10 +62,10 @@ from app.services.user_mapping import (
 logger = logging.getLogger(__name__)
 
 _ROLE_LABELS: dict[str, str] = {
-    "banca-admin": "Quản trị",
-    "banca-seller": "Đại lý viên",
-    "banca-accounting-operator": "Kế toán viên",
-    "banca-accounting-controller": "Phê duyệt viên",
+    "banca-admin": "Quan tri",
+    "banca-seller": "Dai ly vien",
+    "banca-accounting-operator": "Ke toan vien",
+    "banca-accounting-controller": "Phe duyet vien",
 }
 
 _client_uuid_cache: dict[str, str] = {}
@@ -88,6 +90,27 @@ def _generate_temp_password(length: int = 14) -> str:
             return pwd
 
 
+def _date_based_password(suffix: str = "") -> str:
+    base = f"Ngay{datetime.now():%d%m%Y}@"
+    return f"{base}{suffix}" if suffix else base
+
+
+def _reset_password_with_retry(
+    client: KeycloakClient, user_id: str, temporary: bool
+) -> str:
+    for attempt in range(6):
+        pwd = _date_based_password("" if attempt == 0 else str(attempt))
+        try:
+            client.reset_password(user_id, pwd, temporary=temporary)
+            return pwd
+        except KeycloakError as exc:
+            msg = str(exc).lower()
+            if attempt < 5 and ("password" in msg or "history" in msg or "400" in msg):
+                continue
+            raise
+    raise KeycloakError("Khong the dat mat khau moi sau nhieu lan thu.")
+
+
 def _resolve_temp_password(user: KeycloakUserInput) -> str:
     if user.password:
         return user.password
@@ -103,52 +126,176 @@ def _build_kc_client(realm: str) -> KeycloakClient:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
+
+
+def _role_assign_client(provision_client: KeycloakClient) -> KeycloakClient:
+    """Client dùng để gán role — client riêng nếu cấu hình, không thì tái dùng provision client."""
+    if settings.keycloak_role_assign_configured:
+        return KeycloakClient(
+            realm=provision_client.realm or None,
+            client_id=settings.keycloak_role_assign_client_id,
+            client_secret=settings.keycloak_role_assign_client_secret,
+        )
+    return provision_client
+
+
+def _existing_role_names(
+    client: KeycloakClient, user_id: str, client_uuid: str
+) -> tuple[set[str], bool]:
+    """Trả (tên role đã có, skipped_lookup_403)."""
+    existing, err = client.get_user_client_roles_optional(user_id, client_uuid)
+    if err == "403":
+        logger.warning(
+            "Khong doc duoc client roles cua user %s (403) — van thu gan role.",
+            user_id,
+        )
+        return set(), True
+    return {str(r.get("name", "")) for r in existing}, False
+
+
+def _assign_roles_with_client(
+    client: KeycloakClient,
+    user_id: str,
+    client_uuid: str,
+    role_names: list[str],
+) -> list[str]:
+    """Gán role qua một KeycloakClient cụ thể. Trả actions hoặc raise.
+
+    Đồng bộ (reconcile) role: gán role còn thiếu và gỡ những role thuộc bộ
+    role hệ thống quản lý nhưng không còn nằm trong danh sách mong muốn.
+    """
+    applied: list[str] = []
+    existing, lookup_skipped = _existing_role_names(client, user_id, client_uuid)
+    desired = set(role_names)
+    to_assign: list[dict] = []
+
+    for role_name in role_names:
+        role_repr = client.get_client_role(client_uuid, role_name)
+        if not role_repr:
+            raise KeycloakError(
+                f"Role '{role_name}' khong ton tai tren client "
+                f"'{settings.keycloak_roles_client_id}'."
+            )
+        if role_name in existing:
+            applied.append(f"role_already:{role_name}")
+            continue
+        to_assign.append(KeycloakClient._role_mapping_payload(role_repr, client_uuid))
+
+    if to_assign:
+        client.assign_client_roles_batch(user_id, client_uuid, to_assign)
+        for payload in to_assign:
+            applied.append(f"assign_role:{payload['name']}")
+
+    # Gỡ role không còn được chọn. Chỉ đụng tới role trong bộ role hệ thống
+    # quản lý (keycloak_valid_roles) để không thu hồi role khác của user.
+    # Bỏ qua khi không đọc được role hiện có (403) để tránh xóa nhầm.
+    if not lookup_skipped:
+        managed = set(settings.keycloak_valid_roles)
+        to_remove: list[dict] = []
+        for name in existing:
+            if name not in managed or name in desired:
+                continue
+            role_repr = client.get_client_role(client_uuid, name)
+            if role_repr:
+                to_remove.append(
+                    KeycloakClient._role_mapping_payload(role_repr, client_uuid)
+                )
+        if to_remove:
+            client.remove_client_roles_batch(user_id, client_uuid, to_remove)
+            for payload in to_remove:
+                applied.append(f"remove_role:{payload['name']}")
+
+    return applied
+
+
 def _resolve_roles_client_uuid(client: KeycloakClient) -> str:
     client_id = settings.keycloak_roles_client_id.strip()
     if not client_id:
-        raise KeycloakError("KEYCLOAK_ROLES_CLIENT_ID chưa cấu hình.")
+        raise KeycloakError("KEYCLOAK_ROLES_CLIENT_ID chua cau hinh.")
     if client_id in _client_uuid_cache:
         return _client_uuid_cache[client_id]
     kc_client = client.get_client_by_client_id(client_id)
     if not kc_client or not kc_client.get("id"):
-        raise KeycloakError(f"Không tìm thấy Keycloak client '{client_id}'.")
+        raise KeycloakError(f"Khong tim thay Keycloak client '{client_id}'.")
     uuid = str(kc_client["id"])
     _client_uuid_cache[client_id] = uuid
     return uuid
 
 
+def _user_role_names(user: KeycloakUserInput) -> list[str]:
+    if user.roles:
+        return list(user.roles)
+    return [user.role] if user.role else []
+
+
 def _assign_client_role(
     client: KeycloakClient, user_id: str, role_name: str
 ) -> list[str]:
-    """Gán client role nếu user chưa có. Trả actions applied."""
-    if not role_name:
-        return []
-    role_name = normalize_role(role_name)
-    if role_name not in settings.keycloak_valid_roles:
-        raise KeycloakError(f"Role không hợp lệ: '{role_name}'.")
+    return _assign_client_roles(client, user_id, [role_name] if role_name else [])
 
-    try:
-        client_uuid = _resolve_roles_client_uuid(client)
-        role_repr = client.get_client_role(client_uuid, role_name)
-        if not role_repr:
-            raise KeycloakError(
-                f"Role '{role_name}' không tồn tại trên client "
-                f"'{settings.keycloak_roles_client_id}'."
+
+def _resolve_role_for_assign(role_name: str) -> str:
+    """Resolve role slug for Keycloak assign (passthrough valid slugs)."""
+    name = (role_name or "").strip()
+    if not name:
+        return ""
+    if name in settings.keycloak_valid_roles:
+        return name
+    return normalize_role(name)
+
+
+def _assign_client_roles(
+    client: KeycloakClient, user_id: str, role_names: list[str]
+) -> list[str]:
+    resolved = []
+    for role_name in role_names:
+        if not role_name:
+            continue
+        name = _resolve_role_for_assign(role_name)
+        if not name:
+            continue
+        if name not in settings.keycloak_valid_roles:
+            raise KeycloakError(f"Role khong hop le: '{name}'.")
+        if name not in resolved:
+            resolved.append(name)
+
+    if not resolved:
+        return []
+
+    logger.info("Assign roles to user %s: %s", user_id, resolved)
+    client_uuid = _resolve_roles_client_uuid(client)
+    role_client = _role_assign_client(client)
+    clients_to_try = [role_client]
+    if role_client is not client:
+        clients_to_try.append(client)
+
+    last_403: KeycloakError | None = None
+    for kc in clients_to_try:
+        try:
+            return _assign_roles_with_client(kc, user_id, client_uuid, resolved)
+        except KeycloakError as exc:
+            if "403" not in str(exc):
+                raise
+            last_403 = exc
+            logger.warning(
+                "Gan role user %s that bai 403 voi client '%s': %s",
+                user_id,
+                kc.client_id,
+                exc,
             )
 
-        existing = client.get_user_client_roles(user_id, client_uuid)
-        if any(str(r.get("name", "")) == role_name for r in existing):
-            return [f"role_already:{role_name}"]
-
-        client.assign_client_roles(user_id, client_uuid, [role_repr])
-        return [f"assign_role:{role_name}"]
-    except KeycloakError as exc:
-        # Some realms deny role-client lookup for service account; do not block
-        # user creation/update if profile attributes were already saved.
-        if "403" in str(exc):
-            logger.warning("Skip role assignment for '%s': %s", user_id, exc)
-            return [f"assign_role_skipped:{role_name}"]
-        raise
+    skipped = [f"assign_role_skipped:{r}" for r in resolved]
+    skipped.append("roles_assignment_failed:403")
+    if last_403:
+        logger.error(
+            "Khong gan duoc role cho user %s. Cap realm-management roles "
+            "manage-users + manage-clients (hoac realm-admin) cho service account "
+            "'%s' hoac cau hinh KEYCLOAK_ROLE_ASSIGN_CLIENT_ID/SECRET. Loi: %s",
+            user_id,
+            client.client_id,
+            last_403,
+        )
+    return skipped
 
 
 def _save_existing_user(
@@ -157,7 +304,6 @@ def _save_existing_user(
     user: KeycloakUserInput,
     attrs: dict,
 ) -> list[str]:
-    """Save Details + attributes theo SOP manual."""
     applied: list[str] = []
     display_name = user.name.strip()
     first = user.first_name.strip() or (
@@ -176,7 +322,7 @@ def _save_existing_user(
     if attrs:
         client.update_user_attributes(user_id, attrs)
         applied.append("set_attributes")
-    applied.extend(_assign_client_role(client, user_id, user.role))
+    applied.extend(_assign_client_roles(client, user_id, _user_role_names(user)))
     return applied
 
 
@@ -185,7 +331,7 @@ def _require_banca() -> BancaCoreClient:
     if client is None:
         raise HTTPException(
             status_code=503,
-            detail="Banca Core chưa bật hoặc thiếu cấu hình KC client.",
+            detail="Banca Core chua bat hoac thieu cau hinh KC client.",
         )
     return client
 
@@ -199,7 +345,7 @@ def _resolve_users_list(
         result = get_result(job_id)
         if result is None:
             raise HTTPException(
-                status_code=404, detail=f"Không tìm thấy job OCR: {job_id}"
+                status_code=404, detail=f"Khong tim thay job OCR: {job_id}"
             )
         return map_result_to_users(result)
     return list(users), []
@@ -244,11 +390,11 @@ def _provision_one(
 
     missing = validate_user_fields(user)
     if missing:
-        result.error = f"Thiếu/không hợp lệ: {', '.join(missing)}"
+        result.error = f"Thieu/khong hop le: {', '.join(missing)}"
         return result
 
     if not settings.keycloak_roles_configured:
-        result.error = "KEYCLOAK_ROLES_CLIENT_ID chưa cấu hình."
+        result.error = "KEYCLOAK_ROLES_CLIENT_ID chua cau hinh."
         return result
 
     attrs = build_keycloak_attributes(user)
@@ -282,7 +428,7 @@ def _provision_one(
             applied = ["create"] + list(required_actions)
             if attrs:
                 applied.append("set_attributes")
-            applied.extend(_assign_client_role(client, user_id, user.role))
+            applied.extend(_assign_client_roles(client, user_id, _user_role_names(user)))
             result.status = ProvisionStatus.CREATED
             result.user_id = user_id
             result.actions_applied = applied
@@ -294,18 +440,31 @@ def _provision_one(
 
         applied = _save_existing_user(client, user_id, user, attrs)
 
-        if action in (OnConflictAction.RESET_PASSWORD, OnConflictAction.RESET_BOTH):
-            client.reset_password(
-                user_id, _resolve_temp_password(user), temporary=temporary
-            )
+        reset_password = action in (
+            OnConflictAction.RESET_PASSWORD,
+            OnConflictAction.RESET_BOTH,
+        )
+        reset_otp = action in (
+            OnConflictAction.RESET_OTP,
+            OnConflictAction.RESET_BOTH,
+        )
+
+        if reset_password:
+            # Ép người dùng đổi mật khẩu ngay lần đăng nhập kế tiếp.
+            _reset_password_with_retry(client, user_id, temporary=True)
+            applied.append("reset_password")
+
+        # Reset OTP dùng set_required_actions (ghi đè) nên phải chạy TRƯỚC,
+        # sau đó merge UPDATE_PASSWORD để không xóa mất yêu cầu đổi mật khẩu.
+        if reset_otp:
+            deleted = client.reset_otp(user_id)
+            applied.append(f"reset_otp(deleted={deleted})")
+
+        if reset_password:
             client.ensure_required_actions(
                 user_id, [REQUIRED_ACTION_UPDATE_PASSWORD]
             )
-            applied.append("reset_password")
-
-        if action in (OnConflictAction.RESET_OTP, OnConflictAction.RESET_BOTH):
-            deleted = client.reset_otp(user_id)
-            applied.append(f"reset_otp(deleted={deleted})")
+            applied.append(f"require_action:{REQUIRED_ACTION_UPDATE_PASSWORD}")
 
         result.status = ProvisionStatus.UPDATED
         result.actions_applied = applied
@@ -316,11 +475,8 @@ def _provision_one(
         return result
     except KeycloakError as exc:
         result.error = str(exc)
-        logger.warning("Provision '%s' lỗi: %s", username, exc)
+        logger.warning("Provision '%s' loi: %s", username, exc)
         return result
-
-
-# ── Lookup (proxy banca-core) ──
 
 
 @router.get("/lookup/agencies", response_model=AgencyLookupResponse)
@@ -369,10 +525,7 @@ async def lookup_agents(
 @router.get("/field-config", response_model=FieldConfigResponse)
 async def field_config():
     roles = [
-        {
-            "value": role,
-            "label": _ROLE_LABELS.get(role, role),
-        }
+        {"value": role, "label": _ROLE_LABELS.get(role, role)}
         for role in settings.keycloak_valid_roles
     ]
     return FieldConfigResponse(
@@ -416,7 +569,7 @@ async def validate_users(request: ValidateUsersRequest):
 async def enrich_users(request: EnrichRequest):
     users, warnings = _resolve_users_list(request.job_id, request.users)
     if not users:
-        detail = "Không có user để enrich."
+        detail = "Khong co user de enrich."
         if warnings:
             detail += " " + " ".join(warnings)
         raise HTTPException(status_code=400, detail=detail)
@@ -424,6 +577,56 @@ async def enrich_users(request: EnrichRequest):
     resp.warnings = warnings + resp.warnings
     return resp
 
+
+
+
+@router.get("/keycloak-role-check", response_model=KeycloakRoleCheckResponse)
+async def keycloak_role_check():
+    """Kiểm tra service account có đủ quyền gán client role banca-*."""
+    if not settings.keycloak_configured:
+        raise HTTPException(status_code=503, detail="Keycloak chua cau hinh.")
+    if not settings.keycloak_roles_configured:
+        raise HTTPException(status_code=503, detail="KEYCLOAK_ROLES_CLIENT_ID chua cau hinh.")
+
+    client = _build_kc_client("")
+    resp = KeycloakRoleCheckResponse(
+        roles_client_id=settings.keycloak_roles_client_id,
+        provision_client_id=settings.keycloak_client_id,
+        role_assign_client_id=(
+            settings.keycloak_role_assign_client_id
+            if settings.keycloak_role_assign_configured
+            else settings.keycloak_client_id
+        ),
+    )
+    try:
+        client_uuid = _resolve_roles_client_uuid(client)
+        resp.can_view_roles_client = True
+        sample = settings.keycloak_valid_roles[0] if settings.keycloak_valid_roles else ""
+        if sample:
+            role_repr = client.get_client_role(client_uuid, sample)
+            if role_repr:
+                resp.can_assign_test_role = True
+                resp.ok = True
+                resp.message = f"Co the gan role mau '{sample}'."
+    except KeycloakError as exc:
+        msg = str(exc)
+        resp.message = msg
+        if "403" in msg:
+            resp.fix_hint = (
+                "Vao Keycloak > Clients > "
+                f"{settings.keycloak_client_id} > Service account roles > "
+                "Assign role > Filter by clients > realm-management > "
+                "chon manage-users VA manage-clients (hoac realm-admin). "
+                "Hoac cau hinh KEYCLOAK_ROLE_ASSIGN_CLIENT_ID/SECRET voi client co realm-admin."
+            )
+        elif "404" in msg:
+            resp.fix_hint = (
+                f"Kiem tra KEYCLOAK_ROLES_CLIENT_ID='{settings.keycloak_roles_client_id}' "
+                "va KEYCLOAK_REALM."
+            )
+        else:
+            resp.fix_hint = "Kiem tra KEYCLOAK_BASE_URL, client secret va realm."
+    return resp
 
 @router.post(
     "/provision-batch",
@@ -436,11 +639,11 @@ async def enrich_users(request: EnrichRequest):
 )
 async def provision_batch(request: BatchProvisionRequest):
     if not settings.keycloak_configured and not request.realm:
-        raise HTTPException(status_code=503, detail="Keycloak chưa cấu hình.")
+        raise HTTPException(status_code=503, detail="Keycloak chua cau hinh.")
 
     users, warnings = _resolve_users_list(request.job_id, request.users)
     if not users:
-        detail = "Không có user nào để xử lý."
+        detail = "Khong co user nao de xu ly."
         if warnings:
             detail += " " + " ".join(warnings)
         raise HTTPException(status_code=400, detail=detail)
@@ -489,6 +692,6 @@ async def preview_from_job(job_id: str):
 
     result = get_result(job_id)
     if result is None:
-        raise HTTPException(status_code=404, detail=f"Không tìm thấy job: {job_id}")
+        raise HTTPException(status_code=404, detail=f"Khong tim thay job: {job_id}")
     users, warnings = map_result_to_users(result)
     return UserPreviewResponse(job_id=job_id, total=len(users), users=users, warnings=warnings)

@@ -27,7 +27,8 @@ class Settings(BaseSettings):
     paddle_lang: str = "vi"
 
     # VietOCR
-    vietocr_model: str = "vgg_transformer"
+    vietocr_model: str = "vgg_seq2seq"
+    vietocr_model_pass2: str = "vgg_transformer"
 
     # OCR API fallback mode
     ocr_api_provider: str = "ocrspace"
@@ -35,7 +36,7 @@ class Settings(BaseSettings):
     ocr_api_timeout_seconds: int = 60
 
     # --- PDF Processing ---
-    pdf_dpi: int = 300
+    pdf_dpi: int = 350
     poppler_path: str = ""
     poppler_thread_count: int = 4
     pdf_lazy_convert: bool = True
@@ -64,9 +65,13 @@ class Settings(BaseSettings):
     ocr_sso_email_domain: str = "@agribank.com.vn"
     # Cột email (0-based); -1 = tự đoán theo layout SSO (thường cột 5)
     ocr_sso_email_col: int = -1
+    ocr_sso_email_ipcas_priority: bool = True
+    ocr_sso_critical_col_upscale: float = 2.5
+    ocr_sso_role_fuzzy_threshold: float = 0.72
+    ocr_sso_pass2_enabled: bool = True
 
     # --- VietOCR / CPU tuning ---
-    vietocr_batch_size: int = 64
+    vietocr_batch_size: int = 32
     torch_num_threads: int = 4
     cell_ink_min_ratio: float = 0.015
     # Phase 4: VietOCR torch-CUDA trong process con (tránh xung đột Paddle GPU)
@@ -106,6 +111,10 @@ class Settings(BaseSettings):
 
     # Client chứa các role banca-* (public clientId, không phải UUID)
     keycloak_roles_client_id: str = ""
+    # Client riêng để gán role (cần manage-users + manage-clients hoặc realm-admin).
+    # Để trống = dùng KEYCLOAK_CLIENT_ID.
+    keycloak_role_assign_client_id: str = ""
+    keycloak_role_assign_client_secret: str = ""
 
     # Map vai trò nghiệp vụ / alias -> tên client role Keycloak
     keycloak_role_map: str = (
@@ -113,6 +122,10 @@ class Settings(BaseSettings):
         "đại lý viên:banca-seller;dai ly vien:banca-seller;seller:banca-seller;"
         "kế toán viên:banca-accounting-operator;ke toan vien:banca-accounting-operator;"
         "phê duyệt viên:banca-accounting-controller;phe duyet vien:banca-accounting-controller;"
+        "phe duyet:banca-accounting-controller;duyet vien:banca-accounting-controller;"
+        "đại lí viên:banca-seller;dai li vien:banca-seller;dai li:banca-seller;"
+        "kế toán:banca-accounting-operator;ke toan:banca-accounting-operator;"
+        "kt vien:banca-accounting-operator;ketoan:banca-accounting-operator;"
         "banca-admin:banca-admin;banca-seller:banca-seller;"
         "banca-accounting-operator:banca-accounting-operator;"
         "banca-accounting-controller:banca-accounting-controller"
@@ -338,6 +351,15 @@ class Settings(BaseSettings):
     @property
     def keycloak_roles_configured(self) -> bool:
         return bool(self.keycloak_roles_client_id.strip())
+
+    @property
+    def keycloak_role_assign_configured(self) -> bool:
+        cid = self.keycloak_role_assign_client_id.strip()
+        if not cid:
+            return False
+        if cid == self.keycloak_client_id.strip():
+            return False
+        return bool(self.keycloak_role_assign_client_secret.strip())
 
     @property
     def field_labels_vi(self) -> dict[str, str]:

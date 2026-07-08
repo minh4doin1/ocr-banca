@@ -7,9 +7,11 @@ from __future__ import annotations
 import logging
 import re
 import unicodedata
+from difflib import SequenceMatcher
 
 from app.config import settings
 from app.models.schemas import KeycloakUserInput, OcrResult, TableData
+from app.services.email_reconcile import reconcile_agribank_email
 
 logger = logging.getLogger(__name__)
 
@@ -71,26 +73,105 @@ def _normalize_role_alias(text: str) -> str:
     return s.strip()
 
 
+_ROLE_PHRASE_PATTERNS: list[tuple[re.Pattern[str], str]] = [
+    (re.compile(r"phe\s*duyet|duyet\s*vien|controller", re.I), "banca-accounting-controller"),
+    (re.compile(r"dai\s*l[iy]|dai\s*ly\s*vien|seller|sales", re.I), "banca-seller"),
+    (re.compile(r"ke\s*toan|kê\s*toan|toan\s*vien|kt\s*vien|operator", re.I), "banca-accounting-operator"),
+    (re.compile(r"quan\s*tri|admin|qtv", re.I), "banca-admin"),
+]
+
+_ROLE_CANONICAL_ASCII = (
+    ("phe duyet vien", "banca-accounting-controller"),
+    ("dai ly vien", "banca-seller"),
+    ("ke toan vien", "banca-accounting-operator"),
+    ("quan tri", "banca-admin"),
+)
+
+
+def _fuzzy_role_match(key: str, valid: set[str]) -> str:
+    if not key or len(key) < 3:
+        return ""
+    best_role = ""
+    best_score = 0.0
+    threshold = settings.ocr_sso_role_fuzzy_threshold
+    for canonical, role in _ROLE_CANONICAL_ASCII:
+        score = SequenceMatcher(None, key, canonical).ratio()
+        if score >= threshold and score > best_score and role in valid:
+            best_score = score
+            best_role = role
+    return best_role
+
+
+def extract_roles_from_ocr(raw: str) -> list[str]:
+    """Extract all Keycloak roles from OCR role text (with or without delimiters)."""
+    if not str(raw or "").strip():
+        return []
+
+    role_map = settings.keycloak_role_map_parsed
+    valid = set(settings.keycloak_valid_roles)
+    seen: set[str] = set()
+    out: list[str] = []
+
+    def _add(resolved: str) -> None:
+        if resolved and resolved in valid and resolved not in seen:
+            seen.add(resolved)
+            out.append(resolved)
+
+    text = str(raw).strip()
+    # Explicit delimiters and Vietnamese "và"
+    parts = re.split(r"[;,/|]+|\s+và\s+|\s+va\s+", text, flags=re.IGNORECASE)
+    for part in parts:
+        key = _normalize_role_alias(part)
+        if not key:
+            continue
+        if key in role_map:
+            _add(role_map[key])
+            continue
+        fuzzy = _fuzzy_role_match(key, valid)
+        if fuzzy:
+            _add(fuzzy)
+
+    # Phrase scan on full string — preserve left-to-right order
+    full_key = _normalize_role_alias(text)
+    positioned: list[tuple[int, str]] = []
+    for pattern, role in _ROLE_PHRASE_PATTERNS:
+        for m in pattern.finditer(full_key):
+            positioned.append((m.start(), role))
+    positioned.sort(key=lambda x: x[0])
+    for _, role in positioned:
+        _add(role)
+
+    if out:
+        return out
+
+    # Keyword fallback on whole string
+    if any(k in full_key for k in ("quan tri", "admin", "qtv")):
+        _add("banca-admin")
+    if any(k in full_key for k in ("phe duyet", "duyet vien", "controller")):
+        _add("banca-accounting-controller")
+    if any(k in full_key for k in ("ke toan", "toan vien", "kt vien", "operator")):
+        _add("banca-accounting-operator")
+    if any(k in full_key for k in ("dai ly", "dai li", "seller", "sales")):
+        _add("banca-seller")
+
+    if not out:
+        for part in parts:
+            key = _normalize_role_alias(part)
+            if key in valid:
+                _add(key)
+
+    return out
+
+
 def normalize_role(raw: str) -> str:
     """Chuẩn hoá vai trò nghiệp vụ -> tên client role Keycloak."""
-    key = _normalize_role_alias(raw)
-    if not key:
-        return ""
-    role_map = settings.keycloak_role_map_parsed
-    if key in role_map:
-        return role_map[key]
-    # OCR often returns combined/noisy role labels; map by intent keywords.
-    if any(k in key for k in ("quan tri", "admin")):
-        return "banca-admin"
-    if any(k in key for k in ("phe duyet", "duyet vien", "controller")):
-        return "banca-accounting-controller"
-    if any(k in key for k in ("ke toan", "toan vien", "operator")):
-        return "banca-accounting-operator"
-    if any(k in key for k in ("dai ly", "seller", "sales")):
-        return "banca-seller"
-    if key in settings.keycloak_valid_roles:
-        return key
-    return ""
+    roles = normalize_roles(raw)
+    return roles[0] if roles else ""
+
+
+def normalize_roles(raw: str) -> list[str]:
+    """Tách và chuẩn hoá nhiều role (phân tách ; , / | hoặc phrase scan)."""
+    return extract_roles_from_ocr(raw)
 
 
 def _split_vn_name(full_name: str) -> tuple[str, str]:
@@ -120,14 +201,40 @@ def finalize_user(user: KeycloakUserInput) -> KeycloakUserInput:
         if not user.last_name.strip():
             user.last_name = last
 
-    if user.role:
+    if user.roles:
+        user.roles = normalize_roles(";".join(user.roles))
+    elif user.role:
+        user.roles = normalize_roles(user.role)
+    else:
+        user.roles = []
+    if user.roles:
+        user.role = user.roles[0]
+    elif user.role:
         user.role = normalize_role(user.role) or user.role.strip()
+    else:
+        user.role = ""
 
     user.cccd = re.sub(r"\s", "", user.cccd or "")
     user.phone = re.sub(r"\s", "", user.phone or "")
     user.ipcas_code = (user.ipcas_code or "").strip().upper()
     user.unit_code = re.sub(r"\s", "", user.unit_code or "")
     return user
+
+
+def _parse_branch_code_digits(raw: str) -> str:
+    """Extract 4-digit branch code from cell text (e.g. 6900, 6900.0, '6900 Hội sở')."""
+    t = (raw or "").strip()
+    if not t:
+        return ""
+    compact = re.sub(r"\s", "", t)
+    m = re.fullmatch(r"(\d{4})(?:\.0+)?", compact)
+    if m:
+        return m.group(1)
+    m = _DEPARTMENT_CODE_RE.match(t)
+    if m:
+        return m.group(1)
+    m = re.search(r"\b(\d{4})\b", t)
+    return m.group(1) if m else ""
 
 
 def _parse_department_cell(text: str) -> tuple[str, str, str]:
@@ -138,6 +245,9 @@ def _parse_department_cell(text: str) -> tuple[str, str, str]:
     m = _DEPARTMENT_CODE_RE.match(t)
     if m:
         return t, m.group(1), m.group(2).strip()
+    code = _parse_branch_code_digits(t)
+    if code:
+        return t, code, ""
     return t, "", ""
 
 
@@ -255,7 +365,8 @@ def _field_value(data: dict, field: str) -> str:
             data.get("name", ""),
         )
     if field == "role":
-        return normalize_role(str(val or ""))
+        roles = data.get("roles") or normalize_roles(str(val or ""))
+        return roles[0] if roles else normalize_role(str(val or ""))
     return str(val or "").strip()
 
 
@@ -283,8 +394,15 @@ def validate_user_field_errors(user: KeycloakUserInput) -> dict[str, str]:
             label = labels.get(field, field)
             errors[field] = f"Thiếu {label}"
 
-    if user.role and user.role not in settings.keycloak_valid_roles:
-        errors["role"] = "Vai trò không hợp lệ"
+    roles = list(user.roles) if user.roles else (
+        normalize_roles(user.role) if user.role else []
+    )
+    if not roles and "role" in settings.user_required_fields_list:
+        errors["role"] = "Thiếu vai trò"
+    for r in roles:
+        if r not in settings.keycloak_valid_roles:
+            errors["role"] = f"Vai trò không hợp lệ: {r}"
+            break
 
     if user.cccd and not re.fullmatch(r"\d{12}", user.cccd):
         errors["cccd"] = "CCCD phải có 12 số"
@@ -369,8 +487,10 @@ def map_table_to_users(
             raw = row[idx].strip()
             if field == "cccd":
                 return _extract_cccd_from_cell(raw)
+            if field == "branch_code":
+                return _parse_branch_code_digits(raw)
             if field == "role":
-                return normalize_role(raw) or raw
+                return raw
             if field == "unit_code":
                 unit, _notes = _parse_unit_or_notes(raw)
                 return unit
@@ -380,8 +500,10 @@ def map_table_to_users(
         email = _val("email")
         ipcas = _val("ipcas_code")
 
-        # SSO fallback: email column can be blank OCR-wise, but IPCAS is present.
-        if not email and ipcas:
+        reconciled_email, _email_src = reconcile_agribank_email(email, ipcas)
+        if reconciled_email:
+            email = reconciled_email
+        elif not email and ipcas:
             email = _derive_agribank_email(ipcas)
         if not username:
             username = email or _derive_agribank_email(ipcas)
@@ -405,6 +527,8 @@ def map_table_to_users(
             if not unit_code:
                 unit_code = parsed_unit
 
+        role_raw = _val("role")
+        parsed_roles = normalize_roles(role_raw)
         user = KeycloakUserInput(
             username=username or email,
             email=email or username,
@@ -420,13 +544,16 @@ def map_table_to_users(
             phone=_val("phone"),
             unit_code=unit_code,
             notes=notes,
-            role=_val("role"),
+            role_raw=role_raw,
+            role=parsed_roles[0] if parsed_roles else role_raw.strip(),
+            roles=parsed_roles,
             password=_val("password"),
         )
         user = finalize_user(user)
-        if user.role and user.role not in settings.keycloak_valid_roles:
+        invalid_roles = [r for r in user.roles if r not in settings.keycloak_valid_roles]
+        if invalid_roles:
             warnings.append(
-                f"Dòng {row_idx + 1}: vai trò '{user.role}' không hợp lệ."
+                f"Dòng {row_idx + 1}: vai trò không hợp lệ: {', '.join(invalid_roles)}."
             )
         user.missing_fields = validate_user_fields(user)
         users.append(user)

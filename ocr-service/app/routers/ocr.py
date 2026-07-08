@@ -469,7 +469,7 @@ async def get_ocr_validation(job_id: str):
 
 
 @router.get("/result/{job_id}/export")
-async def export_excel(job_id: str):
+async def export_excel(job_id: str, pages: str | None = None):
     result = get_result(job_id)
     if result is None:
         raise HTTPException(
@@ -477,8 +477,20 @@ async def export_excel(job_id: str):
             detail=f"Kết quả OCR không tìm thấy cho job: {job_id}",
         )
 
+    page_numbers: list[int] | None = None
+    if pages:
+        try:
+            page_numbers = [int(p.strip()) for p in pages.split(",") if p.strip()]
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail="Tham số pages không hợp lệ (vd: pages=1,2,3)",
+            ) from exc
+        if not page_numbers:
+            raise HTTPException(status_code=400, detail="Chưa chọn trang để xuất")
+
     try:
-        excel_path = export_to_excel(result)
+        excel_path = export_to_excel(result, page_numbers=page_numbers)
         return FileResponse(
             path=str(excel_path),
             filename=excel_path.name,

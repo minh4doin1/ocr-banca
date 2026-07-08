@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>OCR & Tạo lô User — Agribank Banca</title>
     <link rel="stylesheet" href="styles.css">
+    <link rel="stylesheet" href="styles-overhaul.css">
 </head>
 <body>
 
@@ -29,21 +30,20 @@
 
     <main class="app-main">
 
-        <!-- Stepper -->
         <nav class="stepper" aria-label="Tiến trình">
             <div class="step-item active" data-step="0">
                 <span class="step-dot">1</span>
-                <span class="step-label">Upload PDF</span>
+                <span class="step-label">Tải dữ liệu</span>
             </div>
             <div class="step-line"></div>
             <div class="step-item" data-step="1">
                 <span class="step-dot">2</span>
-                <span class="step-label">Xử lý OCR</span>
+                <span class="step-label">OCR & Xuất Excel</span>
             </div>
             <div class="step-line"></div>
             <div class="step-item" data-step="2">
                 <span class="step-dot">3</span>
-                <span class="step-label">Đối chiếu & Sửa</span>
+                <span class="step-label">Kiểm tra & Sửa</span>
             </div>
             <div class="step-line"></div>
             <div class="step-item" data-step="3">
@@ -57,17 +57,18 @@
             <div class="upload-layout">
                 <div class="card upload-panel">
                     <input type="file" id="file-input" accept=".pdf" hidden>
+                    <input type="file" id="excel-input" accept=".xlsx,.xlsm" hidden>
 
                     <div class="upload-file-row">
                         <button type="button" class="btn btn-primary btn-sm" id="select-btn">Chọn PDF</button>
                         <button type="button" class="btn btn-outline btn-sm" id="select-excel-btn">Nạp Excel</button>
-                        <button type="button" class="btn btn-ghost btn-sm" id="btn-clear-file" type="button">Xóa file</button>
+                        <button type="button" class="btn btn-ghost btn-sm" id="btn-clear-file">Xóa file</button>
                         <span class="file-name" id="file-name-label">Chưa chọn file</span>
                         <div class="drop-hint" id="drop-zone">Kéo thả PDF vào đây</div>
                     </div>
-                    <input type="file" id="excel-input" accept=".xlsx,.xlsm" hidden>
+                    <p class="excel-direct-hint">Đã có file Excel chuẩn? Bấm <strong>Nạp Excel</strong> để bỏ qua OCR và vào thẳng bước kiểm tra.</p>
 
-                    <div class="upload-settings">
+                    <div class="upload-settings" id="upload-settings">
                         <div class="option-group">
                             <span class="option-label">Chế độ OCR</span>
                             <div class="radio-group mode-grid">
@@ -138,19 +139,19 @@
                     <ul class="guide-steps">
                         <li>
                             <strong>Upload PDF</strong>
-                            <span>Tải lên bảng danh sách user cần cấp quyền. Hỗ trợ bản scan.</span>
+                            <span>Tải lên bảng danh sách user. Hệ thống OCR và xuất file Excel để bạn sửa.</span>
                         </li>
                         <li>
-                            <strong>GPU tập trung</strong>
-                            <span>Chọn GPU nội bộ hoặc Colab — máy yếu vẫn nhanh như nhau vì OCR chạy trên worker GPU.</span>
+                            <strong>Hoặc nạp Excel sẵn</strong>
+                            <span>Đã có file Excel đúng format? Nạp trực tiếp, bỏ qua bước OCR.</span>
                         </li>
                         <li>
-                            <strong>Đối chiếu & sửa</strong>
-                            <span>Ô vàng = AI không chắc chắn. Ô đỏ = sai định dạng. Click để kiểm tra ảnh gốc.</span>
+                            <strong>Sửa Excel offline</strong>
+                            <span>Tải Excel, chỉnh sửa trên máy, rồi upload lại vào hệ thống.</span>
                         </li>
                         <li>
-                            <strong>Xuất & đồng bộ</strong>
-                            <span>Xuất Excel hoặc xác nhận tạo lô user sang Banca Core.</span>
+                            <strong>Kiểm tra & tạo lô</strong>
+                            <span>Đối chiếu dữ liệu, map API, chỉnh lần cuối rồi tạo lô user Keycloak.</span>
                         </li>
                     </ul>
                 </aside>
@@ -162,7 +163,7 @@
             <div class="processing-layout">
                 <div class="card processing-main">
                     <div class="processing-header">
-                        <div class="spinner"></div>
+                        <div class="spinner" id="processing-spinner"></div>
                         <div>
                             <h2 id="processing-title">Đang xử lý tài liệu...</h2>
                             <p class="text-muted" id="processing-subtitle">Khởi tạo OCR engine</p>
@@ -178,10 +179,38 @@
 
                     <div class="page-grid" id="page-status-grid"></div>
 
-                    <div class="processing-actions">
-                        <button class="btn btn-outline hidden" id="btn-go-review-early">
-                            Vào đối chiếu ngay (trang đã sẵn sàng)
-                        </button>
+                    <div class="partial-excel-panel hidden" id="partial-excel-panel">
+                        <div class="partial-excel-header">
+                            <h3>Tải Excel từng trang</h3>
+                            <p class="text-muted">Chọn trang đã OCR xong — tải ngay trong khi các trang khác vẫn đang chạy.</p>
+                        </div>
+                        <div class="page-export-toolbar">
+                            <label class="review-filter-chip">
+                                <input type="checkbox" id="page-export-select-all">
+                                <span>Chọn tất cả trang đã xong</span>
+                            </label>
+                        </div>
+                        <div class="page-export-list" id="page-export-list"></div>
+                        <div class="excel-actions">
+                            <button type="button" class="btn btn-primary btn-sm" id="btn-download-pages-excel" disabled>
+                                Tải Excel trang đã chọn
+                            </button>
+                            <span class="page-export-hint" id="page-export-hint"></span>
+                        </div>
+                    </div>
+
+                    <div class="excel-complete-panel hidden" id="excel-complete-panel">
+                        <h3>OCR hoàn tất — Bước tiếp theo</h3>
+                        <ol class="excel-steps">
+                            <li>Tải file Excel bên dưới</li>
+                            <li>Sửa dữ liệu trên Excel (email, role, mã CN…)</li>
+                            <li>Upload lại file Excel đã sửa</li>
+                        </ol>
+                        <div class="excel-actions">
+                            <button type="button" class="btn btn-primary" id="btn-download-excel">Tải Excel</button>
+                            <button type="button" class="btn btn-outline" id="btn-reupload-excel">Upload Excel đã sửa</button>
+                            <input type="file" id="excel-input-reupload" accept=".xlsx,.xlsm" hidden>
+                        </div>
                     </div>
                 </div>
 
@@ -195,177 +224,189 @@
             </div>
         </section>
 
-        <!-- VIEW: Workspace -->
-        <section class="view" id="view-workspace">
-            <div class="processing-banner hidden" id="processing-banner">
-                <div class="banner-spinner"></div>
-                <span id="banner-text">Đang OCR trang 2/5 — bạn có thể sửa các trang đã hoàn tất</span>
-            </div>
-
-            <div class="workspace-layout">
-                <!-- Page sidebar -->
-                <aside class="page-sidebar card">
-                    <div class="sidebar-header">
-                        <h3>Danh sách trang</h3>
-                        <span class="sidebar-count" id="sidebar-count">0/0</span>
+        <!-- VIEW: Review (full-page) -->
+        <section class="view" id="view-review">
+            <div class="review-layout card">
+                <div class="review-header">
+                    <div>
+                        <h2>Kiểm tra & Map dữ liệu</h2>
+                        <p class="text-muted review-subtitle">Rà soát lần cuối trước khi tạo lô user Keycloak</p>
                     </div>
-                    <ul class="page-list" id="page-list"></ul>
-                </aside>
+                    <div class="review-header-actions">
+                        <button type="button" class="btn btn-ghost btn-sm" id="btn-review-back">← Quay lại</button>
+                        <button type="button" class="btn btn-primary" id="btn-create-batch">Xác nhận & Tạo lô User</button>
+                    </div>
+                </div>
 
-                <!-- Split panes -->
-                <div class="workspace-split" id="workspace-split">
-                    <div class="pane-wrapper pane-pdf-wrapper" id="pane-pdf-wrapper">
-                        <div class="pane card" id="pane-pdf">
-                            <div class="pane-toolbar">
-                                <span id="pdf-pane-title">Tài liệu gốc</span>
-                                <div class="toolbar-actions">
-                                    <button class="btn btn-sm btn-outline" id="btn-prev-page" type="button">← Trước</button>
-                                    <button class="btn btn-sm btn-outline" id="btn-next-page" type="button">Sau →</button>
-                                    <button class="btn btn-sm btn-ghost" id="btn-toggle-pdf" type="button" title="Ẩn ảnh gốc để mở rộng bảng">Ẩn ảnh</button>
-                                </div>
-                            </div>
-                            <div class="pane-body pdf-body">
-                                <div class="page-pending-overlay hidden" id="page-pending-overlay">
-                                    <div class="overlay-spinner"></div>
-                                    <p>Trang này đang được OCR...</p>
-                                </div>
-                                <div class="pdf-image-wrapper" id="pdf-image-wrapper">
-                                    <img id="pdf-page-image" class="pdf-page-img" alt="PDF Page">
-                                    <div id="bbox-container"></div>
-                                </div>
-                            </div>
+                <div class="review-stats" id="review-stats">
+                    <div class="review-stat review-stat-total">
+                        <span class="review-stat-num" id="stat-total">0</span>
+                        <span class="review-stat-label">Tổng user</span>
+                    </div>
+                    <div class="review-stat review-stat-ok">
+                        <span class="review-stat-num" id="stat-valid">0</span>
+                        <span class="review-stat-label">Đủ dữ liệu</span>
+                    </div>
+                    <div class="review-stat review-stat-err">
+                        <span class="review-stat-num" id="stat-errors">0</span>
+                        <span class="review-stat-label">Cần sửa</span>
+                    </div>
+                    <div class="review-progress-wrap">
+                        <div class="review-progress-track">
+                            <div class="review-progress-fill" id="review-progress-fill"></div>
                         </div>
+                        <span class="review-progress-text" id="review-progress-text">0%</span>
                     </div>
+                </div>
 
-                    <div class="split-resizer" id="split-resizer" role="separator"
-                         aria-orientation="vertical" aria-label="Kéo để đổi kích thước" tabindex="0"></div>
-
-                    <div class="pane-wrapper pane-table-wrapper" id="pane-table-wrapper">
-                        <div class="pane card" id="pane-table">
-                            <div class="pane-toolbar">
-                                <span>Bảng đối chiếu</span>
-                                <div class="toolbar-actions">
-                                    <button class="btn btn-sm btn-outline hidden" id="btn-show-pdf" type="button">Hiện ảnh gốc</button>
-                                    <button class="btn btn-sm btn-outline" id="btn-reocr-page" type="button" title="OCR lại trang hiện tại">OCR lại trang</button>
-                                    <button class="btn btn-sm btn-outline" id="btn-import-excel" type="button">Nạp Excel đã chỉnh</button>
-                                    <button class="btn btn-sm btn-outline" id="btn-export-excel" type="button">Xuất Excel</button>
-                                    <button class="btn btn-sm btn-ghost" id="btn-restart" type="button">Làm lại</button>
-                                </div>
-                            </div>
-                            <div class="pane-body pane-body-table">
-                                <div class="alert-bar hidden" id="alerts-summary">
-                                    <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor">
-                                        <path d="M1 21h22L12 2 1 21zm12-3h-2v-2h2v2zm0-4h-2v-4h2v4z"/>
-                                    </svg>
-                                    <span id="alert-summary-text"></span>
-                                </div>
-                                <div class="validation-panel hidden" id="validation-panel">
-                                    <div class="validation-panel-header">
-                                        <strong>Chi tiết lỗi toàn bộ tài liệu</strong>
-                                        <button type="button" class="btn btn-xs btn-ghost" id="btn-toggle-validation-panel">Thu gọn</button>
-                                    </div>
-                                    <ul class="validation-list" id="validation-list"></ul>
-                                </div>
-                                <div class="table-scroller" id="table-scroller-zone"></div>
-                            </div>
-                            <div class="pane-footer">
-                                <span class="tip-text">Mẹo: Kéo thanh giữa hai cửa sổ để resize · Tab/↑↓ để di chuyển giữa các ô</span>
-                                <button class="btn btn-primary" id="btn-confirm-batch" type="button">Xác nhận & Tạo lô User</button>
-                            </div>
-                        </div>
+                <div class="review-toolbar-compact">
+                    <div class="review-toolbar-left">
+                        <label class="review-filter-chip">
+                            <input type="checkbox" id="btn-batch-filter-errors">
+                            <span>Chỉ dòng lỗi</span>
+                        </label>
+                        <input type="search" id="review-search" class="review-search" placeholder="Tìm email, IPCAS…">
                     </div>
+                    <div class="review-toolbar-right">
+                        <button type="button" class="btn btn-outline btn-sm" id="btn-toggle-bulk">Áp dụng hàng loạt</button>
+                        <button type="button" class="btn btn-outline btn-sm" id="btn-batch-re-enrich">Enrich lại</button>
+                    </div>
+                </div>
+
+                <div class="review-bulk-panel hidden" id="review-bulk-panel">
+                    <div class="review-bulk-grid">
+                        <label class="review-bulk-item">
+                            <span>Mã CN</span>
+                            <div class="review-bulk-row">
+                                <input type="text" id="bulk-branch-code" class="bulk-inp" placeholder="6900">
+                                <button type="button" class="btn btn-xs btn-outline" data-bulk="branch_code" data-scope="all">Tất cả</button>
+                                <button type="button" class="btn btn-xs btn-ghost" data-bulk="branch_code" data-scope="error">Dòng lỗi</button>
+                            </div>
+                        </label>
+                        <label class="review-bulk-item">
+                            <span>Mã ĐV</span>
+                            <div class="review-bulk-row">
+                                <input type="text" id="bulk-unit-code" class="bulk-inp" placeholder="82204001">
+                                <button type="button" class="btn btn-xs btn-outline" data-bulk="unit_code" data-scope="all">Tất cả</button>
+                                <button type="button" class="btn btn-xs btn-ghost" data-bulk="unit_code" data-scope="error">Dòng lỗi</button>
+                            </div>
+                        </label>
+                        <label class="review-bulk-item review-bulk-roles">
+                            <span>Vai trò</span>
+                            <div class="review-bulk-role-chips" id="bulk-role-chips"></div>
+                        </label>
+                    </div>
+                </div>
+
+                <div class="batch-summary-bar hidden" id="batch-summary-bar" aria-hidden="true"></div>
+
+                <div class="batch-review-scroll review-table-wrap">
+                    <table class="ocr-table batch-review-table">
+                        <thead>
+                            <tr>
+                                <th class="col-stt">#</th>
+                                <th class="col-email">Email</th>
+                                <th class="col-name">Họ</th>
+                                <th class="col-name">Tên</th>
+                                <th class="col-cccd">CCCD</th>
+                                <th class="col-code">Mã CN</th>
+                                <th class="col-code">IPCAS</th>
+                                <th class="col-phone">SĐT</th>
+                                <th class="col-code">Mã ĐV</th>
+                                <th class="col-role">Vai trò</th>
+                                <th class="col-code">Mã ĐL</th>
+                                <th class="col-status">TT</th>
+                            </tr>
+                        </thead>
+                        <tbody id="batch-review-tbody"></tbody>
+                    </table>
                 </div>
             </div>
         </section>
 
-        <!-- VIEW: Success -->
+        <!-- VIEW: Success (full-page) -->
         <section class="view" id="view-success">
-            <div class="card success-card">
-                <div class="success-icon">✓</div>
-                <h2>Gửi thông tin tạo lô User thành công!</h2>
-                <p class="text-muted">Danh sách đã được kiểm soát OCR và gửi sang Banca Core để phê duyệt.</p>
-                <div class="success-details">
-                    <div class="detail-row">
-                        <span>Mã lô</span>
-                        <strong class="mono" id="success-batch-code">—</strong>
+            <div class="success-layout card">
+                <div class="success-header">
+                    <div>
+                        <h2>Tạo lô User thành công</h2>
+                        <p class="text-muted success-subtitle">Mã lô: <strong class="mono" id="success-batch-code">—</strong></p>
                     </div>
-                    <div class="detail-row">
-                        <span>Kết quả</span>
-                        <strong id="success-total-records">—</strong>
+                    <div class="success-header-actions">
+                        <button type="button" class="btn btn-ghost btn-sm" id="btn-success-home">← Quay lại</button>
+                        <button type="button" class="btn btn-outline btn-sm" id="btn-success-new">Tải file khác</button>
+                        <button type="button" class="btn btn-primary" id="btn-finalize-batch">Hoàn tất</button>
                     </div>
                 </div>
-                <div id="batch-results-detail" class="batch-results-detail"></div>
-                <div class="success-actions">
-                    <button class="btn btn-primary" id="btn-success-new">Tải PDF khác</button>
-                    <button class="btn btn-outline" id="btn-success-home">Quay lại</button>
+
+                <div class="success-stats" id="success-stats">
+                    <div class="success-stat success-stat-total">
+                        <span class="success-stat-num" id="success-stat-total">0</span>
+                        <span class="success-stat-label">Tổng</span>
+                    </div>
+                    <div class="success-stat success-stat-created">
+                        <span class="success-stat-num" id="success-stat-created">0</span>
+                        <span class="success-stat-label">Tạo mới</span>
+                    </div>
+                    <div class="success-stat success-stat-updated">
+                        <span class="success-stat-num" id="success-stat-updated">0</span>
+                        <span class="success-stat-label">Đã có</span>
+                    </div>
+                    <div class="success-stat success-stat-failed">
+                        <span class="success-stat-num" id="success-stat-failed">0</span>
+                        <span class="success-stat-label">Lỗi</span>
+                    </div>
+                    <p class="success-stats-hint text-muted" id="success-stats-hint"></p>
                 </div>
+
+                <div class="success-toolbar" id="success-toolbar">
+                    <div class="success-toolbar-left">
+                        <span class="success-toolbar-label">User đã có trên hệ thống — chọn thao tác bổ sung:</span>
+                        <label class="success-field-inline">
+                            <span>Áp dụng hàng loạt</span>
+                            <select id="success-bulk-conflict" class="success-select">
+                                <option value="skip">Bỏ qua</option>
+                                <option value="reset_password">Reset mật khẩu</option>
+                                <option value="reset_otp">Reset OTP</option>
+                                <option value="reset_both">Cả hai</option>
+                            </select>
+                        </label>
+                        <button type="button" class="btn btn-outline btn-sm" id="btn-success-bulk-apply">Áp dụng</button>
+                        <label class="success-filter-chip">
+                            <input type="checkbox" id="success-filter-updated">
+                            <span>Chỉ user đã có</span>
+                        </label>
+                        <input type="search" id="success-search" class="success-search" placeholder="Tìm email…">
+                    </div>
+                </div>
+
+                <div class="success-table-wrap">
+                    <table class="ocr-table success-results-table">
+                        <thead>
+                            <tr>
+                                <th class="col-stt">#</th>
+                                <th class="col-email">Email / Username</th>
+                                <th class="col-status">Trạng thái</th>
+                                <th class="col-actions-done">Đã thực hiện</th>
+                                <th class="col-error">Lỗi</th>
+                                <th class="col-followup">Thao tác (user đã có)</th>
+                            </tr>
+                        </thead>
+                        <tbody id="success-results-tbody"></tbody>
+                    </table>
+                </div>
+
+                <p class="success-footer-note text-muted" id="success-footer-note">
+                    Bước 1: Tạo/cập nhật user trên Keycloak. Bước 2: Với user đã có, chọn reset mật khẩu/OTP nếu cần rồi bấm <strong>Hoàn tất</strong>.
+                </p>
             </div>
         </section>
 
     </main>
 
-    <!-- Modal: Review trước khi tạo lô user -->
-    <div class="modal-overlay hidden" id="batch-review-modal">
-        <div class="modal-card card">
-            <div class="modal-header">
-                <h3>Review & Tạo lô User Keycloak</h3>
-                <button type="button" class="btn btn-ghost btn-sm" id="btn-batch-cancel">✕</button>
-            </div>
-            <p class="text-muted modal-hint">Kiểm tra thông tin theo SOP. Mật khẩu mặc định: <strong id="batch-default-pwd-hint">Agribank@123</strong> (Temporary). Chọn Vai trò và mã CN/ĐL trước khi xác nhận.</p>
-            <div class="modal-toolbar">
-                <label>Mặc định khi trùng:
-                    <select id="batch-default-conflict">
-                        <option value="skip">Bỏ qua</option>
-                        <option value="reset_password">Đổi mật khẩu</option>
-                        <option value="reset_otp">Đổi OTP</option>
-                        <option value="reset_both">Đổi cả 2</option>
-                    </select>
-                </label>
-                <button type="button" class="btn btn-outline btn-sm" id="btn-batch-re-enrich">Enrich lại</button>
-            </div>
-            <div class="batch-summary-bar hidden" id="batch-summary-bar"></div>
-            <div class="batch-bulk-toolbar">
-                <label>Mã CN <input type="text" id="bulk-branch-code" class="bulk-inp" placeholder="VD: 6900">
-                    <button type="button" class="btn btn-xs btn-outline" data-bulk="branch_code" data-scope="all">Tất cả</button>
-                    <button type="button" class="btn btn-xs btn-ghost" data-bulk="branch_code" data-scope="error">Dòng lỗi</button>
-                </label>
-                <label>Mã ĐV <input type="text" id="bulk-unit-code" class="bulk-inp" placeholder="VD: 82204001">
-                    <button type="button" class="btn btn-xs btn-outline" data-bulk="unit_code" data-scope="all">Tất cả</button>
-                    <button type="button" class="btn btn-xs btn-ghost" data-bulk="unit_code" data-scope="error">Dòng lỗi</button>
-                </label>
-                <label>Vai trò
-                    <select id="bulk-role" class="bulk-inp"></select>
-                    <button type="button" class="btn btn-xs btn-outline" data-bulk="role" data-scope="all">Tất cả</button>
-                </label>
-                <button type="button" class="btn btn-xs btn-ghost" id="btn-batch-filter-errors">Chỉ hiện dòng lỗi</button>
-            </div>
-            <div class="batch-review-scroll">
-                <table class="ocr-table batch-review-table">
-                    <thead>
-                        <tr>
-                            <th>Email</th><th>Họ</th><th>Tên</th><th>CCCD</th>
-                            <th>Mã CN</th><th>IPCAS</th><th>SĐT</th><th>Mã ĐV</th>
-                            <th>Vai trò</th><th>Mã ĐL</th><th>Khớp</th><th>Trùng</th><th>TT</th>
-                        </tr>
-                    </thead>
-                    <tbody id="batch-review-tbody"></tbody>
-                </table>
-            </div>
-            <div class="modal-footer">
-                <button type="button" class="btn btn-outline" id="btn-batch-cancel-2">Hủy</button>
-                <button type="button" class="btn btn-primary" id="btn-batch-confirm">Xác nhận tạo lô</button>
-            </div>
-        </div>
-    </div>
+    <div id="notification-center" class="notification-center" aria-live="polite"></div>
 
-    <div class="replace-popover hidden" id="replace-popover">
-        <p>Có ô khác cùng giá trị cũ. Thay thế?</p>
-        <div id="replace-popover-list"></div>
-        <button type="button" class="btn btn-sm btn-primary" id="btn-replace-apply">Áp dụng</button>
-        <button type="button" class="btn btn-sm btn-ghost" id="btn-replace-skip">Bỏ qua</button>
-    </div>
-
-    <script src="app.js?v=12"></script>
-    <script src="batch-users.js?v=3"></script>
+    <script src="app.js?v=15"></script>
+    <script src="batch-users.js?v=9"></script>
 </body>
 </html>

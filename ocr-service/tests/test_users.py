@@ -22,7 +22,7 @@ from app.models.schemas import (
 )
 from app.routers import users as users_router
 from app.routers.users import _provision_one
-from app.services.user_mapping import map_result_to_users, normalize_role
+from app.services.user_mapping import map_result_to_users, normalize_role, normalize_roles
 
 
 @pytest.fixture(autouse=True)
@@ -62,6 +62,23 @@ def test_normalize_role_vn_label():
     assert normalize_role("Phê duyệt viên Đại lý viên") == "banca-accounting-controller"
     assert normalize_role("Kê toán viên Đại lý viên") == "banca-accounting-operator"
     assert normalize_role("Quản trị; Đại lý VIÊN") == "banca-admin"
+
+
+def test_normalize_roles_multi_without_delimiter():
+    roles = normalize_roles("Phe duyet vien Dai ly vien")
+    assert "banca-accounting-controller" in roles
+    assert "banca-seller" in roles
+    assert len(roles) == 2
+
+
+def test_normalize_roles_ocr_variants():
+    assert normalize_roles("dai li") == ["banca-seller"]
+    assert normalize_roles("KT vien") == ["banca-accounting-operator"]
+    assert normalize_roles("Quan tri; Ke toan vien") == [
+        "banca-admin",
+        "banca-accounting-operator",
+    ]
+    assert normalize_roles("garbage xyz") == []
 
 
 def test_map_result_basic():
@@ -200,6 +217,8 @@ def _client_new_user() -> MagicMock:
     client.get_client_by_client_id.return_value = {"id": "client-uuid"}
     client.get_client_role.return_value = {"id": "role-id", "name": "banca-seller"}
     client.get_user_client_roles.return_value = []
+    client.get_user_client_roles_optional.return_value = ([], None)
+    client.assign_client_roles_batch = client.assign_client_roles
     return client
 
 
@@ -210,6 +229,8 @@ def _client_existing_user() -> MagicMock:
     client.get_client_by_client_id.return_value = {"id": "client-uuid"}
     client.get_client_role.return_value = {"id": "role-id", "name": "banca-seller"}
     client.get_user_client_roles.return_value = []
+    client.get_user_client_roles_optional.return_value = ([], None)
+    client.assign_client_roles_batch = client.assign_client_roles
     return client
 
 
@@ -242,7 +263,7 @@ def test_provision_creates_new_user():
     )
     assert result.status == ProvisionStatus.CREATED
     client.create_user.assert_called_once()
-    client.assign_client_roles.assert_called_once()
+    assert client.assign_client_roles.called or client.assign_client_roles_batch.called
     kwargs = client.create_user.call_args.kwargs
     assert kwargs["username"] == "u@agribank.com.vn"
     assert kwargs["required_actions"] == ["UPDATE_PASSWORD", "CONFIGURE_TOTP"]
@@ -261,7 +282,7 @@ def test_provision_existing_user_save_details_and_role():
     assert result.status == ProvisionStatus.UPDATED
     client.create_user.assert_not_called()
     client.update_user_details.assert_called_once()
-    client.assign_client_roles.assert_called_once()
+    assert client.assign_client_roles.called or client.assign_client_roles_batch.called
     client.reset_password.assert_not_called()
 
 
@@ -276,9 +297,109 @@ def test_provision_reset_password():
         default_required_actions=[],
     )
     assert result.status == ProvisionStatus.UPDATED
-    client.reset_password.assert_called_once_with(
-        "existing-id", "New@123", temporary=True
+    client.reset_password.assert_called_once()
+    args, kwargs = client.reset_password.call_args
+    assert args[0] == "existing-id"
+    pwd = args[1] if len(args) > 1 else kwargs.get("value", "")
+    assert pwd.startswith("Ngay") and pwd.endswith("@")
+    assert kwargs.get("temporary", args[2] if len(args) > 2 else None) is True
+
+
+def test_provision_reset_both_keeps_update_password():
+    """RESET_BOTH: reset OTP không được xóa mất yêu cầu đổi mật khẩu."""
+    client = _client_existing_user()
+    user = _user()
+    result = _provision_one(
+        client,
+        user,
+        temporary=True,
+        on_conflict=OnConflictAction.RESET_BOTH,
+        default_required_actions=[],
     )
+    assert result.status == ProvisionStatus.UPDATED
+    client.reset_password.assert_called_once()
+    client.reset_otp.assert_called_once()
+    client.ensure_required_actions.assert_called_once_with(
+        "existing-id", ["UPDATE_PASSWORD"]
+    )
+    # ensure_required_actions phải chạy SAU reset_otp (vì reset_otp ghi đè list).
+    method_order = [
+        c[0] for c in client.mock_calls
+        if c[0] in ("reset_otp", "ensure_required_actions")
+    ]
+    assert method_order == ["reset_otp", "ensure_required_actions"]
+    assert "reset_password" in result.actions_applied
+    assert "require_action:UPDATE_PASSWORD" in result.actions_applied
+
+
+def test_provision_reset_password_requires_update_action():
+    """RESET_PASSWORD: gán required action UPDATE_PASSWORD để ép đổi sau đăng nhập."""
+    client = _client_existing_user()
+    user = _user()
+    result = _provision_one(
+        client,
+        user,
+        temporary=True,
+        on_conflict=OnConflictAction.RESET_PASSWORD,
+        default_required_actions=[],
+    )
+    assert result.status == ProvisionStatus.UPDATED
+    client.ensure_required_actions.assert_called_once_with(
+        "existing-id", ["UPDATE_PASSWORD"]
+    )
+    _args, kwargs = client.reset_password.call_args
+    assert kwargs.get("temporary") is True
+    assert "require_action:UPDATE_PASSWORD" in result.actions_applied
+
+
+def test_provision_existing_user_removes_unselected_role():
+    """User đã có 2 role trên Keycloak, bỏ 1 role thì phải gỡ role đó."""
+    client = _client_existing_user()
+    client.get_user_client_roles_optional.return_value = (
+        [
+            {"name": "banca-seller", "id": "id-seller"},
+            {"name": "banca-accounting-operator", "id": "id-acc"},
+        ],
+        None,
+    )
+    client.get_client_role.side_effect = (
+        lambda client_uuid, name: {"id": f"id-{name}", "name": name}
+    )
+    user = _user(roles=["banca-seller"], role="banca-seller")
+    result = _provision_one(
+        client,
+        user,
+        temporary=True,
+        on_conflict=OnConflictAction.SKIP,
+        default_required_actions=[],
+    )
+    assert result.status == ProvisionStatus.UPDATED
+    client.remove_client_roles_batch.assert_called_once()
+    args, kwargs = client.remove_client_roles_batch.call_args
+    removed = args[2] if len(args) > 2 else kwargs["roles"]
+    removed_names = {p["name"] for p in removed}
+    assert removed_names == {"banca-accounting-operator"}
+    assert "remove_role:banca-accounting-operator" in result.actions_applied
+    assert "role_already:banca-seller" in result.actions_applied
+
+
+def test_provision_existing_user_keeps_roles_when_lookup_forbidden():
+    """Khi không đọc được role hiện có (403) thì không gỡ role để tránh xóa nhầm."""
+    client = _client_existing_user()
+    client.get_user_client_roles_optional.return_value = ([], "403")
+    client.get_client_role.side_effect = (
+        lambda client_uuid, name: {"id": f"id-{name}", "name": name}
+    )
+    user = _user(roles=["banca-seller"], role="banca-seller")
+    result = _provision_one(
+        client,
+        user,
+        temporary=True,
+        on_conflict=OnConflictAction.SKIP,
+        default_required_actions=[],
+    )
+    assert result.status == ProvisionStatus.UPDATED
+    client.remove_client_roles_batch.assert_not_called()
 
 
 def test_provision_fails_without_role():
@@ -297,9 +418,14 @@ def test_provision_fails_without_role():
 
 def test_provision_created_when_role_assignment_forbidden():
     client = _client_new_user()
-    client.get_client_by_client_id.side_effect = users_router.KeycloakError(
-        "Tra client 'banca' thất bại (HTTP 403)"
-    )
+
+    def _assign_403(*_a, **_k):
+        raise users_router.KeycloakError(
+            "Gán client role (user x) thất bại (HTTP 403): forbidden"
+        )
+
+    client.assign_client_roles_batch.side_effect = _assign_403
+    client.assign_client_roles.side_effect = _assign_403
     user = _user(password="Pass@123")
     result = _provision_one(
         client,
@@ -310,6 +436,7 @@ def test_provision_created_when_role_assignment_forbidden():
     )
     assert result.status == ProvisionStatus.CREATED
     assert "assign_role_skipped:banca-seller" in result.actions_applied
+    assert "roles_assignment_failed:403" in result.actions_applied
 
 
 def test_build_keycloak_attributes_sop_fields():
@@ -324,3 +451,41 @@ def test_build_keycloak_attributes_sop_fields():
     assert attrs["phone"] == ["0982867163"]
     assert attrs["idNo"] == ["001234567890"]
     assert attrs["branchCode"] == ["1500"]
+
+def test_branch_code_digits_only():
+    from app.services.user_mapping import _parse_branch_code_digits, _parse_department_cell
+
+    assert _parse_branch_code_digits("6900") == "6900"
+    assert _parse_branch_code_digits("6900.0") == "6900"
+    assert _parse_branch_code_digits("6900 Hội sở") == "6900"
+    full, code, name = _parse_department_cell("6900")
+    assert code == "6900"
+    assert name == ""
+
+
+def test_map_sso_branch_from_digits_only_department():
+    table = _make_table(
+        [
+            "1",
+            "User Test",
+            "6900",
+            "TGILMP",
+            "081234567890",
+            "test@agribank.com.vn",
+            "0907809680",
+            "Quản trị",
+            "82204001",
+        ],
+        [],
+    )
+    users, _ = map_result_to_users(_make_result(table))
+    assert len(users) == 1
+    assert users[0].branch_code == "6900"
+
+
+def test_resolve_role_for_assign_passthrough():
+    from app.routers.users import _resolve_role_for_assign
+
+    assert _resolve_role_for_assign("banca-seller") == "banca-seller"
+    assert _resolve_role_for_assign("Quản trị") == "banca-admin"
+
