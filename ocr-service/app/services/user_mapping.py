@@ -33,8 +33,21 @@ _KNOWN_FIELDS = (
     "password",
 )
 
-# Layout form SSO Agribank (9 cột) khi postprocess đã bỏ dòng header.
-_SSO_DATA_COL_FIELDS: dict[int, str] = {
+# Layout form SSO Agribank Mẫu 01/SSO mới (10 cột) khi postprocess đã bỏ dòng header.
+_SSO_DATA_COL_FIELDS_10: dict[int, str] = {
+    1: "name",
+    2: "branch_code",
+    3: "branch_name",
+    4: "ipcas_code",
+    5: "cccd",
+    6: "email",
+    7: "phone",
+    8: "role",
+    9: "unit_code",
+}
+
+# Layout form SSO cũ (9 cột): Phòng/Đơn vị gộp mã CN + tên.
+_SSO_DATA_COL_FIELDS_9: dict[int, str] = {
     1: "name",
     2: "department_name",
     3: "ipcas_code",
@@ -48,14 +61,22 @@ _SSO_DATA_COL_FIELDS: dict[int, str] = {
 _SSO_COLUMN_LABELS: list[dict[str, str]] = [
     {"col": "0", "field": "stt", "label": "STT"},
     {"col": "1", "field": "name", "label": "Họ và tên"},
-    {"col": "2", "field": "department_name", "label": "Phòng/Đơn vị"},
-    {"col": "3", "field": "ipcas_code", "label": "User IPCAS"},
-    {"col": "4", "field": "cccd", "label": "Số CCCD"},
-    {"col": "5", "field": "email", "label": "Email tại Agribank"},
-    {"col": "6", "field": "phone", "label": "Số điện thoại"},
-    {"col": "7", "field": "role", "label": "Phân quyền"},
-    {"col": "8", "field": "unit_code", "label": "Ghi chú / Mã ĐV"},
+    {"col": "2", "field": "branch_code", "label": "Mã chi nhánh"},
+    {"col": "3", "field": "branch_name", "label": "Tên Chi nhánh"},
+    {"col": "4", "field": "ipcas_code", "label": "User IPCAS"},
+    {"col": "5", "field": "cccd", "label": "Số CCCD"},
+    {"col": "6", "field": "email", "label": "Email tại Agribank"},
+    {"col": "7", "field": "phone", "label": "SĐT"},
+    {"col": "8", "field": "role", "label": "Phân quyền"},
+    {"col": "9", "field": "unit_code", "label": "Mã liên ngân hàng"},
 ]
+
+
+def _sso_data_col_fields_for(num_cols: int) -> dict[int, str]:
+    """Chọn layout cột theo số cột bảng (10 = mẫu mới, 9 = mẫu cũ)."""
+    if num_cols >= 10:
+        return _SSO_DATA_COL_FIELDS_10
+    return _SSO_DATA_COL_FIELDS_9
 
 _UNIT_CODE_RE = re.compile(r"^\d{6,10}$")
 _DEPARTMENT_CODE_RE = re.compile(r"^(\d{4})\s+(.+)$")
@@ -63,6 +84,79 @@ _DEPARTMENT_CODE_RE = re.compile(r"^(\d{4})\s+(.+)$")
 
 def _normalize(text: str) -> str:
     return " ".join(str(text or "").strip().lower().split())
+
+
+def _normalize_header_key(text: str) -> str:
+    """Chuẩn hóa tiêu đề cột: lower, bỏ dấu tiếng Việt (để khớp alias)."""
+    s = str(text or "").strip().lower()
+    s = s.replace("đ", "d")
+    s = unicodedata.normalize("NFD", s)
+    s = "".join(c for c in s if unicodedata.category(c) != "Mn")
+    return " ".join(s.split())
+
+
+def _normalize_phone(raw: str) -> str:
+    """Bỏ khoảng trắng, dấu chấm, gạch ngang trong SĐT."""
+    return re.sub(r"[\s.\-]", "", (raw or "").strip())
+
+
+def _header_cell_matches_field(norm_cell: str, aliases: list[str]) -> bool:
+    if not norm_cell:
+        return False
+    # Ô dữ liệu (email, số thuần) — không phải tiêu đề cột
+    if "@" in norm_cell:
+        return False
+    if re.fullmatch(r"[\d.\s\-]+", norm_cell):
+        return False
+    if norm_cell in aliases:
+        return True
+    for alias in aliases:
+        if len(alias) < 4:
+            continue
+        if alias in norm_cell or norm_cell in alias:
+            return True
+    return False
+
+
+def _map_header_sufficient(col_to_field: dict[str, int]) -> bool:
+    """Cần ít nhất 2 trường quan trọng mới coi là dòng tiêu đề."""
+    keys = ("username", "email", "ipcas_code", "name", "cccd", "phone", "role")
+    return sum(1 for k in keys if k in col_to_field) >= 2
+
+
+def _is_column_number_row(row: list[str]) -> bool:
+    """Dòng đánh số cột (1)(2)… — không nhầm với dòng dữ liệu STT=1."""
+    vals = [str(c or "").strip() for c in row if str(c or "").strip()]
+    if len(vals) < 3:
+        return False
+    paren = re.compile(r"^\(?\d{1,2}\)?$")
+    hits = sum(1 for v in vals if paren.match(v))
+    # Dòng số cột: hầu hết ô chỉ là số thứ tự cột, không có tên/email
+    return hits >= 3 and hits >= len(vals) * 0.8
+
+
+def _strip_sso_preamble_rows(matrix: list[list[str]]) -> list[list[str]]:
+    """Bỏ dòng tiêu đề SSO và dòng đánh số cột (1)(2)… ở đầu bảng."""
+    rows = list(matrix)
+    while rows:
+        if _is_column_number_row(rows[0]):
+            rows = rows[1:]
+            continue
+        hits = 0
+        alias_map = settings.keycloak_header_map_parsed
+        for cell in rows[0][:12]:
+            norm = _normalize_header_key(cell)
+            if not norm:
+                continue
+            for field in _KNOWN_FIELDS:
+                if _header_cell_matches_field(norm, alias_map.get(field, [])):
+                    hits += 1
+                    break
+        if hits >= 4:
+            rows = rows[1:]
+            continue
+        break
+    return rows
 
 
 def _normalize_role_alias(text: str) -> str:
@@ -298,26 +392,53 @@ def _map_header(header: list[str]) -> dict[str, int]:
     alias_map = settings.keycloak_header_map_parsed
     col_to_field: dict[str, int] = {}
     for col_idx, title in enumerate(header):
-        norm = _normalize(title)
+        norm = _normalize_header_key(title)
         if not norm:
             continue
+        best_field = ""
+        best_alias_len = 0
         for field in _KNOWN_FIELDS:
-            aliases = alias_map.get(field, [])
-            if norm in aliases and field not in col_to_field:
-                col_to_field[field] = col_idx
-                break
+            for alias in alias_map.get(field, []):
+                if not _header_cell_matches_field(norm, [alias]):
+                    continue
+                if len(alias) > best_alias_len:
+                    best_field = field
+                    best_alias_len = len(alias)
+        if best_field and best_field not in col_to_field:
+            col_to_field[best_field] = col_idx
     return col_to_field
 
 
 def _is_sso_data_first_row(row: list[str]) -> bool:
     if not row:
         return False
-    return bool(re.match(r"^\d{1,3}$", (row[0] or "").strip()))
+    if re.match(r"^\d{1,3}$", (row[0] or "").strip()):
+        return True
+    if len(row) < 5:
+        return False
+    ipcas = (row[4] or "").strip().upper()
+    if ipcas.startswith("QSO"):
+        return True
+    if len(row) < 8:
+        return False
+    name = (row[1] or "").strip()
+    if not name or name.isascii() or len(name) < 3:
+        return False
+    ipcas = (row[4] or "").strip()
+    cccd = re.sub(r"\D", "", row[5] or "")
+    email = (row[6] or "").strip().lower()
+    if len(cccd) >= 9:
+        return True
+    if ipcas and re.fullmatch(r"[A-Z0-9]{4,16}", ipcas.upper()):
+        return True
+    if "@agribank" in email or email.endswith("@agribank.com.vn"):
+        return True
+    return False
 
 
 def _sso_data_col_map(num_cols: int) -> dict[str, int]:
     out: dict[str, int] = {}
-    for col_idx, field in _SSO_DATA_COL_FIELDS.items():
+    for col_idx, field in _sso_data_col_fields_for(num_cols).items():
         if col_idx < num_cols:
             out[field] = col_idx
     return out
@@ -338,15 +459,33 @@ def _resolve_col_map(matrix: list[list[str]]) -> tuple[dict[str, int], int]:
     if len(matrix) < 1:
         return {}, 0
 
-    header = matrix[0]
-    col_to_field = _map_header(header)
-    if "username" in col_to_field or "email" in col_to_field:
-        return col_to_field, 1
+    scan_limit = min(6, len(matrix))
+    for row_idx in range(scan_limit):
+        row = matrix[row_idx]
+        if _is_column_number_row(row):
+            continue
+        col_to_field = _map_header(row)
+        if _map_header_sufficient(col_to_field):
+            data_start = row_idx + 1
+            while data_start < len(matrix) and _is_column_number_row(matrix[data_start]):
+                data_start += 1
+            return col_to_field, data_start
 
-    if _is_sso_data_first_row(header) and len(header) >= 6:
-        return _sso_data_col_map(len(header)), 0
+    for row_idx, row in enumerate(matrix):
+        if _is_column_number_row(row):
+            continue
+        if _is_sso_data_first_row(row) and len(row) >= 8:
+            return _sso_data_col_map(len(row)), row_idx
 
-    return col_to_field, 1
+    return {}, 0
+
+
+def table_has_user_columns(matrix: list[list[str]]) -> bool:
+    """Bảng có đủ cột để map user (email/username/ipcas hoặc layout SSO)."""
+    if len(matrix) < 1:
+        return False
+    col_map, _ = _resolve_col_map(matrix)
+    return any(f in col_map for f in ("username", "email", "ipcas_code"))
 
 
 def _compose_name(first_name: str, last_name: str, full_name: str) -> str:
@@ -407,7 +546,7 @@ def validate_user_field_errors(user: KeycloakUserInput) -> dict[str, str]:
     if user.cccd and not re.fullmatch(r"\d{12}", user.cccd):
         errors["cccd"] = "CCCD phải có 12 số"
 
-    if user.phone and not re.fullmatch(r"0\d{8,10}", user.phone):
+    if user.phone and not re.fullmatch(r"0\d{8,10}", _normalize_phone(user.phone)):
         errors["phone"] = "SĐT không hợp lệ"
 
     email = (user.email or "").strip()
@@ -469,16 +608,18 @@ def map_table_to_users(
         return [], warnings
 
     col_to_field, data_start = _resolve_col_map(matrix)
-    if "username" not in col_to_field and "email" not in col_to_field:
+    if not any(f in col_to_field for f in ("username", "email", "ipcas_code")):
         warnings.append(
-            f"Bảng {table.table_index + 1}: không tìm thấy cột email/username "
-            f"(cần header hoặc form SSO 9 cột). Bỏ qua bảng này."
+            f"Bảng {table.table_index + 1}: không tìm thấy cột email/username/ipcas "
+            f"(cần header hoặc form SSO 10 cột). Bỏ qua bảng này."
         )
         return [], warnings
 
     users: list[KeycloakUserInput] = []
     for row_idx in range(data_start, len(matrix)):
         row = matrix[row_idx]
+        if _is_column_number_row(row):
+            continue
 
         def _val(field: str) -> str:
             idx = col_to_field.get(field)
@@ -489,6 +630,8 @@ def map_table_to_users(
                 return _extract_cccd_from_cell(raw)
             if field == "branch_code":
                 return _parse_branch_code_digits(raw)
+            if field == "phone":
+                return _normalize_phone(raw)
             if field == "role":
                 return raw
             if field == "unit_code":
@@ -529,6 +672,10 @@ def map_table_to_users(
 
         role_raw = _val("role")
         parsed_roles = normalize_roles(role_raw)
+        branch_code_val = _val("branch_code") or parsed_branch_code
+        if not branch_code_val and dept_raw:
+            branch_code_val = _parse_branch_code_digits(dept_raw)
+
         user = KeycloakUserInput(
             username=username or email,
             email=email or username,
@@ -537,8 +684,8 @@ def map_table_to_users(
             last_name=last_name,
             cccd=_val("cccd"),
             branch_name=_val("branch_name") or parsed_branch_name,
-            department_name=dept_name,
-            branch_code=_val("branch_code") or parsed_branch_code,
+            department_name=dept_name or _val("branch_name") or parsed_branch_name,
+            branch_code=branch_code_val,
             agent_code=_val("agent_code"),
             ipcas_code=ipcas,
             phone=_val("phone"),
@@ -588,7 +735,7 @@ def map_result_to_users(
 def _sso_col_field_map(num_cols: int) -> dict[int, str]:
     """Map column index -> field name for SSO layout."""
     out: dict[int, str] = {0: "stt"}
-    for col_idx, field in _SSO_DATA_COL_FIELDS.items():
+    for col_idx, field in _sso_data_col_fields_for(num_cols).items():
         if col_idx < num_cols:
             out[col_idx] = field
     return out
@@ -603,7 +750,7 @@ def _validate_cell_for_field(field: str, text: str, confidence: float) -> str:
         return f"Thiếu {label}"
     if field == "cccd" and not re.fullmatch(r"\d{12}", re.sub(r"\s", "", text)):
         return "CCCD phải có 12 số"
-    if field == "phone" and not re.fullmatch(r"0\d{8,10}", re.sub(r"\s", "", text)):
+    if field == "phone" and not re.fullmatch(r"0\d{8,10}", _normalize_phone(text)):
         return "SĐT không hợp lệ"
     if field in ("name", "first_name") and re.search(r"\d", text):
         return "Tên chứa chữ số"
@@ -643,9 +790,9 @@ def validate_ocr_result(result: OcrResult) -> dict:
                 ]
                 alias_map = settings.keycloak_header_map_parsed
                 for hc in header_row:
-                    norm = _normalize(hc.text)
+                    norm = _normalize_header_key(hc.text)
                     for field in _KNOWN_FIELDS:
-                        if norm in alias_map.get(field, []):
+                        if _header_cell_matches_field(norm, alias_map.get(field, [])):
                             col_fields[hc.col] = field
                             break
 

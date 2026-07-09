@@ -14,6 +14,7 @@ from openpyxl.utils import get_column_letter
 
 from app.config import settings
 from app.models.schemas import CellData, OcrResult, PageResult, TableData
+from app.services.user_mapping import _normalize_header_key, _strip_sso_preamble_rows
 
 logger = logging.getLogger(__name__)
 
@@ -47,13 +48,16 @@ NORMAL_ALIGNMENT = Alignment(
 
 
 SSO_HEADERS = [
-    "STT", "Ho va ten", "Phong/Don vi", "Ma CN", "User IPCAS", "So CCCD",
-    "Email tai Agribank", "So dien thoai", "Phan quyen", "Ghi chu / Ma DV",
+    "STT", "Ho va ten", "Ma chi nhanh", "Ten Chi nhanh", "User IPCAS", "So CCCD",
+    "Email tai Agribank", "SDT", "Phan quyen", "Ma lien ngan hang",
     "Vai tro (goi y)",
 ]
 
-# OCR grid col index -> Excel export column (after Ma CN insert at col 3).
-_SSO_GRID_TO_EXCEL_COL = {
+# OCR grid col index -> Excel export column (mẫu 10 cột mới).
+_SSO_GRID_TO_EXCEL_COL_10 = {i: i for i in range(10)}
+
+# Mẫu cũ 9 cột -> cột Excel mới (tách Phòng/Đơn vị thành Mã CN + Tên CN khi export).
+_SSO_GRID_TO_EXCEL_COL_9 = {
     0: 0, 1: 1, 2: 2, 3: 4, 4: 5, 5: 6, 6: 7, 7: 8, 8: 9,
 }
 
@@ -69,11 +73,21 @@ THIN_BORDER = Border(
 
 def _export_sso_sheet(ws, table, threshold: float, start_row: int = 1) -> int:
     from app.services.email_reconcile import email_mismatch_with_ipcas, email_needs_review
-    from app.services.user_mapping import _parse_branch_code_digits, normalize_roles
+    from app.services.user_mapping import (
+        _parse_branch_code_digits,
+        _parse_department_cell,
+        normalize_roles,
+    )
 
     grid = {}
     for cell in table.cells:
         grid[(cell.row, cell.col)] = (cell.text, cell.confidence)
+    is_new_layout = table.num_cols >= 10
+    grid_to_excel = _SSO_GRID_TO_EXCEL_COL_10 if is_new_layout else _SSO_GRID_TO_EXCEL_COL_9
+    email_grid_col = 6 if is_new_layout else 5
+    role_grid_col = 8 if is_new_layout else 7
+    ipcas_grid_col = 4 if is_new_layout else 3
+
     row = start_row
     for c, title in enumerate(SSO_HEADERS):
         cell = ws.cell(row=row, column=c + 1)
@@ -85,10 +99,14 @@ def _export_sso_sheet(ws, table, threshold: float, start_row: int = 1) -> int:
     data_rows = max(table.num_rows, 1)
     for r in range(data_rows):
         dept_text, _ = grid.get((r, 2), ("", 1.0))
-        branch_code = _parse_branch_code_digits(dept_text)
-        ipcas = grid.get((r, 3), ("", 1.0))[0]
-        email_text, email_conf = grid.get((r, 5), ("", 1.0))
-        role_text, role_conf = grid.get((r, 7), ("", 1.0))
+        branch_code = (
+            grid.get((r, 2), ("", 1.0))[0].strip()
+            if is_new_layout
+            else _parse_branch_code_digits(dept_text)
+        )
+        ipcas = grid.get((r, ipcas_grid_col), ("", 1.0))[0]
+        email_text, email_conf = grid.get((r, email_grid_col), ("", 1.0))
+        role_text, role_conf = grid.get((r, role_grid_col), ("", 1.0))
         role_suggested = ";".join(normalize_roles(role_text)) if role_text else ""
         email_mismatch = bool(ipcas and email_text and email_mismatch_with_ipcas(email_text, ipcas))
         email_uncertain = bool(email_text and email_needs_review(email_text))
@@ -99,8 +117,14 @@ def _export_sso_sheet(ws, table, threshold: float, start_row: int = 1) -> int:
             ws_cell.alignment = NORMAL_ALIGNMENT
             ws_cell.border = THIN_BORDER
 
-            if excel_c == 3:
-                ws_cell.value = branch_code
+            if excel_c == 2 and not is_new_layout:
+                _, bc, _ = _parse_department_cell(dept_text)
+                ws_cell.value = bc or branch_code
+                ws_cell.font = NORMAL_FONT
+                continue
+            if excel_c == 3 and not is_new_layout:
+                _, _, bn = _parse_department_cell(dept_text)
+                ws_cell.value = bn or dept_text
                 ws_cell.font = NORMAL_FONT
                 continue
             if excel_c == 10:
@@ -112,15 +136,15 @@ def _export_sso_sheet(ws, table, threshold: float, start_row: int = 1) -> int:
                     ws_cell.font = NORMAL_FONT
                 continue
 
-            grid_c = next((g for g, e in _SSO_GRID_TO_EXCEL_COL.items() if e == excel_c), None)
+            grid_c = next((g for g, e in grid_to_excel.items() if e == excel_c), None)
             if grid_c is None:
                 continue
             text_val, conf = grid.get((r, grid_c), ("", 1.0))
             ws_cell.value = text_val
-            if grid_c == 5 and (email_mismatch or email_uncertain):
+            if grid_c == email_grid_col and (email_mismatch or email_uncertain):
                 ws_cell.fill = EMAIL_MISMATCH_FILL
                 ws_cell.font = EMAIL_MISMATCH_FONT
-            elif grid_c == 7 and role_unmapped:
+            elif grid_c == role_grid_col and role_unmapped:
                 ws_cell.fill = ROLE_UNMAPPED_FILL
                 ws_cell.font = LOW_CONFIDENCE_FONT
             elif conf < threshold:
@@ -133,20 +157,16 @@ def _export_sso_sheet(ws, table, threshold: float, start_row: int = 1) -> int:
 
 
 def _norm_excel_header(val: str) -> str:
-    import unicodedata
-
-    s = str(val or "").strip().lower()
-    s = s.replace("đ", "d")
-    s = unicodedata.normalize("NFD", s)
-    s = "".join(c for c in s if unicodedata.category(c) != "Mn")
-    return " ".join(s.split())
+    return _normalize_header_key(val)
 
 
 def _is_sso_header_row(row: list[str]) -> bool:
     aliases = {
-        "stt", "ho va ten", "phong/don vi", "ma cn", "user ipcas", "so cccd",
-        "email", "email tai agribank", "so dien thoai", "phan quyen",
-        "ghi chu / ma dv", "vai tro (goi y)",
+        "stt", "ho va ten", "ma chi nhanh", "ten chi nhanh", "user ipcas", "so cccd",
+        "email", "email tai agribank", "sdt", "so dien thoai", "phan quyen",
+        "ma lien ngan hang", "ghi chu / ma dv",
+        # Mẫu cũ
+        "phong/don vi", "ma cn",
     }
     hits = sum(1 for cell in row[:12] if _norm_excel_header(cell) in aliases)
     return hits >= 4
@@ -390,10 +410,7 @@ def _read_matrix(ws, start_row: int, end_row: int) -> list[list[str]]:
 
 
 def _matrix_to_table(matrix: list[list[str]], table_index: int) -> TableData:
-    if matrix and _is_sso_header_row(matrix[0]):
-        matrix = matrix[1:]
-
-    """Convert 2D string matrix to TableData."""
+    matrix = _strip_sso_preamble_rows(matrix)
     num_rows = len(matrix)
     num_cols = max((len(r) for r in matrix), default=0)
     cells: list[CellData] = []

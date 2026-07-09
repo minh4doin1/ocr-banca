@@ -3,10 +3,19 @@
  * Phụ thuộc app.js: API_BASE, jobId, setStep, stopPolling, notify, escapeAttr, btnCreateBatch, successBatchCode, successTotalRecords
  */
 
-const SSO_COL_FIELDS = {
+const SSO_COL_FIELDS_10 = {
+    0: 'stt', 1: 'name', 2: 'branch_code', 3: 'branch_name', 4: 'ipcas_code',
+    5: 'cccd', 6: 'email', 7: 'phone', 8: 'role', 9: 'unit_code',
+};
+
+const SSO_COL_FIELDS_9 = {
     0: 'stt', 1: 'name', 2: 'department_name', 3: 'ipcas_code',
     4: 'cccd', 5: 'email', 6: 'phone', 7: 'role', 8: 'unit_code',
 };
+
+function getSsoColFields(numCols) {
+    return numCols >= 10 ? SSO_COL_FIELDS_10 : SSO_COL_FIELDS_9;
+}
 
 let fieldConfig = null;
 let enrichedUsers = [];
@@ -61,9 +70,10 @@ function normalizeHeader(t) {
 }
 
 function getTableColFieldMap(table) {
-    if (table?.table_kind === 'sso_agribank' || table?.num_cols === 9) {
+    if (table?.table_kind === 'sso_agribank' || table?.num_cols >= 9) {
         const map = {};
-        Object.entries(SSO_COL_FIELDS).forEach(([col, field]) => {
+        const colFields = getSsoColFields(table.num_cols);
+        Object.entries(colFields).forEach(([col, field]) => {
             if (+col < table.num_cols) map[+col] = field;
         });
         return map;

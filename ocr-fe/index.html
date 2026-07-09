@@ -58,15 +58,59 @@
                 <div class="card upload-panel">
                     <input type="file" id="file-input" accept=".pdf" hidden>
                     <input type="file" id="excel-input" accept=".xlsx,.xlsm" hidden>
+                    <input type="file" id="docx-input" accept=".docx" hidden>
+                    <input type="file" id="any-input" accept=".pdf,.docx,.xlsx,.xlsm" hidden>
 
                     <div class="upload-file-row">
                         <button type="button" class="btn btn-primary btn-sm" id="select-btn">Chọn PDF</button>
                         <button type="button" class="btn btn-outline btn-sm" id="select-excel-btn">Nạp Excel</button>
+                        <button type="button" class="btn btn-outline btn-sm" id="select-docx-btn">Nạp Word</button>
                         <button type="button" class="btn btn-ghost btn-sm" id="btn-clear-file">Xóa file</button>
                         <span class="file-name" id="file-name-label">Chưa chọn file</span>
-                        <div class="drop-hint" id="drop-zone">Kéo thả PDF vào đây</div>
                     </div>
-                    <p class="excel-direct-hint">Đã có file Excel chuẩn? Bấm <strong>Nạp Excel</strong> để bỏ qua OCR và vào thẳng bước kiểm tra.</p>
+
+                    <div class="drop-zone-large" id="drop-zone">
+                        <span class="drop-zone-icon" aria-hidden="true">⬆</span>
+                        <span class="drop-zone-title">Kéo thả file vào đây</span>
+                        <span class="drop-zone-sub">Hỗ trợ <strong>PDF</strong> · <strong>Word (.docx)</strong> · <strong>Excel (.xlsx/.xlsm)</strong></span>
+                        <span class="drop-zone-note">PDF có text → đọc trực tiếp · PDF scan → OCR · Word/Excel gốc chính xác nhất</span>
+                    </div>
+
+                    <details class="format-guide" id="format-guide">
+                        <summary>Hướng dẫn format bảng chuẩn (Excel / Word)</summary>
+                        <div class="format-guide-body">
+                            <p class="format-guide-intro">
+                                PDF <strong>có lớp text</strong> (in từ Word/Excel) sẽ được đọc trực tiếp, không qua OCR.
+                                PDF <strong>scan/ảnh</strong> mới cần OCR. Nếu có file Word/Excel gốc, nạp trực tiếp để chính xác tuyệt đối.
+                                File Excel/Word cần chứa <strong>một bảng</strong> với <strong>dòng tiêu đề (header)</strong> ở trên cùng.
+                                Đặt tên cột theo đúng danh sách dưới đây để hệ thống nhận diện. Thứ tự cột có thể khác,
+                                miễn là tên cột khớp.
+                            </p>
+                            <table class="format-guide-table">
+                                <thead>
+                                    <tr><th>Cột (tiêu đề gợi ý)</th><th>Bắt buộc</th><th>Ghi chú</th></tr>
+                                </thead>
+                                <tbody>
+                                    <tr><td>STT</td><td>—</td><td>Số thứ tự (tùy chọn)</td></tr>
+                                    <tr><td>Họ và tên</td><td class="req">Có</td><td>Họ tên đầy đủ</td></tr>
+                                    <tr><td>Mã chi nhánh</td><td class="req">Có</td><td>Mã CN 4 số, vd: <code>6900</code></td></tr>
+                                    <tr><td>Tên Chi nhánh</td><td>—</td><td>Tên chi nhánh, vd: Hội sở Agribank CN Tiền Giang</td></tr>
+                                    <tr><td>User IPCAS</td><td class="req">Có</td><td>Mã IPCAS</td></tr>
+                                    <tr><td>Số CCCD</td><td class="req">Có</td><td>Đúng 12 chữ số</td></tr>
+                                    <tr><td>Email tại Agribank</td><td class="req">Có</td><td>Kết thúc bằng <code>@agribank.com.vn</code></td></tr>
+                                    <tr><td>SĐT</td><td class="req">Có</td><td>Bắt đầu bằng <code>0</code></td></tr>
+                                    <tr><td>Phân quyền</td><td class="req">Có</td><td>Quản trị / Đại lý viên / Kế toán viên / Phê duyệt viên</td></tr>
+                                    <tr><td>Mã liên ngân hàng</td><td>—</td><td>Mã 8 chữ số (nếu có)</td></tr>
+                                </tbody>
+                            </table>
+                            <p class="format-guide-note">
+                                Cần tối thiểu cột <strong>Email tại Agribank</strong> (hoặc <strong>User IPCAS</strong> để tự suy ra email) thì bảng mới được nhận.
+                                Mẫu <strong>Mẫu 01/SSO</strong> có <strong>10 cột</strong> — đặt đúng thứ tự hoặc dùng tiêu đề cột như bảng trên.
+                            </p>
+                        </div>
+                    </details>
+
+                    <p class="excel-direct-hint">Đã có file Excel hoặc Word (.docx) chuẩn? Bấm <strong>Nạp Excel</strong> / <strong>Nạp Word</strong> để bỏ qua OCR và vào thẳng bước kiểm tra — dữ liệu đọc trực tiếp nên chính xác hơn OCR.</p>
 
                     <div class="upload-settings" id="upload-settings">
                         <div class="option-group">
@@ -195,6 +239,9 @@
                             <button type="button" class="btn btn-primary btn-sm" id="btn-download-pages-excel" disabled>
                                 Tải Excel trang đã chọn
                             </button>
+                            <button type="button" class="btn btn-outline btn-sm" id="btn-download-pages-docx" disabled>
+                                Tải Word trang đã chọn
+                            </button>
                             <span class="page-export-hint" id="page-export-hint"></span>
                         </div>
                     </div>
@@ -202,14 +249,17 @@
                     <div class="excel-complete-panel hidden" id="excel-complete-panel">
                         <h3>OCR hoàn tất — Bước tiếp theo</h3>
                         <ol class="excel-steps">
-                            <li>Tải file Excel bên dưới</li>
-                            <li>Sửa dữ liệu trên Excel (email, role, mã CN…)</li>
-                            <li>Upload lại file Excel đã sửa</li>
+                            <li>Tải file Excel hoặc Word bên dưới</li>
+                            <li>Sửa dữ liệu trên file đã tải (email, role, mã CN…)</li>
+                            <li>Upload lại file Excel hoặc Word đã sửa</li>
                         </ol>
                         <div class="excel-actions">
                             <button type="button" class="btn btn-primary" id="btn-download-excel">Tải Excel</button>
+                            <button type="button" class="btn btn-outline" id="btn-download-docx">Tải Word</button>
                             <button type="button" class="btn btn-outline" id="btn-reupload-excel">Upload Excel đã sửa</button>
+                            <button type="button" class="btn btn-outline" id="btn-reupload-docx">Upload Word đã sửa</button>
                             <input type="file" id="excel-input-reupload" accept=".xlsx,.xlsm" hidden>
+                            <input type="file" id="docx-input-reupload" accept=".docx" hidden>
                         </div>
                     </div>
                 </div>
@@ -406,7 +456,7 @@
 
     <div id="notification-center" class="notification-center" aria-live="polite"></div>
 
-    <script src="app.js?v=15"></script>
-    <script src="batch-users.js?v=9"></script>
+    <script src="app.js?v=17"></script>
+    <script src="batch-users.js?v=10"></script>
 </body>
 </html>

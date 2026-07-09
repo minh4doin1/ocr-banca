@@ -112,7 +112,7 @@ class TableData(BaseModel):
     html: str = Field(default="", description="Table as HTML (from PP-Structure)")
     table_kind: str = Field(
         default="",
-        description="sso_agribank when Agribank SSO 9-column form detected",
+        description="sso_agribank when Agribank SSO 10-column form detected",
     )
 
 

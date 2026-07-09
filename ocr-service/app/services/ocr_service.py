@@ -1178,7 +1178,11 @@ def _row_looks_like_fragment_continuation(
             if not _is_email_domain_fragment(t)
             and not _is_cccd_date_fragment(t)
         ]
-        if all(col in (1, 2, 7, 8) for col in non_frag_cols):
+        if 4 in non_frag_cols:
+            return False
+        if 3 in non_frag_cols and len(non_frag_cols) >= 2:
+            return False
+        if non_frag_cols and all(col in (1, 2, 3, 7, 8, 9) for col in non_frag_cols):
             return True
         return len(lower_cols) <= 2
 
@@ -1192,7 +1196,7 @@ def _row_looks_like_fragment_continuation(
         return any(_is_vietnamese_name_fragment(lower_cols[c]) for c in name_cols)
 
     role_cols = set(lower_cols.keys()) - {0}
-    if role_cols <= {7, 8} and any(
+    if role_cols <= {7, 8, 9} and any(
         "viên" in t.lower() or t.lower() in ("viên", "vien", "vi")
         for t in lower_texts
     ):
@@ -1428,6 +1432,37 @@ def _sso_email_domain() -> str:
     return dom if dom.startswith("@") else f"@{dom}"
 
 
+def _sso_layout_from_header_text(text: str) -> int:
+    """10 = mẫu SSO mới (Mã/Tên chi nhánh tách); 9 = mẫu cũ (Phòng/Đơn vị)."""
+    combined = _normalize_match_text(text)
+    if any(k in combined for k in ("machinh", "tenchinhanh", "maliennganhang")):
+        return 10
+    if ("phong" in combined or "donvi" in combined) and "machinh" not in combined:
+        return 9
+    return 10
+
+
+def _sso_layout_col_count(
+    cells: list[CellData] | None, num_cols: int = 0
+) -> int:
+    """Số cột layout SSO (9 hoặc 10) — ưu tiên tiêu đề, không chỉ đếm cột lưới."""
+    if cells:
+        header_bits: list[str] = []
+        for c in cells:
+            if c.row > 2:
+                break
+            header_bits.append(c.text)
+        layout = _sso_layout_from_header_text(" ".join(header_bits))
+        if layout == 9 or any(
+            k in _normalize_match_text(" ".join(header_bits))
+            for k in ("machinh", "tenchinhanh", "maliennganhang", "phong", "donvi")
+        ):
+            return layout
+    if num_cols >= 10:
+        return 10
+    return 9
+
+
 def _resolve_sso_email_col(num_cols: int, cells: list[CellData] | None = None) -> int | None:
     """Return email column index for Agribank SSO grid."""
     if cells:
@@ -1436,9 +1471,8 @@ def _resolve_sso_email_col(num_cols: int, cells: list[CellData] | None = None) -
             return email_col
     if settings.ocr_sso_email_col >= 0:
         return settings.ocr_sso_email_col
-    if num_cols >= 7:
-        return 5
-    return None
+    layout = _sso_layout_col_count(cells, num_cols)
+    return 6 if layout >= 10 else 5
 
 
 def _find_role_col(cells: list[CellData]) -> int | None:
@@ -1447,12 +1481,10 @@ def _find_role_col(cells: list[CellData]) -> int | None:
         if c.row > 1:
             break
         low = _normalize_match_text(c.text)
-        if any(k in low for k in ("phan quyen", "vai tro", "role", "quyen")):
+        if any(k in low for k in ("phanquyen", "vaitro", "role", "quyen")):
             return c.col
-    max_col = max((c.col for c in cells), default=0)
-    if max_col + 1 >= 8:
-        return 7
-    return None
+    layout = _sso_layout_col_count(cells, max((c.col for c in cells), default=0) + 1)
+    return 8 if layout >= 10 else 7
 
 
 def _enhance_cell_for_ocr(crop: np.ndarray, *, col_kind: str = "default") -> np.ndarray:
@@ -1501,8 +1533,15 @@ def _recognize_critical_cell(
     *,
     col_kind: str,
 ) -> tuple[str, float]:
-    """Second-pass ensemble OCR for email/role columns."""
+    """Second-pass ensemble OCR for SSO critical columns."""
     enhanced = _enhance_cell_for_ocr(crop, col_kind=col_kind)
+
+    if col_kind in ("ipcas", "cccd", "phone", "branch"):
+        text, conf = _recognize_with_paddle_cell(enhanced)
+        if text.strip():
+            return text.strip(), conf
+        return _recognize_with_vietocr(enhanced)
+
     candidates: list[tuple[str, float]] = []
 
     v_text, v_conf = _recognize_with_vietocr(enhanced)
@@ -1533,20 +1572,70 @@ def _recognize_critical_cell(
     return best[0], best[1]
 
 
+def _sso_cell_needs_pass2(text: str, kind: str) -> bool:
+    """Chỉ chạy pass-2 Paddle khi VietOCR sai rõ ràng."""
+    import re
+
+    t = (text or "").strip()
+    if not t:
+        return True
+    if _is_gibberish_text(t) or _is_hallucinated_ocr_line(t):
+        return True
+    if kind == "ipcas":
+        if _is_gibberish_text(t) or _is_hallucinated_ocr_line(t):
+            return True
+        compact = re.sub(r"\s", "", t.upper())
+        if not re.fullmatch(r"[A-Z][A-Z0-9]{3,15}", compact):
+            return True
+        return not compact.startswith("QSO")
+    if kind == "cccd":
+        return len(re.sub(r"\D", "", t)) < 9
+    if kind == "phone":
+        digits = re.sub(r"\D", "", t)
+        return not re.fullmatch(r"0\d{8,10}", digits)
+    if kind == "branch":
+        digits = re.sub(r"\D", "", t)
+        if not re.fullmatch(r"\d{3,5}", digits):
+            return True
+        # Mã CN SSO thường 3526, 6900… — 4 chữ số; OCR hay đọc sai 1-2 số
+        if len(digits) == 4:
+            return False
+        return True
+    if kind == "email":
+        return "@" not in t or not _extract_sso_email_local(t)
+    return False
+
+
 def _refine_sso_critical_columns(
     image: np.ndarray,
     cells: list[CellData],
 ) -> list[CellData]:
-    """Re-OCR email and role columns with upscale (pass 2)."""
+    """Re-OCR IPCAS/CCCD/email/SĐT/role với upscale + Paddle (pass 2)."""
     if not settings.ocr_sso_pass2_enabled or not cells:
         return cells
 
     max_col = max(c.col for c in cells)
-    email_col = _resolve_sso_email_col(max_col + 1, cells)
+    num_cols = max_col + 1
+    email_col = _resolve_sso_email_col(num_cols, cells)
     role_col = _find_role_col(cells)
-    critical = {c for c in (email_col, role_col) if c is not None}
+    paddle_cols = _sso_paddle_first_cols(num_cols)
+    critical = set(paddle_cols)
+    if email_col is not None:
+        critical.add(email_col)
+    if role_col is not None:
+        critical.add(role_col)
     if not critical:
         return cells
+
+    col_kind_map: dict[int, str] = {}
+    if num_cols >= 10:
+        col_kind_map.update({4: "ipcas", 5: "cccd", 7: "phone", 2: "branch"})
+    else:
+        col_kind_map.update({3: "ipcas", 4: "cccd", 6: "phone", 2: "branch"})
+    if email_col is not None:
+        col_kind_map[email_col] = "email"
+    if role_col is not None:
+        col_kind_map[role_col] = "role"
 
     header_rows = {c.row for c in cells if c.row <= 1}
     out: list[CellData] = []
@@ -1565,7 +1654,10 @@ def _refine_sso_critical_columns(
             out.append(c)
             continue
 
-        kind = "email" if c.col == email_col else "role"
+        kind = col_kind_map.get(c.col, "default")
+        if kind != "role" and not _sso_cell_needs_pass2(c.text, kind):
+            out.append(c)
+            continue
         text, conf = _recognize_critical_cell(crop, col_kind=kind)
         if not text.strip():
             out.append(c)
@@ -1583,6 +1675,47 @@ def _refine_sso_critical_columns(
                 row=c.row,
                 col=c.col,
                 text=text,
+                confidence=max(c.confidence, conf),
+                bbox=c.bbox,
+            )
+        )
+    return out
+
+
+def _refine_sso_branch_column(
+    image: np.ndarray,
+    cells: list[CellData],
+) -> list[CellData]:
+    """Pass-2 Paddle cho cột mã chi nhánh (col 2) — VietOCR hay đọc sai số."""
+    import re
+
+    branch_col = 2
+    header_rows = {c.row for c in cells if c.row <= 1}
+    out: list[CellData] = []
+    for c in cells:
+        if c.col != branch_col or c.row in header_rows or not c.bbox or len(c.bbox) < 4:
+            out.append(c)
+            continue
+        x1, y1, x2, y2 = [int(v) for v in c.bbox[:4]]
+        crop = image[
+            max(0, y1 - 2) : min(image.shape[0], y2 + 2),
+            max(0, x1 - 2) : min(image.shape[1], x2 + 2),
+        ]
+        if crop.size == 0:
+            out.append(c)
+            continue
+        if not _sso_cell_needs_pass2(c.text, "branch"):
+            out.append(c)
+            continue
+        text, conf = _recognize_with_paddle_cell(crop)
+        if not text.strip():
+            out.append(c)
+            continue
+        out.append(
+            CellData(
+                row=c.row,
+                col=c.col,
+                text=text.strip(),
                 confidence=max(c.confidence, conf),
                 bbox=c.bbox,
             )
@@ -2275,6 +2408,9 @@ _SSO_HEADER_KEYWORDS = (
     "stt",
     "hovaten",
     "hoten",
+    "machi nhanh",
+    "machinh",
+    "tenchinhanh",
     "phong",
     "donvi",
     "ipcas",
@@ -2283,6 +2419,7 @@ _SSO_HEADER_KEYWORDS = (
     "sdt",
     "phanquyen",
     "ghichu",
+    "maliennganhang",
 )
 
 
@@ -2636,6 +2773,92 @@ def _detect_grid_line_positions(
     return None
 
 
+def _sso_data_column_count(col_lines: list[int]) -> int:
+    """Số cột dữ liệu từ danh sách đường kẻ dọc."""
+    return max(0, len(col_lines) - 1)
+
+
+def _adjust_col_lines_to_target(
+    col_lines: list[int], target_cols: int
+) -> list[int]:
+    """Chèn/gộp đường kẻ dọc để lưới có đúng target_cols cột."""
+    if len(col_lines) < 2 or target_cols < 1:
+        return col_lines
+    lines = list(col_lines)
+    while _sso_data_column_count(lines) < target_cols:
+        best_i, best_gap = 0, 0
+        for i in range(len(lines) - 1):
+            gap = lines[i + 1] - lines[i]
+            if gap > best_gap:
+                best_gap = gap
+                best_i = i
+        if best_gap < 8:
+            break
+        lines.insert(best_i + 1, (lines[best_i] + lines[best_i + 1]) // 2)
+    while _sso_data_column_count(lines) > target_cols:
+        best_i, best_gap = 0, float("inf")
+        for i in range(len(lines) - 1):
+            gap = lines[i + 1] - lines[i]
+            if gap < best_gap:
+                best_gap = gap
+                best_i = i
+        lines.pop(best_i + 1)
+    return lines
+
+
+def _detect_sso_grid_for_crop(
+    image: np.ndarray, *, prefer_cols: int = 10
+) -> tuple[list[int], list[int]] | None:
+    """
+    Thử nhiều tham số phát hiện lưới; chọn lưới gần prefer_cols cột nhất.
+
+    Mẫu 10 cột có ô hẹp — col_min_gap lớn (35px) hay gộp nhầm 2 cột thành 1.
+    """
+    best: tuple[list[int], list[int]] | None = None
+    best_dist = 999
+    attempts = [
+        (6, 11, 18),
+        (6, 10, 20),
+        (6, 10, 22),
+        (6, 9, 22),
+        (6, 8, 28),
+        (8, 6, 35),
+        (5, 4, 22),
+    ]
+    for min_rows, min_col_lines, col_min_gap in attempts:
+        grid = _detect_grid_line_positions(
+            image,
+            min_rows=min_rows,
+            min_cols=min_col_lines,
+            col_min_gap=col_min_gap,
+        )
+        if not grid:
+            continue
+        row_lines, col_lines = grid
+        dist = abs(_sso_data_column_count(col_lines) - prefer_cols)
+        if dist < best_dist:
+            best_dist = dist
+            best = (row_lines, col_lines)
+    if best is None:
+        return None
+    row_lines, col_lines = best
+    if _sso_data_column_count(col_lines) != prefer_cols:
+        col_lines = _adjust_col_lines_to_target(col_lines, prefer_cols)
+        logger.info(
+            "SSO grid adjusted to %d columns (was %d)",
+            prefer_cols,
+            _sso_data_column_count(best[1]),
+        )
+    return row_lines, col_lines
+
+
+def _sso_paddle_first_cols(num_cols: int) -> set[int]:
+    """Cột SSO cần pass-2 PaddleOCR (IPCAS, CCCD, email, SĐT)."""
+    if num_cols >= 10:
+        return {4, 5, 6, 7}
+    return {3, 4, 5, 6}
+
+
 def _ocr_table_grid(
     image: np.ndarray,
     row_lines: list[int],
@@ -2664,7 +2887,13 @@ def _ocr_table_grid(
             crop = image[cy1:cy2, cx1:cx2]
             if crop.size == 0:
                 continue
-            if not _cell_has_ink(crop):
+            is_stt_col = ci == 0
+            if not _cell_has_ink(crop) and not is_stt_col:
+                continue
+            if is_stt_col and not _cell_has_ink(crop):
+                # STT: ô hẹp, mực ít — vẫn thử OCR để giữ chỉ số dòng
+                crops.append(crop)
+                metas.append((ri, ci, x1, y1, x2, y2, 0))
                 continue
             if settings.ocr_sso_enhance and settings.ocr_cell_multiline:
                 line_crops = _split_cell_text_lines(crop)
@@ -2762,7 +2991,41 @@ def _ocr_table_grid(
         cells = _apply_fixed_email_domain(cells)
 
     cells = _refine_sso_critical_columns(image, cells)
+    cells = _refine_sso_branch_column(image, cells)
     return cells
+
+
+def _find_best_sso_table_region(
+    image: np.ndarray, *, prefer_cols: int = 10
+) -> tuple[int, list[int], list[int]] | None:
+    """
+    Tìm vùng bảng SSO khi không có dòng tiêu đề (trang tiếp theo).
+
+    Quét nhiều mức crop từ trên xuống, chọn lưới 10 cột có nhiều hàng nhất.
+    """
+    h = image.shape[0]
+    best: tuple[int, list[int], list[int]] | None = None
+    best_score = -1
+    for top_pct in (0.08, 0.10, 0.12, 0.15, 0.18, 0.22, 0.26, 0.30):
+        top = int(h * top_pct)
+        if top >= h - 200:
+            continue
+        crop = image[top:, :]
+        if settings.ocr_sso_enhance:
+            crop = deskew_image(crop)
+        grid = _detect_sso_grid_for_crop(crop, prefer_cols=prefer_cols)
+        if not grid:
+            continue
+        row_lines, col_lines = grid
+        nrows = len(row_lines) - 1
+        ncols = _sso_data_column_count(col_lines)
+        if nrows < 4 or ncols < 9:
+            continue
+        score = nrows * 20 + (12 - abs(ncols - prefer_cols))
+        if score > best_score:
+            best_score = score
+            best = (top, row_lines, col_lines)
+    return best
 
 
 def _find_table_top_y(
@@ -2795,21 +3058,55 @@ def _prepare_sso_grid_draft(
     rows = _cluster_line_boxes_into_rows(line_boxes)
     header_y = _find_table_top_y(image, rows)
     sso_header = header_y is not None
-    table_top = header_y if header_y is not None else int(image.shape[0] * 0.12)
+    prefer_cols = 10
 
-    crop = image[table_top:, :]
-    if settings.ocr_sso_enhance:
-        crop = deskew_image(crop)
-    if settings.ocr_sso_grid_relax and sso_header:
-        grid = _detect_grid_line_positions(
-            crop, min_rows=6, min_cols=5, col_min_gap=28
-        )
+    if sso_header:
+        table_top = header_y
+        for row in rows:
+            if abs(min(b[1] for b in row) - table_top) > 12:
+                continue
+            texts = _recognize_row_boxes(image, row)
+            if _score_sso_header_row(texts) >= 3:
+                prefer_cols = _sso_layout_from_header_text(" ".join(texts))
+                break
+        crop = image[table_top:, :]
+        if settings.ocr_sso_enhance:
+            crop = deskew_image(crop)
+        grid = _detect_sso_grid_for_crop(crop, prefer_cols=prefer_cols)
     else:
-        grid = _detect_grid_line_positions(crop)
-    if grid is None and settings.ocr_sso_grid_relax:
-        grid = _detect_grid_line_positions(
-            crop, min_rows=5, min_cols=4, col_min_gap=22
+        region = _find_best_sso_table_region(image, prefer_cols=prefer_cols)
+        if region is None:
+            table_top = int(image.shape[0] * 0.12)
+            crop = image[table_top:, :]
+            if settings.ocr_sso_enhance:
+                crop = deskew_image(crop)
+            grid = _detect_sso_grid_for_crop(crop, prefer_cols=prefer_cols)
+            if grid is None and settings.ocr_sso_grid_relax:
+                grid = _detect_grid_line_positions(
+                    crop, min_rows=5, min_cols=8, col_min_gap=22
+                )
+            if grid is None:
+                return None
+            row_lines, col_lines = grid
+            return SsoGridDraft(
+                page_number=page_number,
+                crop=crop,
+                row_lines=row_lines,
+                col_lines=col_lines,
+                table_top=table_top,
+            )
+        table_top, row_lines, col_lines = region
+        crop = image[table_top:, :]
+        if settings.ocr_sso_enhance:
+            crop = deskew_image(crop)
+        return SsoGridDraft(
+            page_number=page_number,
+            crop=crop,
+            row_lines=row_lines,
+            col_lines=col_lines,
+            table_top=table_top,
         )
+
     if grid is None:
         return None
 
@@ -2949,7 +3246,10 @@ def _find_sso_table_header(
         if score > best_score and score >= 3:
             best_score = score
             best_idx = idx
-            best_bounds = _refine_sso_column_bounds(rows, idx)
+            prefer_cols = _sso_layout_from_header_text(" ".join(texts))
+            best_bounds = _refine_sso_column_bounds(
+                rows, idx, prefer_cols=prefer_cols
+            )
 
     if best_idx is None:
         return None, None
@@ -2960,6 +3260,8 @@ def _refine_sso_column_bounds(
     rows: list[list[tuple[int, int, int, int]]],
     header_idx: int,
     sample_rows: int = 6,
+    *,
+    prefer_cols: int | None = None,
 ) -> list[tuple[float, float]]:
     """Derive column x-ranges from header + vài dòng dữ liệu đầu (ổn định hơn)."""
     boxes: list[tuple[int, int, int, int]] = []
@@ -2969,7 +3271,7 @@ def _refine_sso_column_bounds(
         return _column_bounds_from_row_boxes(rows[header_idx])
 
     header_sorted = sorted(rows[header_idx], key=lambda b: b[0])
-    num_cols = max(len(header_sorted), 7)
+    num_cols = prefer_cols or max(len(header_sorted), 7)
     num_cols = min(num_cols, 10)
 
     centers = sorted((b[0] + b[2]) / 2 for b in boxes)
@@ -3024,6 +3326,22 @@ def _is_valid_data_row(cols: dict[int, CellData]) -> bool:
     texts = [c.text.strip() for c in cols.values() if c.text.strip()]
     if not texts:
         return False
+
+    name_cell = cols.get(1)
+    name = (name_cell.text.strip() if name_cell else "") or ""
+    ipcas = (cols.get(4).text if cols.get(4) else "").strip().upper()
+    if name and len(name) < 6 and ipcas and not ipcas.startswith("QSO"):
+        return False
+    if name and not name.isascii() and len(name) >= 3:
+        cccd_raw = (cols.get(5).text if cols.get(5) else "").strip()
+        email_raw = (cols.get(6).text if cols.get(6) else "").strip()
+        if re.sub(r"\D", "", cccd_raw) and len(re.sub(r"\D", "", cccd_raw)) >= 9:
+            return True
+        if ipcas and ipcas.startswith("QSO"):
+            return True
+        if "@" in email_raw or "agribank" in email_raw.lower():
+            return True
+
     gib = sum(1 for t in texts if _is_gibberish_text(t))
     if gib >= max(2, len(texts) // 2):
         return False
@@ -3036,27 +3354,25 @@ def _is_valid_data_row(cols: dict[int, CellData]) -> bool:
     return gib == 0 and len(texts) >= 2
 
 
-_SSO_TARGET_COLS = 9
-
-
-def _enforce_sso_nine_columns(cells: list[CellData]) -> list[CellData]:
-    """Pad or trim SSO grid to exactly 9 columns (0..8)."""
+def _enforce_sso_target_columns(cells: list[CellData]) -> list[CellData]:
+    """Trim SSO grid về đúng số cột layout (9 mẫu cũ / 10 mẫu mới)."""
     if not cells:
         return cells
     max_col = max(c.col for c in cells)
-    if max_col + 1 == _SSO_TARGET_COLS:
+    target_cols = _sso_layout_col_count(cells, max_col + 1)
+    if max_col + 1 == target_cols:
         return cells
-    if max_col + 1 > _SSO_TARGET_COLS:
+    if max_col + 1 > target_cols:
         logger.warning(
             "SSO table has %d columns — trimming to %d",
             max_col + 1,
-            _SSO_TARGET_COLS,
+            target_cols,
         )
-        return [c for c in cells if c.col < _SSO_TARGET_COLS]
+        return [c for c in cells if c.col < target_cols]
     logger.info(
-        "SSO table has %d columns — padding to %d",
+        "SSO table has %d columns — expected %d (layout from header)",
         max_col + 1,
-        _SSO_TARGET_COLS,
+        target_cols,
     )
     return cells
 
@@ -3098,9 +3414,19 @@ def _postprocess_sso_cells(cells: list[CellData]) -> list[CellData]:
         c0 = cols.get(0, CellData(row=0, col=0, text="", confidence=0)).text.strip()
         c1 = cols.get(1, CellData(row=0, col=1, text="", confidence=0)).text.strip()
         norm = _normalize_match_text(c0 + c1)
-        if "stt" in norm or ("hoten" in norm and "phong" in _normalize_match_text(
-            " ".join(c.text for c in cols.values())
-        )):
+        row_norm = _normalize_match_text(" ".join(c.text for c in cols.values()))
+        is_header_row = (
+            "stt" in norm
+            or (
+                "hoten" in norm
+                and any(
+                    k in row_norm
+                    for k in ("phong", "donvi", "machinh", "tenchinhanh", "email")
+                )
+            )
+            or ("machinh" in row_norm and "email" in row_norm)
+        )
+        if is_header_row:
             start_row = row
             break
         if re.match(r"^\d{1,3}$", c0) and c1 and not c1.isascii():
@@ -3137,7 +3463,7 @@ def _postprocess_sso_cells(cells: list[CellData]) -> list[CellData]:
         new_idx += 1
 
     renumbered = _fix_cccd_email_columns(renumbered)
-    renumbered = _enforce_sso_nine_columns(renumbered)
+    renumbered = _enforce_sso_target_columns(renumbered)
     renumbered.sort(key=lambda c: (c.row, c.col))
     return renumbered
 
@@ -3254,7 +3580,7 @@ def _fallback_full_page_ocr(
         tx2 = min(img_w, max(b[2] for b in content_boxes) + 8)
 
         centers = sorted((b[0] + b[2]) / 2 for b in content_boxes)
-        num_cols = min(9, max(4, _estimate_column_count(centers)))
+        num_cols = min(10, max(4, _estimate_column_count(centers)))
         col_bounds = _cluster_centers_to_bounds(centers, num_cols)
         col_bounds_crop = [(l - tx1, r - tx1) for l, r in col_bounds]
         line_boxes_crop = [
@@ -3297,4 +3623,4 @@ def _estimate_column_count(centers: list[float]) -> int:
     if med_gap <= 0:
         return 6
     big_gaps = sum(1 for g in gaps if g > med_gap * 1.8)
-    return max(4, min(9, big_gaps + 1))
+    return max(4, min(10, big_gaps + 1))

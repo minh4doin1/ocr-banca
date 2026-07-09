@@ -25,8 +25,12 @@ const $$ = (sel) => document.querySelectorAll(sel);
 const fileInput = $('#file-input');
 const excelInput = $('#excel-input');
 const excelInputReupload = $('#excel-input-reupload');
+const docxInputReupload = $('#docx-input-reupload');
+const docxInput = $('#docx-input');
+const anyInput = $('#any-input');
 const selectBtn = $('#select-btn');
 const selectExcelBtn = $('#select-excel-btn');
+const selectDocxBtn = $('#select-docx-btn');
 const fileNameLabel = $('#file-name-label');
 const dropZone = $('#drop-zone');
 const uploadSettings = $('#upload-settings');
@@ -63,9 +67,12 @@ const partialExcelPanel = $('#partial-excel-panel');
 const pageExportList = $('#page-export-list');
 const pageExportSelectAll = $('#page-export-select-all');
 const btnDownloadPagesExcel = $('#btn-download-pages-excel');
+const btnDownloadPagesDocx = $('#btn-download-pages-docx');
 const pageExportHint = $('#page-export-hint');
 const btnDownloadExcel = $('#btn-download-excel');
+const btnDownloadDocx = $('#btn-download-docx');
 const btnReuploadExcel = $('#btn-reupload-excel');
+const btnReuploadDocx = $('#btn-reupload-docx');
 
 const successBatchCode = $('#success-batch-code');
 const successTotalRecords = $('#success-total-records');
@@ -175,6 +182,7 @@ function resetAll() {
     uploadSource = 'pdf';
     if (fileInput) fileInput.value = '';
     if (excelInput) excelInput.value = '';
+    if (docxInput) docxInput.value = '';
     if (excelInputReupload) excelInputReupload.value = '';
     if (fileNameLabel) fileNameLabel.textContent = 'Chưa chọn file';
     if (logConsole) logConsole.innerHTML = '';
@@ -185,6 +193,7 @@ function resetAll() {
     if (pageExportList) pageExportList.innerHTML = '';
     if (pageExportSelectAll) pageExportSelectAll.checked = false;
     if (btnDownloadPagesExcel) btnDownloadPagesExcel.disabled = true;
+    if (btnDownloadPagesDocx) btnDownloadPagesDocx.disabled = true;
     processingSpinner?.classList.remove('hidden');
     uploadSettings?.classList.remove('hidden');
     hideReviewPage?.();
@@ -205,6 +214,12 @@ function setupUpload() {
         uploadSettings?.classList.add('hidden');
         excelInput?.click();
     });
+    selectDocxBtn?.addEventListener('click', (e) => {
+        e.preventDefault();
+        uploadSource = 'docx';
+        uploadSettings?.classList.add('hidden');
+        docxInput?.click();
+    });
 
     fileInput?.addEventListener('change', (e) => {
         if (e.target.files.length) {
@@ -216,6 +231,13 @@ function setupUpload() {
         if (e.target.files.length) {
             fileNameLabel.textContent = e.target.files[0].name;
             handleExcelFile(e.target.files[0], '');
+            e.target.value = '';
+        }
+    });
+    docxInput?.addEventListener('change', (e) => {
+        if (e.target.files.length) {
+            fileNameLabel.textContent = e.target.files[0].name;
+            handleDocxFile(e.target.files[0], '');
             e.target.value = '';
         }
     });
@@ -232,18 +254,13 @@ function setupUpload() {
         e.preventDefault();
         dropZone.classList.remove('drag-over');
         if (!e.dataTransfer.files.length) return;
-        const file = e.dataTransfer.files[0];
-        fileNameLabel.textContent = file.name;
-        if (file.name.toLowerCase().endsWith('.pdf')) {
-            uploadSource = 'pdf';
-            uploadSettings?.classList.remove('hidden');
-            handleFile(file);
-        } else if (/\.(xlsx|xlsm)$/i.test(file.name)) {
-            uploadSource = 'excel';
-            uploadSettings?.classList.add('hidden');
-            handleExcelFile(file, '');
-        } else {
-            notify('error', 'Định dạng không hỗ trợ', 'Chỉ chấp nhận PDF hoặc Excel .xlsx/.xlsm');
+        routeUploadFile(e.dataTransfer.files[0]);
+    });
+    dropZone?.addEventListener('click', () => anyInput?.click());
+    anyInput?.addEventListener('change', (e) => {
+        if (e.target.files.length) {
+            routeUploadFile(e.target.files[0]);
+            e.target.value = '';
         }
     });
 
@@ -264,6 +281,10 @@ function setupProcessing() {
         if (!jobId) return;
         downloadExcelPages(null);
     });
+    btnDownloadDocx?.addEventListener('click', () => {
+        if (!jobId) return;
+        downloadDocxPages(null);
+    });
     btnDownloadPagesExcel?.addEventListener('click', () => {
         const pages = Array.from(selectedExportPages).sort((a, b) => a - b);
         if (!pages.length) {
@@ -271,6 +292,14 @@ function setupProcessing() {
             return;
         }
         downloadExcelPages(pages);
+    });
+    btnDownloadPagesDocx?.addEventListener('click', () => {
+        const pages = Array.from(selectedExportPages).sort((a, b) => a - b);
+        if (!pages.length) {
+            notify('warn', 'Chưa chọn trang', 'Tick ít nhất một trang đã xong.');
+            return;
+        }
+        downloadDocxPages(pages);
     });
     pageExportSelectAll?.addEventListener('change', (e) => {
         const checked = e.target.checked;
@@ -283,9 +312,16 @@ function setupProcessing() {
         syncPageExportDownloadBtn();
     });
     btnReuploadExcel?.addEventListener('click', () => excelInputReupload?.click());
+    btnReuploadDocx?.addEventListener('click', () => docxInputReupload?.click());
     excelInputReupload?.addEventListener('change', (e) => {
         if (e.target.files.length) {
             handleExcelFile(e.target.files[0], jobId);
+            e.target.value = '';
+        }
+    });
+    docxInputReupload?.addEventListener('change', (e) => {
+        if (e.target.files.length) {
+            handleDocxFile(e.target.files[0], jobId);
             e.target.value = '';
         }
     });
@@ -293,7 +329,7 @@ function setupProcessing() {
 
 function setupReviewNav() {
     btnReviewBack?.addEventListener('click', () => {
-        if (uploadSource === 'excel') setStep(0);
+        if (uploadSource === 'excel' || uploadSource === 'docx') setStep(0);
         else setStep(1);
     });
     btnCreateBatch?.addEventListener('click', () => submitBatch());
@@ -403,6 +439,36 @@ function handleExcelFile(file, targetJobId = '') {
     uploadExcel(file, targetJobId);
 }
 
+function handleDocxFile(file, targetJobId = '') {
+    const name = (file?.name || '').toLowerCase();
+    if (!name.endsWith('.docx')) {
+        notify('error', 'Chỉ hỗ trợ Word .docx');
+        return;
+    }
+    uploadDocx(file, targetJobId);
+}
+
+function routeUploadFile(file) {
+    if (!file) return;
+    const name = (file.name || '').toLowerCase();
+    if (fileNameLabel) fileNameLabel.textContent = file.name;
+    if (name.endsWith('.pdf')) {
+        uploadSource = 'pdf';
+        uploadSettings?.classList.remove('hidden');
+        handleFile(file);
+    } else if (/\.(xlsx|xlsm)$/i.test(name)) {
+        uploadSource = 'excel';
+        uploadSettings?.classList.add('hidden');
+        handleExcelFile(file, '');
+    } else if (name.endsWith('.docx')) {
+        uploadSource = 'docx';
+        uploadSettings?.classList.add('hidden');
+        handleDocxFile(file, '');
+    } else {
+        notify('error', 'Định dạng không hỗ trợ', 'Chỉ chấp nhận PDF, Word (.docx) hoặc Excel (.xlsx/.xlsm)');
+    }
+}
+
 async function uploadPdf(file) {
     updateProgress(2, 'Đang upload file...');
     const modeKind = getModeKind();
@@ -485,6 +551,37 @@ async function uploadExcel(file, targetJobId = '') {
         await submitReview();
     } catch (e) {
         notify('error', 'Lỗi nạp Excel', e.message || 'Không xác định');
+        if (!isReupload) setStep(0);
+    }
+}
+
+async function uploadDocx(file, targetJobId = '') {
+    const isReupload = !!targetJobId;
+    notify('info', isReupload ? 'Đang nạp Word đã sửa...' : 'Đang nạp Word...', file.name);
+
+    try {
+        const formData = new FormData();
+        formData.append('file', file);
+        if (targetJobId) formData.append('job_id', targetJobId);
+
+        const res = await fetch(`${API_BASE}/api/ocr/upload-docx`, { method: 'POST', body: formData });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.detail || 'Upload Word thất bại');
+
+        jobId = data.job_id;
+        stopPolling();
+        fileNameLabel.textContent = file.name;
+
+        if (!isReupload) {
+            uploadSource = 'docx';
+            notify('success', 'Nạp Word thành công', `Job ${jobId} — bỏ qua OCR, vào bước kiểm tra.`);
+        } else {
+            notify('success', 'Đã cập nhật từ Word', 'Dữ liệu đã ghi đè, đang tải lại review.');
+        }
+
+        await submitReview();
+    } catch (e) {
+        notify('error', 'Lỗi nạp Word', e.message || 'Không xác định');
         if (!isReupload) setStep(0);
     }
 }
@@ -597,9 +694,23 @@ function downloadExcelPages(pages) {
     notify('info', 'Đang tải Excel', `Xuất ${label} — mở file và sửa trước khi upload lại.`);
 }
 
+function downloadDocxPages(pages) {
+    if (!jobId) return;
+    let url = `${API_BASE}/api/ocr/result/${jobId}/export-docx`;
+    if (pages?.length) {
+        url += `?pages=${pages.join(',')}`;
+    }
+    window.open(url);
+    const label = pages?.length
+        ? `trang ${pages.join(', ')}`
+        : 'toàn bộ';
+    notify('info', 'Đang tải Word', `Xuất ${label} — mở file .docx và sửa hoặc nạp lại qua Nạp Word.`);
+}
+
 function syncPageExportDownloadBtn() {
     const count = selectedExportPages.size;
     if (btnDownloadPagesExcel) btnDownloadPagesExcel.disabled = count === 0;
+    if (btnDownloadPagesDocx) btnDownloadPagesDocx.disabled = count === 0;
     if (pageExportHint) {
         pageExportHint.textContent = count
             ? `Đã chọn ${count} trang`

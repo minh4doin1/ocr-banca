@@ -28,6 +28,7 @@ from app.models.schemas import (
     UpdateResultRequest,
     UploadResponse,
 )
+from app.services.docx_service import export_to_docx, import_from_docx
 from app.services.excel_service import export_to_excel, import_from_excel
 from app.services.job_queue import OcrJobTask, QueueFullError, start_job_queue
 from app.services.remote_ocr_service import (
@@ -60,6 +61,7 @@ router = APIRouter(
 
 ALLOWED_EXTENSIONS = {".pdf"}
 ALLOWED_EXCEL_EXTENSIONS = {".xlsx", ".xlsm"}
+ALLOWED_DOCX_EXTENSIONS = {".docx"}
 MAX_FILE_SIZE = 50 * 1024 * 1024
 _queue_started = False
 
@@ -346,6 +348,63 @@ async def upload_excel(
     )
 
 
+@router.post(
+    "/upload-docx",
+    response_model=UploadResponse,
+    responses={400: {"model": ErrorResponse}, 413: {"model": ErrorResponse}},
+    summary="Upload Word (.docx) để nạp dữ liệu trực tiếp (bỏ qua OCR)",
+)
+async def upload_docx(
+    file: UploadFile = File(..., description="File Word .docx chứa bảng danh sách"),
+    job_id: str = Form(default=""),
+):
+    """Đọc bảng trong file Word gốc và map vào cấu trúc OCR (không qua OCR)."""
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="Filename is required")
+
+    ext = Path(file.filename).suffix.lower()
+    if ext not in ALLOWED_DOCX_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Chỉ hỗ trợ file Word (.docx). Nhận được: {ext}",
+        )
+
+    content = await file.read()
+    if len(content) > MAX_FILE_SIZE:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File quá lớn. Tối đa: {MAX_FILE_SIZE // (1024 * 1024)} MB",
+        )
+
+    target_job_id = job_id.strip() or str(uuid.uuid4())[:8]
+    docx_path = settings.upload_path / f"{target_job_id}_{file.filename}"
+    async with aiofiles.open(docx_path, "wb") as f:
+        await f.write(content)
+
+    try:
+        result = import_from_docx(docx_path, target_job_id, file.filename)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    job = get_job(target_job_id)
+    if job is None:
+        create_manual_job(
+            job_id=target_job_id,
+            filename=file.filename,
+            total_pages=result.total_pages,
+        )
+
+    set_result(target_job_id, result)
+
+    return UploadResponse(
+        job_id=target_job_id,
+        filename=file.filename,
+        processing_mode=ProcessingMode.LOCAL,
+        use_gpu=False,
+        message="Đã nạp dữ liệu từ Word. Có thể đối chiếu/chỉnh sửa ngay.",
+    )
+
+
 def _run_ocr_job(
     job_id: str,
     pdf_path: Path,
@@ -501,6 +560,77 @@ async def export_excel(job_id: str, pages: str | None = None):
     except Exception as e:
         logger.error("Excel export failed: %s", e)
         raise HTTPException(status_code=500, detail=f"Lỗi xuất Excel: {e}")
+
+
+@router.get("/result/{job_id}/export-docx")
+async def export_docx(job_id: str, pages: str | None = None):
+    """Xuất kết quả ra file Word (.docx)."""
+    result = get_result(job_id)
+    if result is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Kết quả OCR không tìm thấy cho job: {job_id}",
+        )
+
+    page_numbers: list[int] | None = None
+    if pages:
+        try:
+            page_numbers = [int(p.strip()) for p in pages.split(",") if p.strip()]
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail="Tham số pages không hợp lệ (vd: pages=1,2,3)",
+            ) from exc
+        if not page_numbers:
+            raise HTTPException(status_code=400, detail="Chưa chọn trang để xuất")
+
+    try:
+        docx_path = export_to_docx(result, page_numbers=page_numbers)
+        return FileResponse(
+            path=str(docx_path),
+            filename=docx_path.name,
+            media_type=(
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            ),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as e:
+        logger.error("DOCX export failed: %s", e)
+        raise HTTPException(status_code=500, detail=f"Lỗi xuất Word: {e}")
+
+
+@router.get("/result/{job_id}/pdf-to-docx")
+async def convert_pdf_to_docx_download(job_id: str):
+    """Chuyển file PDF gốc của job sang Word (.docx) để sửa tay rồi nạp lại."""
+    from app.services.pdf_text_service import convert_pdf_to_docx
+
+    job = get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"Không tìm thấy job: {job_id}")
+
+    candidates = list(settings.upload_path.glob(f"{job_id}_*.pdf"))
+    if not candidates:
+        raise HTTPException(
+            status_code=404,
+            detail="Không tìm thấy file PDF gốc của job",
+        )
+    pdf_path = candidates[0]
+    out_path = settings.export_path / f"{job_id}_{pdf_path.stem}.docx"
+    try:
+        convert_pdf_to_docx(pdf_path, out_path)
+        return FileResponse(
+            path=str(out_path),
+            filename=out_path.name,
+            media_type=(
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            ),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as e:
+        logger.error("PDF to DOCX failed: %s", e)
+        raise HTTPException(status_code=500, detail=f"Lỗi chuyển PDF sang Word: {e}")
 
 
 @router.get("/jobs", response_model=list[JobInfo])
