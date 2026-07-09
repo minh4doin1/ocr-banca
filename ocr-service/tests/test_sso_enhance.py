@@ -5,7 +5,9 @@ import numpy as np
 from app.config import settings
 from app.models.schemas import CellData
 from app.services.ocr_service import (
+    _adjust_col_lines_to_target,
     _assign_lines_to_grid,
+    _sso_layout_from_header_text,
     _extract_sso_email_local,
     _format_sso_email,
     _is_hallucinated_ocr_line,
@@ -14,8 +16,11 @@ from app.services.ocr_service import (
     _merge_fragment_sso_rows,
     _normalize_cell_text,
     _repair_agribank_email,
+    _resolve_sso_email_col,
     _row_looks_like_fragment_continuation,
     _split_cell_text_lines,
+    _sso_data_column_count,
+    _sso_layout_col_count,
     _strip_leading_english_hallucination,
 )
 
@@ -255,3 +260,32 @@ def test_enhance_flags_exist():
     assert settings.ocr_cell_multiline is True
     assert settings.ocr_sso_email_fixed_domain is True
     assert settings.ocr_sso_email_domain == "@agribank.com.vn"
+
+
+def test_sso_layout_detects_new_10_column_template():
+    header = "STT Họ và tên Mã chi nhánh Tên Chi nhánh User IPCAS Số CCCD Email tại Agribank"
+    assert _sso_layout_from_header_text(header) == 10
+
+
+def test_sso_layout_detects_old_9_column_template():
+    header = "STT Họ và tên Phòng/Đơn vị User IPCAS Số CCCD Email SĐT Phân quyền"
+    assert _sso_layout_from_header_text(header) == 9
+
+
+def test_email_col_uses_layout_not_grid_count():
+    """Mẫu 10 cột nhưng lưới chỉ detect 9 cột — email vẫn phải ở cột 6."""
+    cells = [
+        CellData(row=0, col=0, text="STT", confidence=1.0, bbox=[]),
+        CellData(row=0, col=2, text="Mã chi nhánh", confidence=1.0, bbox=[]),
+        CellData(row=0, col=6, text="Email tại Agribank", confidence=1.0, bbox=[]),
+    ]
+    assert _resolve_sso_email_col(9, cells) == 6
+    assert _sso_layout_col_count(cells, 9) == 10
+
+
+def test_adjust_col_lines_splits_wide_gap_to_10_columns():
+    # 9 cột (10 đường kẻ) → cần 11 đường kẻ cho 10 cột
+    col_lines = [0, 50, 100, 150, 200, 250, 300, 350, 400, 500]
+    assert _sso_data_column_count(col_lines) == 9
+    adjusted = _adjust_col_lines_to_target(col_lines, 10)
+    assert _sso_data_column_count(adjusted) == 10

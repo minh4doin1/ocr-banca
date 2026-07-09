@@ -455,6 +455,69 @@ def _finalize_page(
         _save_partial_result(job, pages)
 
 
+def _try_import_pdf_text_layer(job: JobInfo, pdf_path: str | Path) -> OcrResult | None:
+    """Thử đọc bảng SSO từ PDF có lớp text; trả None để fallback OCR."""
+    from app.services.pdf_text_service import import_from_pdf_text, pdf_has_text_layer
+    from app.services.user_mapping import map_table_to_users
+
+    pdf_path = Path(pdf_path)
+    try:
+        if not pdf_has_text_layer(pdf_path):
+            return None
+        _append_log(
+            job,
+            "PDF có lớp text — thử đọc bảng trực tiếp (không OCR)…",
+        )
+        result = import_from_pdf_text(pdf_path, job.job_id, job.filename)
+        if not result or not result.pages:
+            _append_log(
+                job,
+                "Không trích được bảng SSO từ text PDF — chuyển sang OCR",
+                LogLevel.WARNING,
+            )
+            return None
+
+        total_users = 0
+        for page in result.pages:
+            for table in page.tables:
+                users, _ = map_table_to_users(table)
+                total_users += len(users)
+        if total_users < 1:
+            _append_log(
+                job,
+                "Text PDF không có dòng user hợp lệ — chuyển sang OCR",
+                LogLevel.WARNING,
+            )
+            return None
+
+        job.total_pages = result.total_pages
+        _init_page_statuses(job, result.total_pages)
+        for ps in job.page_statuses:
+            ps.status = PageStatus.COMPLETED
+        job.progress = result.total_pages
+        job.status = JobStatus.COMPLETED
+        job.updated_at = datetime.now()
+        result.is_complete = True
+        set_result(job.job_id, result)
+
+        _append_log(
+            job,
+            f"Đọc trực tiếp {result.total_pages} trang, {total_users} user — "
+            "bỏ qua OCR (chính xác như Word/Excel gốc)",
+            LogLevel.SUCCESS,
+        )
+        logger.info("[%s] PDF text import completed: %d users", job.job_id, total_users)
+        return result
+    except Exception as exc:
+        _append_log(
+            job,
+            f"Đọc text PDF thất bại — chuyển OCR: {exc}",
+            LogLevel.WARNING,
+        )
+        logger.warning("[%s] PDF text import failed: %s", job.job_id, exc)
+        return None
+
+
 def process_job(
     job_id: str,
     pdf_path: str | Path,
@@ -517,6 +580,12 @@ def process_job(
                 )
             else:
                 _append_log(job, f"OCR engine đã cấu hình chạy trên {device_label}")
+
+        # PDF số (có lớp text): đọc bảng trực tiếp — chính xác hơn OCR rất nhiều.
+        if processing_mode == ProcessingMode.LOCAL:
+            text_result = _try_import_pdf_text_layer(job, pdf_path)
+            if text_result is not None:
+                return text_result
 
         # Step 1: PDF → images (lazy: từng trang, prefetch trang kế)
         total_pages = job.total_pages or get_page_count(pdf_path)
