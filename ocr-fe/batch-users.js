@@ -24,9 +24,9 @@ let reviewSearchQuery = '';
 let lastProvisionResponse = null;
 let followUpActions = {};
 let followUpFinalized = false;
-let followUpApplied = {};
 let successShowUpdatedOnly = false;
 let successSearchQuery = '';
+const SUCCESS_STATE_KEY = 'ocr_batch_success_state_v1';
 
 const CONFLICT_OPTIONS = [
     { value: 'skip', label: 'Bỏ qua' },
@@ -581,8 +581,6 @@ function statusLabelVi(status) {
 }
 
 function renderConflictSelect(username, action, disabled = false) {
-    const locked = followUpApplied[username];
-    disabled = disabled || locked;
     const opts = CONFLICT_OPTIONS.map(o =>
         `<option value="${o.value}"${o.value === action ? ' selected' : ''}>${o.label}</option>`
     ).join('');
@@ -591,7 +589,6 @@ function renderConflictSelect(username, action, disabled = false) {
 
 function initFollowUpActions(results) {
     followUpActions = {};
-    followUpApplied = {};
     (results || []).forEach(r => {
         if (r.status === 'updated') followUpActions[r.username] = 'skip';
     });
@@ -688,6 +685,7 @@ function renderSuccessResultsTable() {
             followUpActions[sel.dataset.username] = sel.value;
             followUpFinalized = false;
             updateFinalizeButton();
+            persistSuccessState();
         });
     });
     updateFinalizeButton();
@@ -697,9 +695,9 @@ function hideSuccessPage() {
     lastProvisionResponse = null;
     followUpActions = {};
     followUpFinalized = false;
-    followUpApplied = {};
     successShowUpdatedOnly = false;
     successSearchQuery = '';
+    localStorage.removeItem(SUCCESS_STATE_KEY);
     const tbody = document.getElementById('success-results-tbody');
     if (tbody) tbody.innerHTML = '';
     const searchInp = document.getElementById('success-search');
@@ -712,6 +710,49 @@ function hideSuccessPage() {
     });
     const hint = document.getElementById('success-stats-hint');
     if (hint) hint.textContent = '';
+}
+
+function persistSuccessState() {
+    if (!lastProvisionResponse || !jobId) return;
+    const payload = {
+        jobId,
+        lastProvisionResponse,
+        followUpActions,
+        followUpFinalized,
+        successShowUpdatedOnly,
+        successSearchQuery,
+        savedAt: new Date().toISOString(),
+    };
+    localStorage.setItem(SUCCESS_STATE_KEY, JSON.stringify(payload));
+}
+
+function restoreSuccessState() {
+    try {
+        const raw = localStorage.getItem(SUCCESS_STATE_KEY);
+        if (!raw) return false;
+        const s = JSON.parse(raw);
+        if (!s?.jobId || !s?.lastProvisionResponse?.results?.length) return false;
+
+        jobId = s.jobId;
+        lastProvisionResponse = s.lastProvisionResponse;
+        followUpActions = s.followUpActions || {};
+        followUpFinalized = !!s.followUpFinalized;
+        successShowUpdatedOnly = !!s.successShowUpdatedOnly;
+        successSearchQuery = s.successSearchQuery || '';
+
+        if (successBatchCode) successBatchCode.textContent = `BATCH-${jobId.toUpperCase()}`;
+        updateSuccessStats(lastProvisionResponse);
+        const searchInp = document.getElementById('success-search');
+        if (searchInp) searchInp.value = successSearchQuery;
+        const filterCb = document.getElementById('success-filter-updated');
+        if (filterCb) filterCb.checked = successShowUpdatedOnly;
+        renderSuccessResultsTable();
+        setStep(3);
+        return true;
+    } catch {
+        localStorage.removeItem(SUCCESS_STATE_KEY);
+        return false;
+    }
 }
 
 function buildProvisionUserPayload(u, onConflict) {
@@ -783,6 +824,7 @@ function showBatchResults(data) {
     }
     stopPolling();
     setStep(3);
+    persistSuccessState();
 }
 
 async function finalizeBatch() {
@@ -834,11 +876,11 @@ async function finalizeBatch() {
         (data.results || []).forEach(r => {
             if (!r.error) {
                 followUpActions[r.username] = 'skip';
-                followUpApplied[r.username] = true;
             }
         });
         followUpFinalized = countPendingFollowUps() === 0;
         renderSuccessResultsTable();
+        persistSuccessState();
 
         const ok = (data.results || []).filter(r => !r.error).length;
         const fail = (data.results || []).filter(r => r.error).length;
@@ -932,18 +974,26 @@ function setupSuccessPage() {
         Object.keys(followUpActions).forEach(username => { followUpActions[username] = val; });
         followUpFinalized = false;
         renderSuccessResultsTable();
+        persistSuccessState();
         notify('success', 'Đã áp dụng hàng loạt', CONFLICT_OPTIONS.find(o => o.value === val)?.label || val);
     });
 
     document.getElementById('success-search')?.addEventListener('input', (e) => {
         successSearchQuery = e.target.value || '';
         renderSuccessResultsTable();
+        persistSuccessState();
     });
 
     document.getElementById('success-filter-updated')?.addEventListener('change', (e) => {
         successShowUpdatedOnly = e.target.checked;
         renderSuccessResultsTable();
+        persistSuccessState();
     });
+
+    const restored = restoreSuccessState();
+    if (restored) {
+        notify('info', 'Đã khôi phục trạng thái', 'Trang kết quả lô trước đã được giữ lại sau khi tải lại.');
+    }
 }
 
 // Backward compat
