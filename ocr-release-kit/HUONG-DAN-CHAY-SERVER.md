@@ -46,6 +46,20 @@ cd C:\Projects\ocr-banca
 .\ocr-release-kit\Start-OcrSystem.ps1
 ```
 
+Chay user-service (port 8300):
+
+```powershell
+cd C:\Projects\ocr-banca
+.\ocr-release-kit\Start-UserService.ps1
+```
+
+Chay ca 2 service:
+
+```powershell
+cd C:\Projects\ocr-banca
+.\ocr-release-kit\Start-AllServices.ps1
+```
+
 Tùy chọn:
 
 ```powershell
@@ -183,6 +197,13 @@ cd C:\Projects\ocr-banca
 .\ocr-release-kit\Start-OcrTunnel.ps1
 ```
 
+Tunnel cho user-service (terminal khac):
+
+```powershell
+cd C:\Projects\ocr-banca
+.\ocr-release-kit\Start-OcrTunnel.ps1 -Service user
+```
+
 Đợi vài giây, tìm dòng:
 
 ```
@@ -197,6 +218,12 @@ Gửi link đó cho user. **Mỗi lần chạy tunnel = URL mới.** Tắt termi
 cloudflared tunnel --url http://127.0.0.1:8100 --no-autoupdate
 ```
 
+User-service:
+
+```powershell
+cloudflared tunnel --url http://127.0.0.1:8300 --no-autoupdate
+```
+
 ### Lưu ý bảo mật
 
 - Tunnel free **không có mật khẩu** — ai có link đều upload được.
@@ -208,14 +235,17 @@ cloudflared tunnel --url http://127.0.0.1:8100 --no-autoupdate
 ## 7. Quy trình hàng ngày (tóm tắt)
 
 ```powershell
-# 1) Start server (1 terminal)
+# 1) Start ca OCR + user-service (1 terminal)
 cd C:\Projects\ocr-banca
-.\ocr-release-kit\Start-OcrSystem.ps1
+.\ocr-release-kit\Start-AllServices.ps1
 
 # 2a) Chia sẻ LAN / Tailscale — copy link script in ra
 
-# 2b) HOẶC public internet — terminal thứ 2:
+# 2b) HOẶC public internet cho OCR — terminal thứ 2:
 .\ocr-release-kit\Start-OcrTunnel.ps1
+
+# 2c) Neu can public user-service — terminal thứ 3:
+.\ocr-release-kit\Start-OcrTunnel.ps1 -Service user
 ```
 
 Kiểm tra server OK:
@@ -225,6 +255,7 @@ Kiểm tra server OK:
 | `http://localhost:8100/` | Giao diện upload |
 | `http://localhost:8100/health` | GPU, queue, trạng thái |
 | `http://localhost:8100/docs` | API Swagger |
+| `http://localhost:8300/healthz` | Health user-service |
 
 Health tốt khi `status: "healthy"`, `gpu_available: true`. Phase 4 bật thì có thêm `vietocr_gpu_subprocess: true`.
 
@@ -235,6 +266,8 @@ Health tốt khi `status: "healthy"`, `gpu_available: true`. Phase 4 bật thì 
 | Triệu chứng | Nguyên nhân | Cách xử lý |
 |-------------|-------------|------------|
 | `Errno 10048` port 8100 | Server đã chạy | Dùng link hiện có, hoặc `taskkill` PID cũ |
+| Port 8300 đã dùng | User-service đã chạy | Kill PID cũ hoặc đổi `-UserPort` |
+| Tunnel user-service lỗi | Chưa start user-service | Chạy `.\ocr-release-kit\Start-UserService.ps1` rồi mở tunnel `-Service user` |
 | User LAN không vào được | Firewall chặn | Mở rule port 8100 (mục 4) |
 | `vietocr_gpu_ready: false` | Chưa cài worker GPU | Chạy `setup_vietocr_gpu_worker.ps1` + restart |
 | GPU không sẵn sàng | Thiếu cuDNN | `.\scripts\setup_gpu_windows.ps1` |
@@ -247,6 +280,8 @@ Health tốt khi `status: "healthy"`, `gpu_available: true`. Phase 4 bật thì 
 | Script | Việc làm |
 |--------|----------|
 | `ocr-release-kit\Start-OcrSystem.ps1` | Start/stop server, in link LAN + Tailscale |
+| `ocr-release-kit\Start-UserService.ps1` | Start/stop user-service (`/healthz`) |
+| `ocr-release-kit\Start-AllServices.ps1` | Start OCR + user-service trong 1 lenh |
 | `ocr-release-kit\Start-OcrTunnel.ps1` | Public link qua Cloudflare |
 | `ocr-service\scripts\setup_gpu_windows.ps1` | Cài GPU Paddle + torch CPU |
 | `ocr-service\scripts\setup_vietocr_gpu_worker.ps1` | Phase 4 VietOCR GPU |

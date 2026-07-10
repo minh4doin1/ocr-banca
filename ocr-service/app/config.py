@@ -126,7 +126,7 @@ class Settings(BaseSettings):
     user_service_url: str = ""
     user_service_api_key: str = ""  # Shared secret với user-service; trống = không auth (dev only)
     user_service_timeout_seconds: int = 30
-    user_service_roles_client_id: str = "banca-app"  # client chứa role banca-*
+    user_service_roles_client_id: str = "banca"  # client chứa role banca-*
 
     # Mặc định nghiệp vụ khi tạo/reset user
     keycloak_default_temporary: bool = True

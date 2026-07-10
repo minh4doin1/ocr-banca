@@ -2,7 +2,7 @@
  * Credential service — quản lý credentials (đặc biệt là OTP).
  */
 
-import type { CredentialRepresentation } from '@keycloak/keycloak-admin-client/lib/defs/credentialRepresentation.js';
+import type CredentialRepresentation from '@keycloak/keycloak-admin-client/lib/defs/credentialRepresentation.js';
 
 import { config } from '../config.js';
 import { kcClient, withKeycloakErrors, UserNotFoundError } from '../keycloak.js';
@@ -69,11 +69,15 @@ export async function resetOtp(userId: string): Promise<{ deleted: number }> {
   const current = user.requiredActions ?? [];
   if (!current.includes(REQUIRED_ACTION_CONFIGURE_TOTP)) {
     await withKeycloakErrors(() =>
-      kcClient.raw().users.update({
-        realm: config.KEYCLOAK_REALM,
-        id: userId,
-        user: { requiredActions: [...current, REQUIRED_ACTION_CONFIGURE_TOTP] },
-      }),
+      kcClient
+        .raw()
+        .users.update(
+          {
+            realm: config.KEYCLOAK_REALM,
+            id: userId,
+          },
+          { ...user, requiredActions: [...current, REQUIRED_ACTION_CONFIGURE_TOTP] },
+        ),
     );
   }
 

@@ -5,7 +5,8 @@
  * Keycloak HTTP errors sang domain errors (UserExistsError, UserNotFoundError, …).
  */
 
-import type { UserRepresentation, CredentialRepresentation } from '@keycloak/keycloak-admin-client/lib/defs/userRepresentation.js';
+import type UserRepresentation from '@keycloak/keycloak-admin-client/lib/defs/userRepresentation.js';
+import type CredentialRepresentation from '@keycloak/keycloak-admin-client/lib/defs/credentialRepresentation.js';
 
 import { config } from '../config.js';
 import { kcClient, withKeycloakErrors, UserNotFoundError } from '../keycloak.js';
@@ -57,7 +58,7 @@ export async function createUser(input: CreateUserInput): Promise<{ id: string }
       ];
     }
 
-    const result = await kcClient.raw().users.create({ realm: config.KEYCLOAK_REALM, user });
+    const result = await kcClient.raw().users.create({ realm: config.KEYCLOAK_REALM, ...user });
     return { id: result.id };
   });
 }
@@ -113,11 +114,13 @@ export async function updateUser(userId: string, input: UpdateUserInput): Promis
       ...(input.attributes !== undefined && { attributes: input.attributes }),
     };
 
-    await kcClient.raw().users.update({
-      realm: config.KEYCLOAK_REALM,
-      id: userId,
-      user: merged,
-    });
+    await kcClient.raw().users.update(
+      {
+        realm: config.KEYCLOAK_REALM,
+        id: userId,
+      },
+      merged,
+    );
   });
 }
 
@@ -160,18 +163,16 @@ export async function mergeUserAttributes(
       if (v && v.length > 0) merged[k] = v;
     }
 
-    await kcClient.raw().users.update({
-      realm: config.KEYCLOAK_REALM,
-      id: userId,
-      user: {
-        username: existing.username,
-        email: existing.email,
-        firstName: existing.firstName,
-        lastName: existing.lastName,
-        enabled: existing.enabled,
+    await kcClient.raw().users.update(
+      {
+        realm: config.KEYCLOAK_REALM,
+        id: userId,
+      },
+      {
+        ...existing,
         attributes: merged,
       },
-    });
+    );
   });
 }
 
@@ -193,11 +194,16 @@ export async function ensureRequiredActions(
     const merged = Array.from(new Set([...current, ...actions]));
     if (merged.length === current.length) return merged; // không thay đổi
 
-    await kcClient.raw().users.update({
-      realm: config.KEYCLOAK_REALM,
-      id: userId,
-      user: { requiredActions: merged },
-    });
+    await kcClient.raw().users.update(
+      {
+        realm: config.KEYCLOAK_REALM,
+        id: userId,
+      },
+      {
+        ...existing,
+        requiredActions: merged,
+      },
+    );
     return merged;
   });
 }
@@ -208,11 +214,22 @@ export async function setRequiredActions(
 ): Promise<string[]> {
   await kcClient.ensureAuth();
   return withKeycloakErrors(async () => {
-    await kcClient.raw().users.update({
+    const existing = await kcClient.raw().users.findOne({
       realm: config.KEYCLOAK_REALM,
       id: userId,
-      user: { requiredActions: actions },
     });
+    if (!existing) throw new UserNotFoundError(userId);
+
+    await kcClient.raw().users.update(
+      {
+        realm: config.KEYCLOAK_REALM,
+        id: userId,
+      },
+      {
+        ...existing,
+        requiredActions: actions,
+      },
+    );
     return actions;
   });
 }

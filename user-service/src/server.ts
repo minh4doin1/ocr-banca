@@ -65,7 +65,7 @@ export async function buildServer(): Promise<FastifyInstance> {
         .code(status)
         .send({ error: 'keycloak_error', message: err.message, upstream_status: err.status });
     }
-    if (err.name === 'ZodError') {
+    if (err instanceof Error && err.name === 'ZodError') {
       return reply.code(400).send({
         error: 'validation_error',
         issues: (err as any).issues,
@@ -73,7 +73,8 @@ export async function buildServer(): Promise<FastifyInstance> {
     }
     // Unknown error
     reply.log.error({ err }, 'unhandled error');
-    return reply.code(500).send({ error: 'internal_error', message: err.message });
+    const message = err instanceof Error ? err.message : 'Unknown error';
+    return reply.code(500).send({ error: 'internal_error', message });
   });
 
   // ── Routes ──

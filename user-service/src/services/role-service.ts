@@ -5,7 +5,8 @@
  * Cache UUID của client trong memory để giảm API call.
  */
 
-import type { RoleRepresentation } from '@keycloak/keycloak-admin-client/lib/defs/roleRepresentation.js';
+import type RoleRepresentation from '@keycloak/keycloak-admin-client/lib/defs/roleRepresentation.js';
+import type { RoleMappingPayload } from '@keycloak/keycloak-admin-client/lib/defs/roleRepresentation.js';
 
 import { config } from '../config.js';
 import { kcClient, withKeycloakErrors } from '../keycloak.js';
@@ -89,7 +90,7 @@ export async function assignClientRoles(
     })) as RoleRepresentation[];
     const currentNames = new Set(current.map((r) => r.name));
 
-    const toAssign: RoleRepresentation[] = [];
+    const toAssign: RoleMappingPayload[] = [];
     const skipped: string[] = [];
     for (const name of roleNames) {
       if (currentNames.has(name)) {
@@ -97,7 +98,9 @@ export async function assignClientRoles(
         continue;
       }
       const role = await resolveRoleRepresentation(clientUuid, name);
-      toAssign.push(role);
+      if (role.id && role.name) {
+        toAssign.push({ id: role.id, name: role.name });
+      }
     }
 
     if (toAssign.length === 0) {
@@ -132,7 +135,7 @@ export async function removeClientRoles(
     })) as RoleRepresentation[];
     const currentByName = new Map(current.map((r) => [r.name, r]));
 
-    const toRemove: RoleRepresentation[] = [];
+    const toRemove: RoleMappingPayload[] = [];
     const skipped: string[] = [];
     for (const name of roleNames) {
       const r = currentByName.get(name);
@@ -140,7 +143,9 @@ export async function removeClientRoles(
         skipped.push(name);
         continue;
       }
-      toRemove.push(r);
+      if (r.id && r.name) {
+        toRemove.push({ id: r.id, name: r.name });
+      }
     }
 
     if (toRemove.length === 0) return { removed: [], skipped };

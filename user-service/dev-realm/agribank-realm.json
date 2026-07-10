@@ -28,7 +28,7 @@
       "protocol": "openid-connect"
     },
     {
-      "clientId": "banca-app",
+      "clientId": "banca",
       "enabled": true,
       "publicClient": true,
       "bearerOnly": false,

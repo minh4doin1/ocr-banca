@@ -70,7 +70,7 @@ class UserServiceClient:
         base_url: str,
         api_key: str,
         timeout: int = 30,
-        roles_client_id: str = "banca-app",
+        roles_client_id: str = "banca",
     ) -> None:
         if not base_url:
             raise UserServiceError("USER_SERVICE_URL chưa cấu hình.")

@@ -5,8 +5,15 @@
  * Validate bằng zod để fail-fast khi thiếu config quan trọng.
  */
 
-import 'dotenv/config';
+import path from 'node:path';
+import { config as loadDotenv } from 'dotenv';
 import { z } from 'zod';
+
+// Luôn đọc .env từ thư mục user-service/, không phụ thuộc cwd khi start.
+const envPath = path.resolve(__dirname, '..', '.env');
+loadDotenv({ path: envPath });
+
+export const ENV_FILE_PATH = envPath;
 
 const ConfigSchema = z.object({
   // ── Server ──
@@ -32,7 +39,7 @@ const ConfigSchema = z.object({
 
   // ── Client chứa role nghiệp vụ ──
   // Service tự resolve UUID từ tên này — caller không cần biết UUID.
-  ROLES_CLIENT_ID: z.string().default('banca-app'),
+  ROLES_CLIENT_ID: z.string().default('banca'),
 });
 
 export type AppConfig = z.infer<typeof ConfigSchema>;
