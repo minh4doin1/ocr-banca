@@ -1,0 +1,12 @@
+node_modules
+dist
+tests
+.env
+.env.local
+.git
+.gitignore
+README.md
+*.md
+dev-realm
+coverage
+.DS_Store

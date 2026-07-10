@@ -6,7 +6,9 @@
 param(
     [string]$Branch = "main",
     [switch]$UseGpu = $true,
-    [int]$Port = 8100
+    [int]$Port = 8100,
+    [switch]$StartUserService = $true,
+    [int]$UserPort = 8300
 )
 
 Set-StrictMode -Version Latest
@@ -28,4 +30,9 @@ if ($UseGpu) {
     & $starter -Port $Port
 } else {
     & $starter -UseGpu:$false -Port $Port
+}
+
+if ($StartUserService) {
+    $userStarter = Join-Path $repoRoot "ocr-release-kit\Start-UserService.ps1"
+    & $userStarter -Port $UserPort
 }

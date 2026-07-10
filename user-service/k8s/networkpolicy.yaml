@@ -1,0 +1,50 @@
+# ============================================================
+# NetworkPolicy — restrict ingress/egress cho user-service
+# ============================================================
+
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: user-service-netpol
+  namespace: agribank
+spec:
+  podSelector:
+    matchLabels:
+      app: user-service
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  # Allow ingress-nginx (cho external caller qua ingress)
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: ingress-nginx
+    ports:
+    - port: 8300
+      protocol: TCP
+  # Allow OCR service pods gọi trực tiếp (cluster-internal)
+  - from:
+    - podSelector:
+        matchLabels:
+          app: ocr-banca
+    ports:
+    - port: 8300
+      protocol: TCP
+  egress:
+  # DNS
+  - to:
+    - namespaceSelector: {}
+    ports:
+    - port: 53
+      protocol: UDP
+    - port: 53
+      protocol: TCP
+  # Keycloak service trong cluster
+  - to:
+    - podSelector:
+        matchLabels:
+          app: keycloak
+    ports:
+    - port: 8080
+      protocol: TCP

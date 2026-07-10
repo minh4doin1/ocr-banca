@@ -1,0 +1,130 @@
+# ============================================================
+# kc-proxy — Kubernetes manifests
+# Namespace: agribank (đổi nếu cluster dùng namespace khác)
+# Apply thứ tự: secret.yaml → deployment.yaml → service.yaml → networkpolicy.yaml → ingress-patch.yaml
+# ============================================================
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: agribank
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: kc-proxy-secrets
+  namespace: agribank
+type: Opaque
+# Tạo secret thật bằng:
+#   kubectl -n agribank create secret generic kc-proxy-secrets \
+#     --from-literal=PROXY_API_KEY="$(openssl rand -hex 32)" \
+#     --from-literal=KEYCLOAK_CLIENT_ID="ocr-banca-service" \
+#     --from-literal=KEYCLOAK_CLIENT_SECRET="<real-secret-from-keycloak-admin>"
+stringData:
+  PROXY_API_KEY: "REPLACE_WITH_OPENSSL_RAND_HEX_32"
+  KEYCLOAK_CLIENT_ID: "ocr-banca-service"
+  KEYCLOAK_CLIENT_SECRET: "REPLACE_WITH_REAL_KEYCLOAK_CLIENT_SECRET"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kc-proxy
+  namespace: agribank
+  labels:
+    app: kc-proxy
+    tier: internal
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: kc-proxy
+  template:
+    metadata:
+      labels:
+        app: kc-proxy
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+      containers:
+      - name: kc-proxy
+        image: registry.agribank.com.vn/ocr-banca/kc-proxy:1.0.0
+        imagePullPolicy: IfNotPresent
+        ports:
+        - name: http
+          containerPort: 8200
+        envFrom:
+        - secretRef:
+            name: kc-proxy-secrets
+        env:
+        - name: HOST
+          value: "0.0.0.0"
+        - name: PORT
+          value: "8200"
+        - name: LOG_LEVEL
+          value: "INFO"
+        - name: KEYCLOAK_INTERNAL_URL
+          value: "http://keycloak.keycloak.svc.cluster.local:8080"
+        - name: KEYCLOAK_REALM
+          value: "agribank"
+        - name: KEYCLOAK_VERIFY_SSL
+          value: "false"
+        - name: KEYCLOAK_TIMEOUT_SECONDS
+          value: "30"
+        - name: KEYCLOAK_TOKEN_LEEWAY_SECONDS
+          value: "30"
+        - name: PROXY_PATH_PREFIX
+          value: "/api/v1/iam-bridge"
+        - name: AUDIT_LOG_ENABLED
+          value: "true"
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            cpu: 500m
+            memory: 256Mi
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: http
+          initialDelaySeconds: 10
+          periodSeconds: 30
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: http
+          initialDelaySeconds: 5
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: ["ALL"]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kc-proxy
+  namespace: agribank
+  labels:
+    app: kc-proxy
+spec:
+  type: ClusterIP
+  selector:
+    app: kc-proxy
+  ports:
+  - name: http
+    port: 80
+    targetPort: http
+    protocol: TCP

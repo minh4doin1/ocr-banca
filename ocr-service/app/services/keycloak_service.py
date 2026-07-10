@@ -146,6 +146,9 @@ class KeycloakClient:
         headers = {"Authorization": f"Bearer {self.get_access_token()}"}
         if json_body:
             headers["Content-Type"] = "application/json"
+        # Khi deploy qua kc-proxy, gửi kèm shared secret để proxy xác thực.
+        if settings.keycloak_proxy_api_key:
+            headers["X-Proxy-Key"] = settings.keycloak_proxy_api_key
         return headers
 
     def _request(

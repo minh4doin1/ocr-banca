@@ -1,0 +1,51 @@
+# ============================================================
+# NetworkPolicy — chỉ allow ingress từ ingress-nginx và OCR service
+# Egress chỉ cho phép tới Keycloak service trong cluster
+# ============================================================
+
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: kc-proxy-netpol
+  namespace: agribank
+spec:
+  podSelector:
+    matchLabels:
+      app: kc-proxy
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  # Allow ingress controller (nginx) gọi vào proxy
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: ingress-nginx
+    ports:
+    - port: 8200
+      protocol: TCP
+  # Allow OCR service pods gọi trực tiếp (nếu không qua ingress)
+  - from:
+    - podSelector:
+        matchLabels:
+          app: ocr-banca
+    ports:
+    - port: 8200
+      protocol: TCP
+  egress:
+  # Cho phép gọi DNS (cần thiết để resolve cluster DNS)
+  - to:
+    - namespaceSelector: {}
+    ports:
+    - port: 53
+      protocol: UDP
+    - port: 53
+      protocol: TCP
+  # Cho phép gọi Keycloak service trong cluster
+  - to:
+    - podSelector:
+        matchLabels:
+          app: keycloak
+    ports:
+    - port: 8080
+      protocol: TCP

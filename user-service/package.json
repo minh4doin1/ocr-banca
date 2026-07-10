@@ -1,0 +1,32 @@
+{
+  "name": "@agribank/user-service",
+  "version": "1.0.0",
+  "description": "Keycloak User Management BE service (Node.js + Fastify + keycloak-admin)",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx watch src/index.ts",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@fastify/helmet": "^12.0.0",
+    "@fastify/sensible": "^6.0.0",
+    "@keycloak/keycloak-admin-client": "^26.0.0",
+    "dotenv": "^16.4.5",
+    "fastify": "^5.0.0",
+    "pino-pretty": "^11.2.2",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.7.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0",
+    "vitest": "^2.1.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

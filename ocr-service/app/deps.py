@@ -6,6 +6,7 @@ from fastapi import Header, HTTPException
 
 from app.config import settings
 from app.services.keycloak_env import normalize_target_env
+from app.services.user_service_client import UserServiceClient
 
 
 def get_target_env(
@@ -35,3 +36,28 @@ def verify_worker_token(authorization: str | None = Header(default=None)) -> Non
     token = authorization.removeprefix("Bearer ").strip()
     if token != expected:
         raise HTTPException(status_code=401, detail="Token worker không hợp lệ")
+
+
+def get_user_service_client() -> UserServiceClient:
+    """
+    Factory cho UserServiceClient (Node.js BE).
+
+    Đọc từ settings.user_service_url. Raise 503 nếu chưa cấu hình
+    (FE sẽ thấy 503 thay vì crash).
+    """
+    if not settings.user_service_url:
+        raise HTTPException(
+            status_code=503,
+            detail="USER_SERVICE_URL chưa cấu hình — không thể provision user.",
+        )
+    return UserServiceClient(
+        base_url=settings.user_service_url,
+        api_key=settings.user_service_api_key,
+        timeout=settings.user_service_timeout_seconds,
+        roles_client_id=settings.user_service_roles_client_id,
+    )
+
+
+def user_service_enabled() -> bool:
+    """True nếu đã cấu hình user-service URL (dùng cho health/diagnostics)."""
+    return bool(settings.user_service_url.strip())

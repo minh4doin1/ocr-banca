@@ -1,0 +1,57 @@
+{
+  "realm": "agribank",
+  "enabled": true,
+  "accessTokenLifespan": 1800,
+  "sslRequired": "none",
+  "registrationAllowed": false,
+  "loginWithEmailAllowed": true,
+  "duplicateEmailsAllowed": false,
+  "resetPasswordAllowed": false,
+  "editUsernameAllowed": false,
+  "bruteForceProtected": false,
+  "permanentLockout": false,
+  "roles": {
+    "realm": []
+  },
+  "clients": [
+    {
+      "clientId": "ocr-banca-service",
+      "enabled": true,
+      "publicClient": false,
+      "secret": "dev-secret-change-me",
+      "bearerOnly": false,
+      "serviceAccountsEnabled": true,
+      "standardFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "redirectUris": [],
+      "webOrigins": [],
+      "protocol": "openid-connect"
+    },
+    {
+      "clientId": "banca",
+      "enabled": true,
+      "publicClient": true,
+      "bearerOnly": false,
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "redirectUris": ["http://localhost:5173/*"],
+      "webOrigins": ["*"],
+      "protocol": "openid-connect",
+      "roles": [
+        { "name": "banca-admin" },
+        { "name": "banca-seller" },
+        { "name": "banca-accounting-operator" },
+        { "name": "banca-accounting-controller" }
+      ]
+    }
+  ],
+  "users": [
+    {
+      "username": "service-admin",
+      "enabled": true,
+      "emailVerified": true,
+      "firstName": "Service",
+      "lastName": "Admin"
+    }
+  ]
+}

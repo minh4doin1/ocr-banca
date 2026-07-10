@@ -1,8 +1,11 @@
 # OCR Release Kit
 
-Bo nay gom 2 file de chay nhanh he thong OCR trong repo:
+Bo nay gom cac file de chay nhanh he thong trong repo:
 
 - `Start-OcrSystem.ps1`: script khoi dong backend OCR.
+- `Start-UserService.ps1`: script khoi dong backend user-service.
+- `Start-AllServices.ps1`: script khoi dong ca OCR + user-service.
+- `Deploy-Remote.ps1`: git pull va khoi dong service qua SSH.
 - `README.md`: huong dan su dung.
 
 ## 1) Vi tri
@@ -38,6 +41,25 @@ Tu root repo:
 .\ocr-release-kit\Start-OcrSystem.ps1
 ```
 
+Chay user-service:
+
+```powershell
+.\ocr-release-kit\Start-UserService.ps1
+```
+
+Chay ca OCR + user-service:
+
+```powershell
+.\ocr-release-kit\Start-AllServices.ps1
+```
+
+Quick start (khuyen dung) cho may host:
+
+```powershell
+cd C:\Projects\ocr-banca
+.\ocr-release-kit\Start-AllServices.ps1
+```
+
 Chay CPU (khong dung GPU):
 
 ```powershell
@@ -62,6 +84,14 @@ Script se:
    - Frontend OCR: `http://localhost:<port>/`
    - API docs: `http://localhost:<port>/docs`
 
+`Start-UserService.ps1` se:
+
+1. Stop process cu tren port user-service (mac dinh 8300).
+2. Build `user-service` neu chua co `dist/index.js`.
+3. Start `node dist/index.js`.
+4. Poll health endpoint `http://localhost:<port>/healthz`.
+5. Ghi log vao `user-service/logs/user-service.log`.
+
 ## 5) Expose ra internet (local tunnel)
 
 Can `cloudflared` (da co tren may: `winget install -e --id Cloudflare.cloudflared`).
@@ -80,13 +110,50 @@ Can `cloudflared` (da co tren may: `winget install -e --id Cloudflare.cloudflare
 
 Script in ra URL dang `https://xxxx.trycloudflare.com` — gui link nay cho may khac truy cap FE/API.
 
+Tunnel cho `user-service` (port 8300):
+
+```powershell
+.\ocr-release-kit\Start-OcrTunnel.ps1 -Service user
+```
+
+Neu muon doi port:
+
+```powershell
+.\ocr-release-kit\Start-OcrTunnel.ps1 -Service user -Port 9300
+```
+
+Mo dong thoi tunnel cho ca 2 service:
+
+```powershell
+# Terminal A
+.\ocr-release-kit\Start-OcrTunnel.ps1
+
+# Terminal B
+.\ocr-release-kit\Start-OcrTunnel.ps1 -Service user
+```
+
 Luu y:
 
 - Moi lan chay tunnel = URL moi (free trycloudflare).
 - Tat terminal tunnel = link het hieu luc.
 - Khong dung cho du lieu nhay cam production (khong co auth mac dinh tren tunnel).
 
-## 6) Chia se cho may khac (LAN / Tailscale)
+## 6) Deploy nhanh qua SSH
+
+Chay tren may deploy:
+
+```powershell
+ssh user@host "powershell -ExecutionPolicy Bypass -File C:/Projects/ocr-banca/ocr-release-kit/Deploy-Remote.ps1"
+```
+
+Tham so hay dung:
+
+- `-Branch main`: branch deploy.
+- `-Port 8100`: port OCR service.
+- `-StartUserService`: mac dinh da bat.
+- `-UserPort 8300`: port user-service.
+
+## 7) Chia se cho may khac (LAN / Tailscale)
 
 **May user khong can cau hinh gi** — chi mo link ma may GPU host in ra.
 
