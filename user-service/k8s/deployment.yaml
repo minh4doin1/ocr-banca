@@ -1,0 +1,124 @@
+# ============================================================
+# user-service — Kubernetes manifests
+# Namespace: agribank
+# Apply: kubectl apply -f deployment.yaml
+# ============================================================
+
+apiVersion: v1
+kind: Secret
+metadata:
+  name: user-service-secrets
+  namespace: agribank
+type: Opaque
+# Tạo secret thật bằng:
+#   kubectl -n agribank create secret generic user-service-secrets \
+#     --from-literal=SERVICE_API_KEY="$(openssl rand -hex 32)" \
+#     --from-literal=KEYCLOAK_CLIENT_ID="ocr-banca-service" \
+#     --from-literal=KEYCLOAK_CLIENT_SECRET="<real>"
+stringData:
+  SERVICE_API_KEY: "REPLACE_WITH_OPENSSL_RAND_HEX_32"
+  KEYCLOAK_CLIENT_ID: "ocr-banca-service"
+  KEYCLOAK_CLIENT_SECRET: "REPLACE_WITH_REAL_KEYCLOAK_CLIENT_SECRET"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: user-service
+  namespace: agribank
+  labels:
+    app: user-service
+    tier: internal
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: user-service
+  template:
+    metadata:
+      labels:
+        app: user-service
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000  # node user trong Alpine
+        runAsGroup: 1000
+        fsGroup: 1000
+      containers:
+      - name: user-service
+        image: registry.agribank.com.vn/ocr-banca/user-service:1.0.0
+        imagePullPolicy: IfNotPresent
+        ports:
+        - name: http
+          containerPort: 8300
+        envFrom:
+        - secretRef:
+            name: user-service-secrets
+        env:
+        - name: HOST
+          value: "0.0.0.0"
+        - name: PORT
+          value: "8300"
+        - name: LOG_LEVEL
+          value: "info"
+        - name: NODE_ENV
+          value: "production"
+        - name: KEYCLOAK_INTERNAL_URL
+          value: "http://keycloak.keycloak.svc.cluster.local:8080"
+        - name: KEYCLOAK_REALM
+          value: "agribank"
+        - name: KEYCLOAK_VERIFY_SSL
+          value: "false"
+        - name: KEYCLOAK_TIMEOUT_MS
+          value: "30000"
+        - name: ROLES_CLIENT_ID
+          value: "banca-app"
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 1000m
+            memory: 512Mi
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: http
+          initialDelaySeconds: 15
+          periodSeconds: 30
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: http
+          initialDelaySeconds: 5
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: ["ALL"]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: user-service
+  namespace: agribank
+  labels:
+      app: user-service
+spec:
+  type: ClusterIP
+  selector:
+    app: user-service
+  ports:
+  - name: http
+    port: 80
+    targetPort: http
+    protocol: TCP
