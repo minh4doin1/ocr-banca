@@ -118,6 +118,16 @@ class Settings(BaseSettings):
     # Set base_url thành URL của proxy ingress (vd https://api.agribank.com.vn/api/v1/iam-bridge).
     keycloak_proxy_api_key: str = ""  # Shared secret với proxy; trống = không gửi header
 
+    # --- User Service (BE service mới, Node.js + Fastify) ---
+    # Khi set, OCR service gọi user-service thay cho KeycloakClient trực tiếp.
+    # user-service tự resolve UUID, cache token, map lỗi — router chỉ cần gọi API cao cấp.
+    # URL vd: http://user-service.agribank.svc.cluster.local:80
+    # hoặc qua ingress: https://api.agribank.com.vn/api/v1/users-svc
+    user_service_url: str = ""
+    user_service_api_key: str = ""  # Shared secret với user-service; trống = không auth (dev only)
+    user_service_timeout_seconds: int = 30
+    user_service_roles_client_id: str = "banca-app"  # client chứa role banca-*
+
     # Mặc định nghiệp vụ khi tạo/reset user
     keycloak_default_temporary: bool = True
     keycloak_default_required_actions: str = "UPDATE_PASSWORD,CONFIGURE_TOTP"
