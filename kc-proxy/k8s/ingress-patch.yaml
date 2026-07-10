@@ -1,0 +1,44 @@
+# ============================================================
+# Ingress patch — thêm path lách vào ingress có sẵn của cluster
+# KHÔNG dùng path hiển nhiên (/admin, /keycloak, /kc, /iam)
+# Áp dụng: kubectl apply -f ingress-patch.yaml
+# ============================================================
+
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ocr-banca-api
+  namespace: agribank
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "1m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "60"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "60"
+    # KHÔNG lộ path qua server-snippet / rewrite
+    nginx.ingress.kubernetes.io/configuration-snippet: |
+      more_clear_input_headers "X-Forwarded-Proto";
+spec:
+  ingressClassName: nginx
+  tls:
+  - hosts:
+    - api.agribank.com.vn
+    secretName: api-agribank-tls
+  rules:
+  - host: api.agribank.com.vn
+    http:
+      paths:
+      # OCR service path (giữ nguyên như cũ)
+      - path: /api/v1
+        pathType: Prefix
+        backend:
+          service:
+            name: ocr-banca
+            port:
+              number: 8100
+      # KC proxy path lách — KHÔNG đổi nếu OCR service đang dùng
+      - path: /api/v1/iam-bridge
+        pathType: Prefix
+        backend:
+          service:
+            name: kc-proxy
+            port:
+              number: 80

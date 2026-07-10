@@ -1,0 +1,1 @@
+"""Tests cho kc-proxy."""

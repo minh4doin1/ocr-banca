@@ -112,6 +112,12 @@ class Settings(BaseSettings):
     keycloak_timeout_seconds: int = 30
     keycloak_token_leeway_seconds: int = 30
 
+    # --- Keycloak Admin Proxy (bypass F5/WAF) ---
+    # Khi set, KeycloakClient sẽ gọi qua proxy (kc-proxy pod trong cluster)
+    # thay vì gọi trực tiếp admin-sso.agribank.com (bị F5 chặn).
+    # Set base_url thành URL của proxy ingress (vd https://api.agribank.com.vn/api/v1/iam-bridge).
+    keycloak_proxy_api_key: str = ""  # Shared secret với proxy; trống = không gửi header
+
     # Mặc định nghiệp vụ khi tạo/reset user
     keycloak_default_temporary: bool = True
     keycloak_default_required_actions: str = "UPDATE_PASSWORD,CONFIGURE_TOTP"
