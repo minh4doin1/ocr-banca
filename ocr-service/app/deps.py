@@ -5,6 +5,14 @@ from __future__ import annotations
 from fastapi import Header, HTTPException
 
 from app.config import settings
+from app.services.keycloak_env import normalize_target_env
+
+
+def get_target_env(
+    x_ocr_target_env: str = Header(default="dev", alias="X-OCR-Target-Env"),
+) -> str:
+    """Frontend dev/prod switcher — chọn profile Keycloak."""
+    return normalize_target_env(x_ocr_target_env)
 
 
 def verify_worker_token(authorization: str | None = Header(default=None)) -> None:

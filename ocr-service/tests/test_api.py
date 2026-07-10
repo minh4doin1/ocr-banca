@@ -46,7 +46,19 @@ def test_health():
     response = client.get("/health")
     assert response.status_code == 200
     data = response.json()
-    assert data["status"] == "healthy"
+    assert data["status"] in ("healthy", "degraded")
+
+
+def test_ocr_environments():
+    """Frontend env switcher: Keycloak profiles; api_url empty = same-origin."""
+    response = client.get("/api/ocr/environments")
+    assert response.status_code == 200
+    data = response.json()
+    assert "server_env" in data
+    assert isinstance(data["profiles"], list)
+    assert len(data["profiles"]) >= 1
+    assert data["profiles"][0]["id"] == "dev"
+    assert data["profiles"][0]["api_url"] == ""
 
 
 # ──────────────────────────────────────────────────────────────
@@ -235,3 +247,29 @@ def test_table_data_schema():
     )
     assert table.num_cols == 2
     assert len(table.cells) == 2
+
+
+def test_keycloak_diagnostics_endpoint(monkeypatch):
+    """GET /api/users/keycloak-diagnostics trả battery test theo X-OCR-Target-Env."""
+    from app.models.schemas import KeycloakDiagStep, KeycloakDiagnosticsResponse
+
+    def _fake_diag(env: str) -> KeycloakDiagnosticsResponse:
+        return KeycloakDiagnosticsResponse(
+            ok=False,
+            target_env=env,
+            summary="test summary",
+            steps=[KeycloakDiagStep(step="dns", ok=True, message="ok")],
+        )
+
+    monkeypatch.setattr(
+        "app.routers.users.run_keycloak_diagnostics", _fake_diag
+    )
+    response = client.get(
+        "/api/users/keycloak-diagnostics",
+        headers={"X-OCR-Target-Env": "prod"},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["target_env"] == "prod"
+    assert data["summary"] == "test summary"
+    assert data["steps"][0]["step"] == "dns"

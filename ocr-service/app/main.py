@@ -31,6 +31,40 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+_kc_file_logging_ready = False
+
+
+def _setup_keycloak_logging() -> None:
+    """Ghi log Keycloak chi tiết ra logs/keycloak.log khi KEYCLOAK_DEBUG=true."""
+    global _kc_file_logging_ready
+    if _kc_file_logging_ready or not settings.keycloak_debug:
+        return
+    from pathlib import Path
+
+    log_dir = Path(__file__).resolve().parent.parent / "logs"
+    log_dir.mkdir(exist_ok=True)
+    fh = logging.FileHandler(log_dir / "keycloak.log", encoding="utf-8")
+    fh.setFormatter(
+        logging.Formatter(
+            "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+    )
+    for name in (
+        "app.services.keycloak_service",
+        "app.routers.users",
+        "app.services.keycloak_diagnostics",
+    ):
+        lg = logging.getLogger(name)
+        lg.setLevel(logging.DEBUG)
+        lg.addHandler(fh)
+    _kc_file_logging_ready = True
+    logger.info("Keycloak debug logging → %s", log_dir / "keycloak.log")
+
+
+_setup_keycloak_logging()
+
 # ──────────────────────────────────────────────────────────────
 # App
 # ──────────────────────────────────────────────────────────────
@@ -56,7 +90,7 @@ app.add_middleware(
     allow_origins=settings.cors_origins_list,
     allow_credentials=True,
     allow_methods=["*"],
-    allow_headers=["*"],
+    allow_headers=["*", "X-OCR-Target-Env", "Authorization", "Content-Type"],
 )
 
 # ──────────────────────────────────────────────────────────────
@@ -140,6 +174,7 @@ async def startup_event():
 
     logger.info("=" * 60)
     logger.info("Banca OCR Service starting up")
+    logger.info("APP_ENV: %s", settings.app_env)
     logger.info("Engine: %s", settings.ocr_engine)
     logger.info("GPU: %s", settings.paddle_use_gpu)
     gpu = probe_gpu_runtime()

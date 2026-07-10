@@ -3,7 +3,126 @@
    ============================================================ */
 
 const _devFePorts = new Set(['5173', '3000', '5500']);
-const API_BASE = _devFePorts.has(window.location.port) ? 'http://localhost:8100' : '';
+const ENV_STORAGE_KEY = 'ocr_keycloak_env_v1';
+const ENV_META_CACHE_KEY = 'ocr_keycloak_env_meta_v2';
+/** Chỉ Vite FE mới trỏ localhost:8100; khi mở từ :8100/LAN/Tailscale → same-origin */
+const _viteApiBase = _devFePorts.has(window.location.port) ? 'http://localhost:8100' : '';
+
+let prodKeycloakReady = false;
+let prodKeycloakLabel = '';
+let activeEnvId = localStorage.getItem(ENV_STORAGE_KEY) || 'dev';
+
+function getActiveEnvId() {
+    return activeEnvId;
+}
+
+/** Backend OCR — luôn cùng máy đang mở FE (không đổi khi chuyển KC DEV/PROD) */
+function getApiBase() {
+    return (_viteApiBase || '').replace(/\/$/, '');
+}
+
+/** Chỉ áp dụng cho API tạo lô user / Keycloak */
+function getTargetEnvHeaders() {
+    return { 'X-OCR-Target-Env': activeEnvId };
+}
+
+window.getTargetEnvHeaders = getTargetEnvHeaders;
+
+function _readEnvMeta() {
+    try {
+        const raw = localStorage.getItem(ENV_META_CACHE_KEY);
+        return raw ? JSON.parse(raw) : null;
+    } catch {
+        return null;
+    }
+}
+
+function _writeEnvMeta(meta) {
+    try {
+        localStorage.setItem(ENV_META_CACHE_KEY, JSON.stringify(meta));
+    } catch {
+        /* ignore */
+    }
+}
+
+async function loadEnvironmentProfiles() {
+    // Xóa cache cũ từng ép api_base=localhost (gây lỗi khi mở qua LAN/Tailscale)
+    try {
+        localStorage.removeItem('ocr_keycloak_env_meta_v1');
+        localStorage.removeItem('ocr_api_env_profiles_v1');
+        localStorage.removeItem('ocr_api_env_profiles_v2');
+        localStorage.removeItem('ocr_api_env_v1');
+    } catch {
+        /* ignore */
+    }
+
+    const cached = _readEnvMeta();
+    if (cached?.prod_keycloak_ready) {
+        prodKeycloakReady = true;
+        prodKeycloakLabel = cached.prod_label || '';
+    }
+
+    try {
+        const res = await fetch(`${getApiBase()}/api/ocr/environments`);
+        if (!res.ok) return;
+        const data = await res.json();
+        const prodProfile = (data.profiles || []).find((p) => p.id === 'prod');
+        prodKeycloakReady = !!prodProfile?.keycloak_configured;
+        prodKeycloakLabel = prodProfile?.keycloak_label || prodProfile?.label || 'PROD';
+        _writeEnvMeta({
+            prod_keycloak_ready: prodKeycloakReady,
+            prod_label: prodKeycloakLabel,
+        });
+    } catch {
+        /* giữ cache / mặc định */
+    }
+}
+
+function updateEnvUi() {
+    const badge = document.getElementById('env-badge');
+    const btn = document.getElementById('btn-env-switch');
+    const isProd = activeEnvId === 'prod';
+
+    if (badge) {
+        badge.textContent = isProd ? 'KC PROD' : 'KC DEV';
+        badge.classList.remove('env-dev', 'env-prod', 'env-mismatch');
+        badge.classList.add(isProd ? 'env-prod' : 'env-dev');
+        badge.title = isProd
+            ? `Tạo lô user → Keycloak PROD (${prodKeycloakLabel || 'production'})`
+            : 'Tạo lô user → Keycloak DEV';
+    }
+    if (btn) {
+        if (!isProd && !prodKeycloakReady) {
+            btn.disabled = true;
+            btn.textContent = 'PROD chưa cấu hình';
+            btn.title = 'Thêm KEYCLOAK_PROD_* trong .env rồi restart server';
+        } else {
+            btn.disabled = false;
+            btn.textContent = isProd ? 'Chuyển KC DEV' : 'Chuyển KC PROD';
+            btn.title = isProd
+                ? 'Tạo lô sẽ gọi Keycloak DEV'
+                : 'Tạo lô sẽ gọi Keycloak PROD (OCR vẫn chạy trên server hiện tại)';
+        }
+    }
+}
+
+async function switchEnvironment() {
+    const targetId = activeEnvId === 'dev' ? 'prod' : 'dev';
+    if (targetId === 'prod' && !prodKeycloakReady) {
+        notify('warning', 'Chưa cấu hình Keycloak PROD', 'Thêm KEYCLOAK_PROD_BASE_URL + KEYCLOAK_PROD_CLIENT_SECRET trong .env.');
+        return;
+    }
+    activeEnvId = targetId;
+    localStorage.setItem(ENV_STORAGE_KEY, activeEnvId);
+    updateEnvUi();
+    // Không gọi lại field-config / không đổi API base — tránh lỗi kết nối BE
+    const label = targetId === 'prod' ? 'Keycloak PROD' : 'Keycloak DEV';
+    notify('success', `Đã chuyển sang ${label}`, 'OCR không đổi. Chỉ bước Tạo lô user dùng Keycloak mới.', 5000);
+}
+
+window.getApiBase = getApiBase;
+window.getActiveEnvId = getActiveEnvId;
+window.switchEnvironment = switchEnvironment;
 
 // ── State ──
 let currentStep = 0;
@@ -110,6 +229,13 @@ function escapeAttr(str) {
 
 // ── Init ──
 document.addEventListener('DOMContentLoaded', async () => {
+    await loadEnvironmentProfiles();
+    if (activeEnvId === 'prod' && !prodKeycloakReady) {
+        activeEnvId = 'dev';
+        localStorage.setItem(ENV_STORAGE_KEY, 'dev');
+    }
+    updateEnvUi();
+    document.getElementById('btn-env-switch')?.addEventListener('click', () => switchEnvironment());
     await loadRuntimeConfig();
     await loadFieldConfig();
     setupUpload();
@@ -123,7 +249,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
 async function loadRuntimeConfig() {
     try {
-        const res = await fetch(`${API_BASE}/api/ocr/config`);
+        const res = await fetch(`${getApiBase()}/api/ocr/config`);
         if (res.ok) {
             runtimeConfig = await res.json();
             if (runtimeConfig.internal_gpu_configured) {
@@ -357,7 +483,7 @@ async function testWorker(provider) {
         params.set('token', colabTokenInput.value.trim());
     }
     try {
-        const res = await fetch(`${API_BASE}/api/ocr/worker/health?${params}`);
+        const res = await fetch(`${getApiBase()}/api/ocr/worker/health?${params}`);
         const data = await res.json();
         if (data.reachable && data.status === 'healthy') {
             resultEl.classList.add('ok');
@@ -498,7 +624,7 @@ async function uploadPdf(file) {
             formData.append('api_provider', apiProviderSelect.value || 'ocrspace');
         }
 
-        const res = await fetch(`${API_BASE}/api/ocr/upload`, { method: 'POST', body: formData });
+        const res = await fetch(`${getApiBase()}/api/ocr/upload`, { method: 'POST', body: formData });
         if (!res.ok) {
             const err = await res.json().catch(() => ({}));
             throw new Error(err.detail || 'Upload failed');
@@ -533,7 +659,7 @@ async function uploadExcel(file, targetJobId = '') {
         formData.append('file', file);
         if (targetJobId) formData.append('job_id', targetJobId);
 
-        const res = await fetch(`${API_BASE}/api/ocr/upload-excel`, { method: 'POST', body: formData });
+        const res = await fetch(`${getApiBase()}/api/ocr/upload-excel`, { method: 'POST', body: formData });
         const data = await res.json().catch(() => ({}));
         if (!res.ok) throw new Error(data.detail || 'Upload Excel thất bại');
 
@@ -564,7 +690,7 @@ async function uploadDocx(file, targetJobId = '') {
         formData.append('file', file);
         if (targetJobId) formData.append('job_id', targetJobId);
 
-        const res = await fetch(`${API_BASE}/api/ocr/upload-docx`, { method: 'POST', body: formData });
+        const res = await fetch(`${getApiBase()}/api/ocr/upload-docx`, { method: 'POST', body: formData });
         const data = await res.json().catch(() => ({}));
         if (!res.ok) throw new Error(data.detail || 'Upload Word thất bại');
 
@@ -598,7 +724,7 @@ function stopPolling() {
 
 async function pollTick() {
     try {
-        const statusRes = await fetch(`${API_BASE}/api/ocr/status/${jobId}`);
+        const statusRes = await fetch(`${getApiBase()}/api/ocr/status/${jobId}`);
         if (!statusRes.ok) throw new Error('Status failed');
         jobStatus = await statusRes.json();
         totalPages = jobStatus.total_pages;
@@ -683,7 +809,7 @@ function appendLog(entry) {
 
 function downloadExcelPages(pages) {
     if (!jobId) return;
-    let url = `${API_BASE}/api/ocr/result/${jobId}/export`;
+    let url = `${getApiBase()}/api/ocr/result/${jobId}/export`;
     if (pages?.length) {
         url += `?pages=${pages.join(',')}`;
     }
@@ -696,7 +822,7 @@ function downloadExcelPages(pages) {
 
 function downloadDocxPages(pages) {
     if (!jobId) return;
-    let url = `${API_BASE}/api/ocr/result/${jobId}/export-docx`;
+    let url = `${getApiBase()}/api/ocr/result/${jobId}/export-docx`;
     if (pages?.length) {
         url += `?pages=${pages.join(',')}`;
     }

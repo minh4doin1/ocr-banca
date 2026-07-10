@@ -15,6 +15,13 @@ class Settings(BaseSettings):
     # --- Server ---
     host: str = "0.0.0.0"
     port: int = 8100
+    # Môi trường instance backend (dev|prod) — hiển thị trên FE
+    app_env: str = "dev"
+    # URL API OCR cho FE khi chọn DEV / PROD (prod để trống = cùng origin khi deploy chung)
+    ocr_env_dev_api_url: str = "http://localhost:8100"
+    ocr_env_prod_api_url: str = ""
+    ocr_env_dev_label: str = "DEV"
+    ocr_env_prod_label: str = "PROD"
 
     # --- Storage ---
     storage_dir: str = "./storage"
@@ -93,6 +100,8 @@ class Settings(BaseSettings):
 
     # --- Logging ---
     log_level: str = "INFO"
+    # Ghi log chi tiết Keycloak vào logs/keycloak.log (mọi request + traceback provision)
+    keycloak_debug: bool = False
 
     # --- Keycloak (User Provisioning) ---
     keycloak_base_url: str = ""  # vd: https://keycloak-domain (không có dấu / cuối)
@@ -115,6 +124,18 @@ class Settings(BaseSettings):
     # Để trống = dùng KEYCLOAK_CLIENT_ID.
     keycloak_role_assign_client_id: str = ""
     keycloak_role_assign_client_secret: str = ""
+
+    # Keycloak PROD — cùng server OCR, FE chuyển môi trường qua header X-OCR-Target-Env
+    keycloak_prod_base_url: str = ""
+    keycloak_prod_realm: str = ""
+    keycloak_prod_client_id: str = ""
+    keycloak_prod_client_secret: str = ""
+    keycloak_prod_roles_client_id: str = ""
+    # UUID client chứa role banca-* (bỏ qua GET /clients khi WAF chặn)
+    keycloak_prod_roles_client_uuid: str = ""
+    keycloak_prod_verify_ssl: bool = True
+    keycloak_prod_role_assign_client_id: str = ""
+    keycloak_prod_role_assign_client_secret: str = ""
 
     # Map vai trò nghiệp vụ / alias -> tên client role Keycloak
     keycloak_role_map: str = (
@@ -373,6 +394,14 @@ class Settings(BaseSettings):
             if field and label:
                 result[field] = label
         return result
+
+    @property
+    def keycloak_prod_configured(self) -> bool:
+        return bool(
+            self.keycloak_prod_base_url.strip()
+            and self.keycloak_prod_client_id.strip()
+            and self.keycloak_prod_client_secret.strip()
+        )
 
     @property
     def banca_core_configured(self) -> bool:

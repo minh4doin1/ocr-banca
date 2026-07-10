@@ -64,6 +64,30 @@ Ensure-EnvLine $envFile "PDF_LAZY_CONVERT" "true"
 Ensure-EnvLine $envFile "PDF_PREFETCH_PAGES" "true"
 Ensure-EnvLine $envFile "OCR_WARMUP_ON_STARTUP" "true"
 Ensure-EnvLine $envFile "OCR_QUEUE_MAX_SIZE" "30"
+# Keycloak PROD — Admin SSO (IP nội bộ 10.0.93.20; cert mismatch nên tắt verify SSL)
+Ensure-EnvLine $envFile "KEYCLOAK_PROD_BASE_URL" "https://admin-sso.agribank.com"
+Ensure-EnvLine $envFile "KEYCLOAK_PROD_REALM" "agribank"
+Ensure-EnvLine $envFile "KEYCLOAK_PROD_CLIENT_ID" "keycloak-automation"
+Ensure-EnvLine $envFile "KEYCLOAK_PROD_ROLES_CLIENT_ID" "banca"
+Ensure-EnvLine $envFile "KEYCLOAK_PROD_VERIFY_SSL" "false"
+
+# Map hostname Keycloak prod → IP nội bộ (DNS ngoài thường không resolve)
+$hostsPath = "$env:SystemRoot\System32\drivers\etc\hosts"
+try {
+    $hostsRaw = Get-Content $hostsPath -Raw -ErrorAction Stop
+    $needAdmin = $hostsRaw -notmatch "(?m)^\s*10\.0\.93\.20\s+admin-sso\.agribank\.com\s*$"
+    $needNhs = $hostsRaw -notmatch "(?m)^\s*10\.0\.93\.20\s+nhs-iam\.agribank\.com\.vn\s*$"
+    if ($needAdmin -or $needNhs) {
+        $append = @("", "# Keycloak PROD Agribank (OCR Banca)")
+        if ($needAdmin) { $append += "10.0.93.20 admin-sso.agribank.com" }
+        if ($needNhs) { $append += "10.0.93.20 nhs-iam.agribank.com.vn" }
+        Add-Content -Path $hostsPath -Value ($append -join "`r`n") -Encoding ASCII
+        Write-Host "Da cap nhat hosts: 10.0.93.20 -> admin-sso / nhs-iam" -ForegroundColor Green
+    }
+} catch {
+    Write-Host "Khong ghi duoc hosts (can Admin): $($_.Exception.Message)" -ForegroundColor Yellow
+    Write-Host "Them thu cong: 10.0.93.20 admin-sso.agribank.com" -ForegroundColor Yellow
+}
 $popplerBin = Join-Path $serviceRoot "bin\poppler-24.08.0\Library\bin"
 if (Test-Path $popplerBin) {
     Ensure-EnvLine $envFile "POPPLER_PATH" ($popplerBin -replace '\\', '/')

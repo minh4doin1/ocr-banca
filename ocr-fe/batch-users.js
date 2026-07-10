@@ -1,6 +1,6 @@
 /**
  * Batch user provisioning — enrich, review full-page, provision Keycloak.
- * Phụ thuộc app.js: API_BASE, jobId, setStep, stopPolling, notify, escapeAttr, btnCreateBatch, successBatchCode, successTotalRecords
+ * Phụ thuộc app.js: getApiBase(), jobId, setStep, stopPolling, notify, escapeAttr, btnCreateBatch, successBatchCode, successTotalRecords
  */
 
 const SSO_COL_FIELDS_10 = {
@@ -26,7 +26,12 @@ let followUpActions = {};
 let followUpFinalized = false;
 let successShowUpdatedOnly = false;
 let successSearchQuery = '';
-const SUCCESS_STATE_KEY = 'ocr_batch_success_state_v1';
+const SUCCESS_STATE_KEY_PREFIX = 'ocr_batch_success_state_v1';
+
+function getSuccessStateKey() {
+    const envId = typeof getActiveEnvId === 'function' ? getActiveEnvId() : 'dev';
+    return `${SUCCESS_STATE_KEY_PREFIX}_${envId}`;
+}
 
 const CONFLICT_OPTIONS = [
     { value: 'skip', label: 'Bỏ qua' },
@@ -37,7 +42,9 @@ const CONFLICT_OPTIONS = [
 
 async function loadFieldConfig() {
     try {
-        const res = await fetch(`${API_BASE}/api/users/field-config`);
+        const res = await fetch(`${getApiBase()}/api/users/field-config`, {
+            headers: getTargetEnvHeaders(),
+        });
         if (res.ok) fieldConfig = await res.json();
     } catch {
         fieldConfig = {
@@ -244,7 +251,7 @@ function readRoleSelect(el) {
 async function enrichBatchUsers(defaults) {
     const body = { job_id: jobId };
     if (defaults && Object.keys(defaults).length) body.defaults = defaults;
-    const res = await fetch(`${API_BASE}/api/users/enrich`, {
+    const res = await fetch(`${getApiBase()}/api/users/enrich`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
@@ -261,13 +268,13 @@ function matchBadge(status) {
 }
 
 async function searchAgencies(q) {
-    const res = await fetch(`${API_BASE}/api/users/lookup/agencies?search=${encodeURIComponent(q)}&size=15`);
+    const res = await fetch(`${getApiBase()}/api/users/lookup/agencies?search=${encodeURIComponent(q)}&size=15`);
     if (!res.ok) return [];
     return (await res.json()).items || [];
 }
 
 async function searchAgents(q, agencyId) {
-    let url = `${API_BASE}/api/users/lookup/agents?search=${encodeURIComponent(q)}&size=15`;
+    let url = `${getApiBase()}/api/users/lookup/agents?search=${encodeURIComponent(q)}&size=15`;
     if (agencyId) url += `&agency_id=${encodeURIComponent(agencyId)}`;
     const res = await fetch(url);
     if (!res.ok) return [];
@@ -697,7 +704,7 @@ function hideSuccessPage() {
     followUpFinalized = false;
     successShowUpdatedOnly = false;
     successSearchQuery = '';
-    localStorage.removeItem(SUCCESS_STATE_KEY);
+    localStorage.removeItem(getSuccessStateKey());
     const tbody = document.getElementById('success-results-tbody');
     if (tbody) tbody.innerHTML = '';
     const searchInp = document.getElementById('success-search');
@@ -715,6 +722,7 @@ function hideSuccessPage() {
 function persistSuccessState() {
     if (!lastProvisionResponse || !jobId) return;
     const payload = {
+        envId: typeof getActiveEnvId === 'function' ? getActiveEnvId() : 'dev',
         jobId,
         lastProvisionResponse,
         followUpActions,
@@ -723,15 +731,17 @@ function persistSuccessState() {
         successSearchQuery,
         savedAt: new Date().toISOString(),
     };
-    localStorage.setItem(SUCCESS_STATE_KEY, JSON.stringify(payload));
+    localStorage.setItem(getSuccessStateKey(), JSON.stringify(payload));
 }
 
 function restoreSuccessState() {
     try {
-        const raw = localStorage.getItem(SUCCESS_STATE_KEY);
+        const raw = localStorage.getItem(getSuccessStateKey());
         if (!raw) return false;
         const s = JSON.parse(raw);
         if (!s?.jobId || !s?.lastProvisionResponse?.results?.length) return false;
+        const currentEnv = typeof getActiveEnvId === 'function' ? getActiveEnvId() : 'dev';
+        if (s.envId && s.envId !== currentEnv) return false;
 
         jobId = s.jobId;
         lastProvisionResponse = s.lastProvisionResponse;
@@ -750,7 +760,7 @@ function restoreSuccessState() {
         setStep(3);
         return true;
     } catch {
-        localStorage.removeItem(SUCCESS_STATE_KEY);
+        localStorage.removeItem(getSuccessStateKey());
         return false;
     }
 }
@@ -775,6 +785,35 @@ function buildProvisionUserPayload(u, onConflict) {
     return payload;
 }
 
+async function fetchKeycloakDiagnostics() {
+    try {
+        const res = await fetch(`${getApiBase()}/api/users/keycloak-diagnostics`, {
+            headers: getTargetEnvHeaders(),
+        });
+        const data = await res.json();
+        console.group(`Keycloak diagnostics (${data.target_env || '?'})`);
+        console.log(data.summary);
+        (data.steps || []).forEach((s) => {
+            const tag = s.ok ? 'OK' : 'FAIL';
+            console.log(`${tag} [${s.step}] ${s.message}`, s.detail || '');
+        });
+        if (data.log_hint) console.info(data.log_hint);
+        console.groupEnd();
+        return data;
+    } catch (e) {
+        console.warn('keycloak-diagnostics failed', e);
+        return null;
+    }
+}
+
+function formatDiagnosticsHint(diag) {
+    if (!diag) return '';
+    const failed = (diag.steps || []).filter((s) => !s.ok);
+    if (!failed.length) return diag.summary || '';
+    const lines = failed.slice(0, 4).map((s) => `${s.step}: ${s.message}${s.detail ? ` — ${s.detail.slice(0, 120)}` : ''}`);
+    return `${diag.summary}\n${lines.join('\n')}`;
+}
+
 async function createBatch() {
     syncRolesFromDom();
     if (!validateBeforeProvision()) return;
@@ -784,16 +823,21 @@ async function createBatch() {
 
     try {
         const payloadUsers = enrichedUsers.map(u => buildProvisionUserPayload(u));
-        const res = await fetch(`${API_BASE}/api/users/provision-batch`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+    const res = await fetch(`${getApiBase()}/api/users/provision-batch`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...getTargetEnvHeaders() },
             body: JSON.stringify({ users: payloadUsers, default_on_conflict: 'skip' }),
         });
         const data = await res.json().catch(() => ({}));
-        if (!res.ok) throw new Error(data.detail || 'Tạo lô thất bại');
+        if (!res.ok) {
+            const diag = await fetchKeycloakDiagnostics();
+            const hint = formatDiagnosticsHint(diag);
+            throw new Error(hint ? `${data.detail || 'Tạo lô thất bại'}\n${hint}` : (data.detail || 'Tạo lô thất bại'));
+        }
         showBatchResults(data);
     } catch (e) {
-        notify('error', 'Lỗi tạo lô', e.message);
+        notify('error', 'Lỗi tạo lô', e.message, 15000);
+        await fetchKeycloakDiagnostics();
     } finally {
         if (btn) { btn.disabled = false; btn.textContent = orig || 'Xác nhận & Tạo lô User'; }
     }
@@ -818,7 +862,12 @@ function showBatchResults(data) {
     renderSuccessResultsTable();
 
     if (data.failed > 0) {
-        notify('warn', `Tạo lô xong — ${data.failed} lỗi`, `${data.created} tạo mới, ${data.updated} đã có. Chọn thao tác bổ sung rồi bấm Hoàn tất.`, 8000);
+        fetchKeycloakDiagnostics().then((diag) => {
+            const hint = formatDiagnosticsHint(diag);
+            notify('warn', `Tạo lô xong — ${data.failed} lỗi`,
+                `${data.created} tạo mới, ${data.updated} đã có.${hint ? '\n' + hint : ''} Mở F12 Console hoặc logs/keycloak.log để xem chi tiết.`,
+                15000);
+        });
     } else {
         notify('success', 'Tạo lô thành công', `${data.created} tạo mới, ${data.updated} đã có. Chọn reset MK/OTP nếu cần rồi bấm Hoàn tất.`, 8000);
     }
@@ -849,9 +898,9 @@ async function finalizeBatch() {
 
         if (!payloadUsers.length) throw new Error('Không tìm thấy dữ liệu user để áp dụng thao tác.');
 
-        const res = await fetch(`${API_BASE}/api/users/provision-batch`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+    const res = await fetch(`${getApiBase()}/api/users/provision-batch`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...getTargetEnvHeaders() },
             body: JSON.stringify({ users: payloadUsers, default_on_conflict: 'skip' }),
         });
         const data = await res.json().catch(() => ({}));

@@ -19,6 +19,8 @@ from app.models.schemas import (
     ErrorResponse,
     JobInfo,
     JobStatus,
+    OcrEnvProfile,
+    OcrEnvironmentsResponse,
     OcrResult,
     OcrRuntimeConfig,
     OcrValidationResponse,
@@ -104,6 +106,42 @@ async def get_queue_status():
     from app.services.job_queue import get_job_queue
 
     return get_job_queue().stats()
+
+
+@router.get(
+    "/environments",
+    response_model=OcrEnvironmentsResponse,
+    summary="Danh sách môi trường API (DEV/PROD)",
+)
+async def get_environments():
+    """Cho FE biết Keycloak prod đã cấu hình.
+
+    api_url để trống = FE dùng same-origin (tránh ép localhost khi mở qua LAN/Tailscale).
+    """
+    prod_kc = settings.keycloak_prod_configured
+    profiles = [
+        OcrEnvProfile(
+            id="dev",
+            label=settings.ocr_env_dev_label.strip() or "DEV",
+            api_url="",
+            keycloak_configured=settings.keycloak_configured,
+            keycloak_label=settings.keycloak_base_url.strip() or "DEV",
+        ),
+    ]
+    if prod_kc:
+        profiles.append(
+            OcrEnvProfile(
+                id="prod",
+                label=settings.ocr_env_prod_label.strip() or "PROD",
+                api_url="",
+                keycloak_configured=True,
+                keycloak_label=settings.keycloak_prod_base_url.strip() or "PROD",
+            )
+        )
+    return OcrEnvironmentsResponse(
+        server_env=(settings.app_env.strip().lower() or "dev"),
+        profiles=profiles,
+    )
 
 
 @router.get(

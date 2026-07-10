@@ -12,7 +12,7 @@ from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from app.config import settings
-from app.deps import verify_worker_token
+from app.deps import get_target_env, verify_worker_token
 from app.models.schemas import (
     AgencyLookupItem,
     AgencyLookupResponse,
@@ -25,6 +25,7 @@ from app.models.schemas import (
     ErrorResponse,
     FieldConfigResponse,
     KeycloakRoleCheckResponse,
+    KeycloakDiagnosticsResponse,
     KeycloakUserInput,
     OnConflictAction,
     ProvisionStatus,
@@ -42,6 +43,8 @@ from app.services.banca_core_service import (
     parse_agent_enrichment,
 )
 from app.services.branch_agent_matcher import enrich_user_row
+from app.services.keycloak_env import KeycloakProfile, resolve_keycloak_profile
+from app.services.keycloak_diagnostics import run_keycloak_diagnostics
 from app.services.keycloak_service import (
     REQUIRED_ACTION_CONFIGURE_TOTP,
     REQUIRED_ACTION_UPDATE_PASSWORD,
@@ -119,22 +122,35 @@ def _resolve_temp_password(user: KeycloakUserInput) -> str:
     return _generate_temp_password()
 
 
-def _build_kc_client(realm: str) -> KeycloakClient:
+def _build_kc_client(realm: str, kc: KeycloakProfile) -> KeycloakClient:
+    if not kc.configured:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Keycloak {kc.env.upper()} chua cau hinh.",
+        )
     try:
-        return KeycloakClient(realm=realm or None)
+        return KeycloakClient(
+            base_url=kc.base_url,
+            realm=realm or kc.realm,
+            client_id=kc.client_id,
+            client_secret=kc.client_secret,
+            verify_ssl=kc.verify_ssl,
+        )
     except KeycloakError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
-
-
-def _role_assign_client(provision_client: KeycloakClient) -> KeycloakClient:
+def _role_assign_client(
+    provision_client: KeycloakClient, kc: KeycloakProfile
+) -> KeycloakClient:
     """Client dùng để gán role — client riêng nếu cấu hình, không thì tái dùng provision client."""
-    if settings.keycloak_role_assign_configured:
+    if kc.role_assign_configured:
         return KeycloakClient(
-            realm=provision_client.realm or None,
-            client_id=settings.keycloak_role_assign_client_id,
-            client_secret=settings.keycloak_role_assign_client_secret,
+            base_url=kc.base_url,
+            realm=provision_client.realm or kc.realm,
+            client_id=kc.role_assign_client_id,
+            client_secret=kc.role_assign_client_secret,
+            verify_ssl=kc.verify_ssl,
         )
     return provision_client
 
@@ -158,6 +174,8 @@ def _assign_roles_with_client(
     user_id: str,
     client_uuid: str,
     role_names: list[str],
+    *,
+    roles_client_id: str,
 ) -> list[str]:
     """Gán role qua một KeycloakClient cụ thể. Trả actions hoặc raise.
 
@@ -174,7 +192,7 @@ def _assign_roles_with_client(
         if not role_repr:
             raise KeycloakError(
                 f"Role '{role_name}' khong ton tai tren client "
-                f"'{settings.keycloak_roles_client_id}'."
+                f"'{roles_client_id}'."
             )
         if role_name in existing:
             applied.append(f"role_already:{role_name}")
@@ -208,17 +226,25 @@ def _assign_roles_with_client(
     return applied
 
 
-def _resolve_roles_client_uuid(client: KeycloakClient) -> str:
-    client_id = settings.keycloak_roles_client_id.strip()
+def _resolve_roles_client_uuid(
+    client: KeycloakClient, kc: KeycloakProfile
+) -> str:
+    client_id = kc.roles_client_id.strip()
     if not client_id:
         raise KeycloakError("KEYCLOAK_ROLES_CLIENT_ID chua cau hinh.")
-    if client_id in _client_uuid_cache:
-        return _client_uuid_cache[client_id]
+    cache_key = f"{kc.base_url}:{client_id}"
+    if cache_key in _client_uuid_cache:
+        return _client_uuid_cache[cache_key]
+    # Bypass GET /clients khi WAF chặn (điền KEYCLOAK_PROD_ROLES_CLIENT_UUID)
+    if kc.roles_client_uuid.strip():
+        uuid = kc.roles_client_uuid.strip()
+        _client_uuid_cache[cache_key] = uuid
+        return uuid
     kc_client = client.get_client_by_client_id(client_id)
     if not kc_client or not kc_client.get("id"):
         raise KeycloakError(f"Khong tim thay Keycloak client '{client_id}'.")
     uuid = str(kc_client["id"])
-    _client_uuid_cache[client_id] = uuid
+    _client_uuid_cache[cache_key] = uuid
     return uuid
 
 
@@ -245,7 +271,10 @@ def _resolve_role_for_assign(role_name: str) -> str:
 
 
 def _assign_client_roles(
-    client: KeycloakClient, user_id: str, role_names: list[str]
+    client: KeycloakClient,
+    user_id: str,
+    role_names: list[str],
+    kc: KeycloakProfile,
 ) -> list[str]:
     resolved = []
     for role_name in role_names:
@@ -263,16 +292,22 @@ def _assign_client_roles(
         return []
 
     logger.info("Assign roles to user %s: %s", user_id, resolved)
-    client_uuid = _resolve_roles_client_uuid(client)
-    role_client = _role_assign_client(client)
+    client_uuid = _resolve_roles_client_uuid(client, kc)
+    role_client = _role_assign_client(client, kc)
     clients_to_try = [role_client]
     if role_client is not client:
         clients_to_try.append(client)
 
     last_403: KeycloakError | None = None
-    for kc in clients_to_try:
+    for role_client_inst in clients_to_try:
         try:
-            return _assign_roles_with_client(kc, user_id, client_uuid, resolved)
+            return _assign_roles_with_client(
+                role_client_inst,
+                user_id,
+                client_uuid,
+                resolved,
+                roles_client_id=kc.roles_client_id,
+            )
         except KeycloakError as exc:
             if "403" not in str(exc):
                 raise
@@ -280,7 +315,7 @@ def _assign_client_roles(
             logger.warning(
                 "Gan role user %s that bai 403 voi client '%s': %s",
                 user_id,
-                kc.client_id,
+                role_client_inst.client_id,
                 exc,
             )
 
@@ -303,6 +338,7 @@ def _save_existing_user(
     user_id: str,
     user: KeycloakUserInput,
     attrs: dict,
+    kc: KeycloakProfile,
 ) -> list[str]:
     applied: list[str] = []
     display_name = user.name.strip()
@@ -322,7 +358,9 @@ def _save_existing_user(
     if attrs:
         client.update_user_attributes(user_id, attrs)
         applied.append("set_attributes")
-    applied.extend(_assign_client_roles(client, user_id, _user_role_names(user)))
+    applied.extend(
+        _assign_client_roles(client, user_id, _user_role_names(user), kc)
+    )
     return applied
 
 
@@ -380,6 +418,7 @@ def _provision_one(
     client: KeycloakClient,
     user: KeycloakUserInput,
     *,
+    kc: KeycloakProfile,
     temporary: bool,
     on_conflict: OnConflictAction,
     default_required_actions: list[str],
@@ -393,7 +432,7 @@ def _provision_one(
         result.error = f"Thieu/khong hop le: {', '.join(missing)}"
         return result
 
-    if not settings.keycloak_roles_configured:
+    if not kc.roles_configured:
         result.error = "KEYCLOAK_ROLES_CLIENT_ID chua cau hinh."
         return result
 
@@ -428,7 +467,9 @@ def _provision_one(
             applied = ["create"] + list(required_actions)
             if attrs:
                 applied.append("set_attributes")
-            applied.extend(_assign_client_roles(client, user_id, _user_role_names(user)))
+            applied.extend(
+                _assign_client_roles(client, user_id, _user_role_names(user), kc)
+            )
             result.status = ProvisionStatus.CREATED
             result.user_id = user_id
             result.actions_applied = applied
@@ -438,7 +479,7 @@ def _provision_one(
         result.user_id = user_id
         action = user.on_conflict or on_conflict
 
-        applied = _save_existing_user(client, user_id, user, attrs)
+        applied = _save_existing_user(client, user_id, user, attrs, kc)
 
         reset_password = action in (
             OnConflictAction.RESET_PASSWORD,
@@ -475,7 +516,13 @@ def _provision_one(
         return result
     except KeycloakError as exc:
         result.error = str(exc)
-        logger.warning("Provision '%s' loi: %s", username, exc)
+        logger.warning(
+            "Provision '%s' env=%s loi: %s",
+            username,
+            kc.env,
+            exc,
+            exc_info=settings.keycloak_debug,
+        )
         return result
 
 
@@ -580,26 +627,34 @@ async def enrich_users(request: EnrichRequest):
 
 
 
+@router.get("/keycloak-diagnostics", response_model=KeycloakDiagnosticsResponse)
+async def keycloak_diagnostics(target_env: str = Depends(get_target_env)):
+    """Chẩn đoán Keycloak từng bước (DNS, token, users, clients, role)."""
+    return run_keycloak_diagnostics(target_env)
+
+
 @router.get("/keycloak-role-check", response_model=KeycloakRoleCheckResponse)
-async def keycloak_role_check():
+async def keycloak_role_check(target_env: str = Depends(get_target_env)):
     """Kiểm tra service account có đủ quyền gán client role banca-*."""
-    if not settings.keycloak_configured:
-        raise HTTPException(status_code=503, detail="Keycloak chua cau hinh.")
-    if not settings.keycloak_roles_configured:
+    kc = resolve_keycloak_profile(target_env)
+    if not kc.configured:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Keycloak {kc.env.upper()} chua cau hinh.",
+        )
+    if not kc.roles_configured:
         raise HTTPException(status_code=503, detail="KEYCLOAK_ROLES_CLIENT_ID chua cau hinh.")
 
-    client = _build_kc_client("")
+    client = _build_kc_client("", kc)
     resp = KeycloakRoleCheckResponse(
-        roles_client_id=settings.keycloak_roles_client_id,
-        provision_client_id=settings.keycloak_client_id,
+        roles_client_id=kc.roles_client_id,
+        provision_client_id=kc.client_id,
         role_assign_client_id=(
-            settings.keycloak_role_assign_client_id
-            if settings.keycloak_role_assign_configured
-            else settings.keycloak_client_id
+            kc.role_assign_client_id if kc.role_assign_configured else kc.client_id
         ),
     )
     try:
-        client_uuid = _resolve_roles_client_uuid(client)
+        client_uuid = _resolve_roles_client_uuid(client, kc)
         resp.can_view_roles_client = True
         sample = settings.keycloak_valid_roles[0] if settings.keycloak_valid_roles else ""
         if sample:
@@ -607,21 +662,21 @@ async def keycloak_role_check():
             if role_repr:
                 resp.can_assign_test_role = True
                 resp.ok = True
-                resp.message = f"Co the gan role mau '{sample}'."
+                resp.message = f"Co the gan role mau '{sample}' ({kc.env.upper()})."
     except KeycloakError as exc:
         msg = str(exc)
         resp.message = msg
         if "403" in msg:
             resp.fix_hint = (
                 "Vao Keycloak > Clients > "
-                f"{settings.keycloak_client_id} > Service account roles > "
+                f"{kc.client_id} > Service account roles > "
                 "Assign role > Filter by clients > realm-management > "
                 "chon manage-users VA manage-clients (hoac realm-admin). "
                 "Hoac cau hinh KEYCLOAK_ROLE_ASSIGN_CLIENT_ID/SECRET voi client co realm-admin."
             )
         elif "404" in msg:
             resp.fix_hint = (
-                f"Kiem tra KEYCLOAK_ROLES_CLIENT_ID='{settings.keycloak_roles_client_id}' "
+                f"Kiem tra KEYCLOAK_ROLES_CLIENT_ID='{kc.roles_client_id}' "
                 "va KEYCLOAK_REALM."
             )
         else:
@@ -637,9 +692,16 @@ async def keycloak_role_check():
         503: {"model": ErrorResponse},
     },
 )
-async def provision_batch(request: BatchProvisionRequest):
-    if not settings.keycloak_configured and not request.realm:
-        raise HTTPException(status_code=503, detail="Keycloak chua cau hinh.")
+async def provision_batch(
+    request: BatchProvisionRequest,
+    target_env: str = Depends(get_target_env),
+):
+    kc = resolve_keycloak_profile(target_env)
+    if not kc.configured and not request.realm:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Keycloak {kc.env.upper()} chua cau hinh.",
+        )
 
     users, warnings = _resolve_users_list(request.job_id, request.users)
     if not users:
@@ -662,13 +724,25 @@ async def provision_batch(request: BatchProvisionRequest):
         else settings.keycloak_default_required_actions_list
     )
 
-    client = _build_kc_client(request.realm)
+    client = _build_kc_client(request.realm, kc)
     response = BatchProvisionResponse(total=len(users))
+    logger.info(
+        "provision_batch env=%s base=%s realm=%s client=%s roles_client=%s "
+        "uuid_configured=%s users=%d",
+        kc.env,
+        kc.base_url,
+        kc.realm,
+        kc.client_id,
+        kc.roles_client_id,
+        bool(kc.roles_client_uuid.strip()),
+        len(users),
+    )
 
     for user in users:
         item = _provision_one(
             client,
             user,
+            kc=kc,
             temporary=temporary,
             on_conflict=request.default_on_conflict,
             default_required_actions=default_required_actions,
@@ -682,6 +756,13 @@ async def provision_batch(request: BatchProvisionRequest):
             response.skipped += 1
         else:
             response.failed += 1
+        logger.info(
+            "provision result user=%s status=%s error=%s actions=%s",
+            item.username,
+            item.status,
+            item.error or "",
+            item.actions_applied,
+        )
 
     return response
 

@@ -22,7 +22,10 @@ from app.models.schemas import (
 )
 from app.routers import users as users_router
 from app.routers.users import _provision_one
+from app.services.keycloak_env import resolve_keycloak_profile
 from app.services.user_mapping import map_result_to_users, normalize_role, normalize_roles
+
+_KC_DEV = resolve_keycloak_profile("dev")
 
 
 @pytest.fixture(autouse=True)
@@ -257,6 +260,7 @@ def test_provision_creates_new_user():
     result = _provision_one(
         client,
         user,
+        kc=_KC_DEV,
         temporary=True,
         on_conflict=OnConflictAction.SKIP,
         default_required_actions=["UPDATE_PASSWORD", "CONFIGURE_TOTP"],
@@ -275,6 +279,7 @@ def test_provision_existing_user_save_details_and_role():
     result = _provision_one(
         client,
         user,
+        kc=_KC_DEV,
         temporary=True,
         on_conflict=OnConflictAction.SKIP,
         default_required_actions=[],
@@ -292,6 +297,7 @@ def test_provision_reset_password():
     result = _provision_one(
         client,
         user,
+        kc=_KC_DEV,
         temporary=True,
         on_conflict=OnConflictAction.RESET_PASSWORD,
         default_required_actions=[],
@@ -312,6 +318,7 @@ def test_provision_reset_both_keeps_update_password():
     result = _provision_one(
         client,
         user,
+        kc=_KC_DEV,
         temporary=True,
         on_conflict=OnConflictAction.RESET_BOTH,
         default_required_actions=[],
@@ -339,6 +346,7 @@ def test_provision_reset_password_requires_update_action():
     result = _provision_one(
         client,
         user,
+        kc=_KC_DEV,
         temporary=True,
         on_conflict=OnConflictAction.RESET_PASSWORD,
         default_required_actions=[],
@@ -369,6 +377,7 @@ def test_provision_existing_user_removes_unselected_role():
     result = _provision_one(
         client,
         user,
+        kc=_KC_DEV,
         temporary=True,
         on_conflict=OnConflictAction.SKIP,
         default_required_actions=[],
@@ -394,6 +403,7 @@ def test_provision_existing_user_keeps_roles_when_lookup_forbidden():
     result = _provision_one(
         client,
         user,
+        kc=_KC_DEV,
         temporary=True,
         on_conflict=OnConflictAction.SKIP,
         default_required_actions=[],
@@ -408,6 +418,7 @@ def test_provision_fails_without_role():
     result = _provision_one(
         client,
         user,
+        kc=_KC_DEV,
         temporary=True,
         on_conflict=OnConflictAction.SKIP,
         default_required_actions=[],
@@ -430,6 +441,7 @@ def test_provision_created_when_role_assignment_forbidden():
     result = _provision_one(
         client,
         user,
+        kc=_KC_DEV,
         temporary=True,
         on_conflict=OnConflictAction.SKIP,
         default_required_actions=[],

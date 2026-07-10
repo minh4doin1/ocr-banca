@@ -117,12 +117,15 @@ class KeycloakClient:
                 ) from exc
 
             if resp.status_code != 200:
+                _log_kc_response("POST", self._token_url(), resp)
                 raise KeycloakError(
                     "Lấy access token thất bại "
                     f"(HTTP {resp.status_code}): {_safe_body(resp)}"
                 )
 
-            data = resp.json()
+            data = _parse_json(resp, context="Token endpoint")
+            if not isinstance(data, dict):
+                raise KeycloakError("Token endpoint trả về JSON không hợp lệ.")
             self._token = data.get("access_token", "")
             if not self._token:
                 raise KeycloakError("Token endpoint không trả về access_token.")
@@ -130,6 +133,13 @@ class KeycloakClient:
             expires_in = int(data.get("expires_in", 60))
             leeway = settings.keycloak_token_leeway_seconds
             self._token_expiry = now + max(expires_in - leeway, 5)
+            if settings.keycloak_debug:
+                logger.debug(
+                    "KC token OK realm=%s client=%s expires_in=%s",
+                    self.realm,
+                    self.client_id,
+                    expires_in,
+                )
             return self._token
 
     def _headers(self, json_body: bool = True) -> dict[str, str]:
@@ -147,6 +157,8 @@ class KeycloakClient:
         params: dict | None = None,
         json_body: bool = True,
     ) -> requests.Response:
+        if settings.keycloak_debug:
+            logger.debug("KC → %s %s params=%s", method, url, params or "")
         try:
             resp = self._session.request(
                 method,
@@ -158,7 +170,16 @@ class KeycloakClient:
                 timeout=self.timeout,
             )
         except requests.RequestException as exc:
+            logger.warning("KC %s %s connection error: %s", method, url, exc)
             raise KeycloakError(f"Lỗi gọi Keycloak {method} {url}: {exc}") from exc
+
+        _log_kc_response(method, url, resp, params=params)
+
+        # F5/WAF đôi khi trả HTTP 200 + HTML "Request Rejected" thay vì JSON Admin API
+        if _looks_like_html_block(resp):
+            raise KeycloakError(
+                f"Keycloak Admin API bi chan ({method} {url}): {_safe_body(resp)}"
+            )
         return resp
 
     # ──────────────────────────────────────────────────────────
@@ -178,8 +199,10 @@ class KeycloakClient:
                 f"Tìm user '{username}' thất bại "
                 f"(HTTP {resp.status_code}): {_safe_body(resp)}"
             )
-        users = resp.json()
-        if not users:
+        users = _parse_json(
+            resp, context=f"Tìm user '{username}'"
+        )
+        if not isinstance(users, list) or not users:
             return None
         # exact=true có thể vẫn trả nhiều bản ghi; chọn đúng username.
         for user in users:
@@ -277,7 +300,7 @@ class KeycloakClient:
                 f"Lấy credentials (user {user_id}) thất bại "
                 f"(HTTP {resp.status_code}): {_safe_body(resp)}"
             )
-        return resp.json() or []
+        return _parse_json(resp, context=f"Lấy credentials (user {user_id})") or []
 
     def delete_credential(self, user_id: str, credential_id: str) -> None:
         """Xóa 1 credential theo id."""
@@ -340,7 +363,9 @@ class KeycloakClient:
                 f"Lấy user {user_id} thất bại "
                 f"(HTTP {resp.status_code}): {_safe_body(resp)}"
             )
-        user = resp.json()
+        user = _parse_json(resp, context=f"Lấy user {user_id}")
+        if not isinstance(user, dict):
+            raise KeycloakError(f"Lấy user {user_id}: JSON không hợp lệ.")
         existing = list(user.get("requiredActions") or [])
         merged = list(dict.fromkeys(existing + actions))
         if merged == existing:
@@ -371,9 +396,11 @@ class KeycloakClient:
         )
         if resp.status_code != 200:
             raise KeycloakError(
-                f"Lấy user {user_id} thất bại (HTTP {resp.status_code})"
+                f"Lấy user {user_id} thất bại (HTTP {resp.status_code}): {_safe_body(resp)}"
             )
-        user = resp.json()
+        user = _parse_json(resp, context=f"Lấy user {user_id}")
+        if not isinstance(user, dict):
+            raise KeycloakError(f"Lấy user {user_id}: JSON không hợp lệ.")
         existing = dict(user.get("attributes") or {})
         for key, vals in attributes.items():
             if vals:
@@ -446,7 +473,8 @@ class KeycloakClient:
                 f"Lấy service-account-user thất bại "
                 f"(HTTP {resp.status_code}): {_safe_body(resp)}"
             )
-        return resp.json()
+        data = _parse_json(resp, context="Lấy service-account-user")
+        return data if isinstance(data, dict) else None
 
     def get_client_by_client_id(self, client_id: str) -> dict | None:
         """Tra client theo public clientId, trả representation đầy đủ."""
@@ -461,7 +489,9 @@ class KeycloakClient:
                 f"Tra client '{client_id}' thất bại "
                 f"(HTTP {resp.status_code}): {_safe_body(resp)}"
             )
-        clients = resp.json() or []
+        clients = _parse_json(resp, context=f"Tra client '{client_id}'") or []
+        if not isinstance(clients, list):
+            raise KeycloakError(f"Tra client '{client_id}': JSON không hợp lệ.")
         return clients[0] if clients else None
 
     def get_client_role(self, client_uuid: str, role_name: str) -> dict | None:
@@ -477,7 +507,8 @@ class KeycloakClient:
                 f"Lấy role '{role_name}' thất bại "
                 f"(HTTP {resp.status_code}): {_safe_body(resp)}"
             )
-        return resp.json()
+        data = _parse_json(resp, context=f"Lấy role '{role_name}'")
+        return data if isinstance(data, dict) else None
 
     def get_user_client_roles_optional(
         self, user_id: str, client_uuid: str
@@ -497,7 +528,10 @@ class KeycloakClient:
                 f"Lấy client roles (user {user_id}) thất bại "
                 f"(HTTP {resp.status_code}): {_safe_body(resp)}"
             )
-        return resp.json() or [], None
+        roles = _parse_json(resp, context=f"Lấy client roles (user {user_id})") or []
+        if not isinstance(roles, list):
+            raise KeycloakError(f"Lấy client roles (user {user_id}): JSON không hợp lệ.")
+        return roles, None
 
     def get_user_client_roles(self, user_id: str, client_uuid: str) -> list[dict]:
         roles, err = self.get_user_client_roles_optional(user_id, client_uuid)
@@ -579,10 +613,92 @@ class KeycloakClient:
             )
 
 
+def _log_kc_response(
+    method: str,
+    url: str,
+    resp: requests.Response,
+    *,
+    params: dict | None = None,
+) -> None:
+    """Ghi log chi tiết khi KEYCLOAK_DEBUG hoặc response lỗi/WAF."""
+    blocked = _looks_like_html_block(resp)
+    if not settings.keycloak_debug and resp.status_code < 400 and not blocked:
+        return
+    ctype = (resp.headers.get("content-type") or "")[:80]
+    body = _safe_body(resp)
+    level = (
+        logging.WARNING
+        if resp.status_code >= 400 or blocked
+        else logging.DEBUG
+    )
+    logger.log(
+        level,
+        "KC %s %s status=%s ctype=%s params=%s body=%s",
+        method,
+        url,
+        resp.status_code,
+        ctype,
+        params or "",
+        body[:600],
+    )
+
+
 def _safe_body(resp: requests.Response) -> str:
     """Trích nội dung lỗi ngắn gọn, không lộ dữ liệu nhạy cảm."""
     try:
         text = resp.text or ""
     except Exception:
         return "<no body>"
+    lower = text.lower()
+    if "request rejected" in lower or "<html" in lower[:200]:
+        support = ""
+        if "support id" in lower:
+            # F5/WAF thường trả support ID để IT whitelist
+            import re
+
+            m = re.search(r"support id is:\s*([0-9]+)", text, re.I)
+            if m:
+                support = f" (Support ID: {m.group(1)})"
+        return (
+            "WAF/firewall chan Admin API Keycloak"
+            f"{support}. Token OK nhung /admin/realms bi reject — "
+            "can whitelist IP may OCR tren F5/WAF Keycloak prod."
+        )
     return text[:500]
+
+
+def _parse_json(resp: requests.Response, *, context: str) -> object:
+    """Parse JSON; raise KeycloakError khi WAF trả HTML hoặc body rỗng."""
+    raw_ctype = resp.headers.get("content-type") if getattr(resp, "headers", None) else None
+    ctype = raw_ctype.lower() if isinstance(raw_ctype, str) else ""
+    try:
+        raw_text = resp.text
+    except Exception:
+        raw_text = ""
+    text = raw_text if isinstance(raw_text, str) else ""
+    head = text.lstrip().lower()[:200]
+    if "html" in ctype or head.startswith("<!doctype") or head.startswith("<html"):
+        raise KeycloakError(f"{context}: {_safe_body(resp)}")
+    if text and not text.strip():
+        raise KeycloakError(
+            f"{context}: Keycloak tra body rong (HTTP {resp.status_code})."
+        )
+    try:
+        return resp.json()
+    except ValueError as exc:
+        raise KeycloakError(
+            f"{context}: khong parse duoc JSON (HTTP {resp.status_code}): "
+            f"{_safe_body(resp)}"
+        ) from exc
+
+
+def _looks_like_html_block(resp: requests.Response) -> bool:
+    raw_ctype = resp.headers.get("content-type") if getattr(resp, "headers", None) else None
+    ctype = raw_ctype.lower() if isinstance(raw_ctype, str) else ""
+    try:
+        raw_text = resp.text
+    except Exception:
+        raw_text = ""
+    text = raw_text if isinstance(raw_text, str) else ""
+    head = text.lstrip().lower()[:200]
+    return "html" in ctype or head.startswith("<!doctype") or head.startswith("<html")

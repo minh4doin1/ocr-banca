@@ -69,6 +69,32 @@ class RemoteProvider(str, enum.Enum):
     CUSTOM = "custom"
 
 
+class OcrEnvProfile(BaseModel):
+    """Frontend API target for dev/prod switching."""
+
+    id: str = Field(..., description="dev | prod")
+    label: str = ""
+    api_url: str = Field(..., description="Base URL OCR API (empty = same origin)")
+    keycloak_configured: bool = Field(
+        default=False,
+        description="True khi profile Keycloak (KEYCLOAK_PROD_*) đã cấu hình",
+    )
+    keycloak_label: str = Field(
+        default="",
+        description="Nhãn hiển thị (vd URL Keycloak prod, không có secret)",
+    )
+
+
+class OcrEnvironmentsResponse(BaseModel):
+    """Available OCR API environments for the frontend switcher."""
+
+    server_env: str = Field(
+        default="dev",
+        description="APP_ENV của instance backend trả response",
+    )
+    profiles: list[OcrEnvProfile] = Field(default_factory=list)
+
+
 class OcrRuntimeConfig(BaseModel):
     """Runtime options exposed to the frontend."""
 
@@ -422,6 +448,36 @@ class KeycloakRoleCheckResponse(BaseModel):
     can_assign_test_role: bool = False
     message: str = ""
     fix_hint: str = ""
+
+
+class KeycloakDiagStep(BaseModel):
+    """Một bước trong battery test Keycloak."""
+
+    step: str = ""
+    ok: bool = False
+    message: str = ""
+    detail: str = ""
+    status_code: int | None = None
+    content_type: str = ""
+
+
+class KeycloakDiagnosticsResponse(BaseModel):
+    """Kết quả chẩn đoán Keycloak (gọi GET /api/users/keycloak-diagnostics)."""
+
+    ok: bool = False
+    target_env: str = "dev"
+    base_url: str = ""
+    realm: str = ""
+    provision_client_id: str = ""
+    roles_client_id: str = ""
+    roles_client_uuid_configured: bool = False
+    verify_ssl: bool = True
+    summary: str = ""
+    steps: list[KeycloakDiagStep] = Field(default_factory=list)
+    log_hint: str = (
+        "Xem chi tiết request: ocr-service/logs/keycloak.log "
+        "(bật KEYCLOAK_DEBUG=true trong .env)"
+    )
 
 
 class UserValidationItem(BaseModel):

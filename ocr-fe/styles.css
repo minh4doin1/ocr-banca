@@ -62,7 +62,7 @@ body {
 .brand-text h1 { font-size: 16px; font-weight: 700; letter-spacing: 0.5px; }
 .brand-text p { font-size: 11px; opacity: 0.85; }
 
-.header-meta { display: flex; gap: 8px; align-items: center; }
+.header-meta { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .badge-env, .badge-branch {
     font-size: 11px;
     font-weight: 600;
@@ -70,7 +70,35 @@ body {
     border-radius: 20px;
     background: rgba(255,255,255,0.18);
 }
-
+.badge-env.env-dev {
+    background: rgba(76, 175, 80, 0.35);
+    border: 1px solid rgba(255,255,255,0.35);
+}
+.badge-env.env-prod {
+    background: rgba(244, 67, 54, 0.4);
+    border: 1px solid rgba(255,255,255,0.4);
+}
+.badge-env.env-mismatch {
+    box-shadow: 0 0 0 2px rgba(255, 193, 7, 0.85);
+}
+.btn-env-switch {
+    font-size: 11px;
+    font-weight: 600;
+    padding: 4px 12px;
+    border-radius: 20px;
+    border: 1px solid rgba(255,255,255,0.45);
+    background: rgba(255,255,255,0.12);
+    color: #fff;
+    cursor: pointer;
+    transition: background 0.15s;
+}
+.btn-env-switch:hover:not(:disabled) {
+    background: rgba(255,255,255,0.28);
+}
+.btn-env-switch:disabled {
+    opacity: 0.55;
+    cursor: not-allowed;
+}
 .app-main {
     flex: 1;
     display: flex;
