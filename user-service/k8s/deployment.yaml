@@ -13,11 +13,11 @@ type: Opaque
 # Tạo secret thật bằng:
 #   kubectl -n agribank create secret generic user-service-secrets \
 #     --from-literal=SERVICE_API_KEY="$(openssl rand -hex 32)" \
-#     --from-literal=KEYCLOAK_CLIENT_ID="ocr-banca-service" \
+#     --from-literal=KEYCLOAK_CLIENT_ID="keycloak-automation" \
 #     --from-literal=KEYCLOAK_CLIENT_SECRET="<real>"
 stringData:
   SERVICE_API_KEY: "REPLACE_WITH_OPENSSL_RAND_HEX_32"
-  KEYCLOAK_CLIENT_ID: "ocr-banca-service"
+  KEYCLOAK_CLIENT_ID: "keycloak-automation"
   KEYCLOAK_CLIENT_SECRET: "REPLACE_WITH_REAL_KEYCLOAK_CLIENT_SECRET"
 ---
 apiVersion: apps/v1
@@ -76,7 +76,7 @@ spec:
         - name: KEYCLOAK_TIMEOUT_MS
           value: "30000"
         - name: ROLES_CLIENT_ID
-          value: "banca-app"
+          value: "banca"
         resources:
           requests:
             cpu: 100m
