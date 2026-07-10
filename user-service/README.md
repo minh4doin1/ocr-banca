@@ -248,7 +248,7 @@ docker compose exec user-service sh
 ```bash
 kubectl -n agribank create secret generic user-service-secrets \
   --from-literal=SERVICE_API_KEY="$(openssl rand -hex 32)" \
-  --from-literal=KEYCLOAK_CLIENT_ID="ocr-banca-service" \
+  --from-literal=KEYCLOAK_CLIENT_ID="keycloak-automation" \
   --from-literal=KEYCLOAK_CLIENT_SECRET="<lấy từ Keycloak admin console>"
 ```
 
