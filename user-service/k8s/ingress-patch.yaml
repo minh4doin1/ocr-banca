@@ -1,0 +1,48 @@
+# ============================================================
+# Ingress patch — thêm path cho user-service
+# Path khác với kc-proxy để dễ route
+# ============================================================
+
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ocr-banca-api
+  namespace: agribank
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "1m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "60"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "60"
+spec:
+  ingressClassName: nginx
+  tls:
+  - hosts:
+    - api.agribank.com.vn
+    secretName: api-agribank-tls
+  rules:
+  - host: api.agribank.com.vn
+    http:
+      paths:
+      # OCR service (giữ nguyên)
+      - path: /api/v1
+        pathType: Prefix
+        backend:
+          service:
+            name: ocr-banca
+            port:
+              number: 8100
+      # kc-proxy (giữ nguyên cho fallback)
+      - path: /api/v1/iam-bridge
+        pathType: Prefix
+        backend:
+          service:
+            name: kc-proxy
+            port:
+              number: 80
+      # user-service — path mới
+      - path: /api/v1/users-svc
+        pathType: Prefix
+        backend:
+          service:
+            name: user-service
+            port:
+              number: 80
