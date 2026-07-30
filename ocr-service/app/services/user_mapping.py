@@ -375,6 +375,21 @@ def _derive_agribank_email(seed: str) -> str:
 
 
 def get_sso_column_labels() -> list[dict[str, str]]:
+    try:
+        from app.services.template_service import get_template_or_default
+
+        profile = get_template_or_default("sso-agribank")
+        if profile.table.columns:
+            return [
+                {
+                    "col": str(c.index),
+                    "field": c.field,
+                    "label": c.header or c.field,
+                }
+                for c in profile.table.columns
+            ]
+    except Exception:
+        pass
     return list(_SSO_COLUMN_LABELS)
 
 
@@ -388,8 +403,11 @@ def _build_matrix(table: TableData) -> list[list[str]]:
     return matrix
 
 
-def _map_header(header: list[str]) -> dict[str, int]:
-    alias_map = settings.keycloak_header_map_parsed
+def _map_header(
+    header: list[str],
+    alias_override: dict[str, list[str]] | None = None,
+) -> dict[str, int]:
+    alias_map = alias_override or settings.keycloak_header_map_parsed
     col_to_field: dict[str, int] = {}
     for col_idx, title in enumerate(header):
         norm = _normalize_header_key(title)
@@ -455,21 +473,66 @@ def _extract_cccd_from_cell(raw: str) -> str:
     return (raw or "").strip()
 
 
-def _resolve_col_map(matrix: list[list[str]]) -> tuple[dict[str, int], int]:
+def _resolve_col_map(
+    matrix: list[list[str]],
+    profile: "TemplateProfile | None" = None,
+) -> tuple[dict[str, int], int]:
     if len(matrix) < 1:
         return {}, 0
 
+    # Explicit template column map (non-SSO or custom)
+    if profile is not None and profile.id != "sso-agribank" and profile.table.columns:
+        from app.services.template_service import field_to_col_index_map
+
+        col_to_field = field_to_col_index_map(profile)
+        if col_to_field:
+            header_row = max(0, min(profile.table.header_row, len(matrix) - 1))
+            # If first rows look like headers matching template, skip them
+            data_start = header_row + 1
+            while data_start < len(matrix) and _is_column_number_row(matrix[data_start]):
+                data_start += 1
+            # Also skip a header-like row when values match template headers
+            if data_start < len(matrix):
+                row = matrix[header_row]
+                hits = 0
+                for col in profile.table.columns:
+                    if col.index < len(row) and col.header:
+                        if _normalize_header_key(row[col.index]) == _normalize_header_key(
+                            col.header
+                        ):
+                            hits += 1
+                if hits >= max(2, len(profile.table.columns) // 3):
+                    data_start = max(data_start, header_row + 1)
+            return col_to_field, min(data_start, len(matrix))
+
     scan_limit = min(6, len(matrix))
+    alias_override = None
+    if profile is not None and profile.table.header_aliases:
+        alias_override = profile.table.header_aliases
+
     for row_idx in range(scan_limit):
         row = matrix[row_idx]
         if _is_column_number_row(row):
             continue
-        col_to_field = _map_header(row)
+        col_to_field = _map_header(row, alias_override=alias_override)
         if _map_header_sufficient(col_to_field):
             data_start = row_idx + 1
             while data_start < len(matrix) and _is_column_number_row(matrix[data_start]):
                 data_start += 1
             return col_to_field, data_start
+
+    # Fallback: positional map from template columns (SSO layouts)
+    if profile is not None and profile.table.columns:
+        from app.services.template_service import field_to_col_index_map
+
+        for row_idx, row in enumerate(matrix):
+            if _is_column_number_row(row):
+                continue
+            if _is_sso_data_first_row(row) and len(row) >= 8:
+                # Prefer classic SSO positional map for builtin compatibility
+                if profile.id == "sso-agribank" or profile.ocr.sso_enhance:
+                    return _sso_data_col_map(len(row)), row_idx
+                return field_to_col_index_map(profile), row_idx
 
     for row_idx, row in enumerate(matrix):
         if _is_column_number_row(row):
@@ -601,13 +664,14 @@ def build_keycloak_attributes(user: KeycloakUserInput) -> dict[str, list[str]]:
 
 def map_table_to_users(
     table: TableData,
+    profile: "TemplateProfile | None" = None,
 ) -> tuple[list[KeycloakUserInput], list[str]]:
     warnings: list[str] = []
     matrix = _build_matrix(table)
     if len(matrix) < 1:
         return [], warnings
 
-    col_to_field, data_start = _resolve_col_map(matrix)
+    col_to_field, data_start = _resolve_col_map(matrix, profile=profile)
     if not any(f in col_to_field for f in ("username", "email", "ipcas_code")):
         warnings.append(
             f"Bảng {table.table_index + 1}: không tìm thấy cột email/username/ipcas "
@@ -710,14 +774,23 @@ def map_table_to_users(
 
 def map_result_to_users(
     result: OcrResult,
+    template_id: str | None = None,
 ) -> tuple[list[KeycloakUserInput], list[str]]:
     all_users: list[KeycloakUserInput] = []
     warnings: list[str] = []
     seen: set[str] = set()
 
+    profile = None
+    try:
+        from app.services.template_service import get_template_or_default
+
+        profile = get_template_or_default(template_id)
+    except Exception:
+        profile = None
+
     for page in result.pages:
         for table in page.tables:
-            users, table_warnings = map_table_to_users(table)
+            users, table_warnings = map_table_to_users(table, profile=profile)
             warnings.extend(table_warnings)
             for user in users:
                 key = user.username.strip().lower()

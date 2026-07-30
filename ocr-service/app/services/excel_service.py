@@ -71,13 +71,15 @@ THIN_BORDER = Border(
 
 
 
-def _export_sso_sheet(ws, table, threshold: float, start_row: int = 1) -> int:
+def _export_sso_sheet(ws, table, threshold: float, start_row: int = 1, headers: list[str] | None = None) -> int:
     from app.services.email_reconcile import email_mismatch_with_ipcas, email_needs_review
     from app.services.user_mapping import (
         _parse_branch_code_digits,
         _parse_department_cell,
         normalize_roles,
     )
+
+    export_headers = headers if headers else SSO_HEADERS
 
     grid = {}
     for cell in table.cells:
@@ -89,7 +91,7 @@ def _export_sso_sheet(ws, table, threshold: float, start_row: int = 1) -> int:
     ipcas_grid_col = 4 if is_new_layout else 3
 
     row = start_row
-    for c, title in enumerate(SSO_HEADERS):
+    for c, title in enumerate(export_headers):
         cell = ws.cell(row=row, column=c + 1)
         cell.value = title
         cell.fill = HEADER_FILL
@@ -112,46 +114,55 @@ def _export_sso_sheet(ws, table, threshold: float, start_row: int = 1) -> int:
         email_uncertain = bool(email_text and email_needs_review(email_text))
         role_unmapped = bool(role_text.strip() and not role_suggested)
 
-        for excel_c in range(len(SSO_HEADERS)):
+        for excel_c in range(len(export_headers)):
             ws_cell = ws.cell(row=row, column=excel_c + 1)
             ws_cell.alignment = NORMAL_ALIGNMENT
             ws_cell.border = THIN_BORDER
 
             if excel_c == 2 and not is_new_layout:
-                _, bc, _ = _parse_department_cell(dept_text)
-                ws_cell.value = bc or branch_code
+                ws_cell.value = branch_code
                 ws_cell.font = NORMAL_FONT
                 continue
             if excel_c == 3 and not is_new_layout:
-                _, _, bn = _parse_department_cell(dept_text)
-                ws_cell.value = bn or dept_text
+                _code, _bc, bname = _parse_department_cell(dept_text)
+                ws_cell.value = bname or dept_text
                 ws_cell.font = NORMAL_FONT
                 continue
-            if excel_c == 10:
+            if excel_c == len(SSO_HEADERS) - 1 and len(export_headers) == len(SSO_HEADERS):
+                # Last SSO column: role suggestion
                 ws_cell.value = role_suggested
                 if role_unmapped:
                     ws_cell.fill = ROLE_UNMAPPED_FILL
-                    ws_cell.font = LOW_CONFIDENCE_FONT
-                else:
+                ws_cell.font = NORMAL_FONT
+                continue
+
+            # Map from grid
+            grid_col = None
+            for gcol, ecol in grid_to_excel.items():
+                if ecol == excel_c:
+                    grid_col = gcol
+                    break
+            if grid_col is None:
+                # Extra export columns beyond SSO grid (e.g. role suggestion already handled)
+                if excel_c >= 10 and excel_c < len(export_headers):
+                    ws_cell.value = role_suggested if excel_c == 10 else ""
                     ws_cell.font = NORMAL_FONT
                 continue
 
-            grid_c = next((g for g, e in grid_to_excel.items() if e == excel_c), None)
-            if grid_c is None:
-                continue
-            text_val, conf = grid.get((r, grid_c), ("", 1.0))
-            ws_cell.value = text_val
-            if grid_c == email_grid_col and (email_mismatch or email_uncertain):
+            text, conf = grid.get((r, grid_col), ("", 1.0))
+            if excel_c == 2 and is_new_layout:
+                text = branch_code or text
+            ws_cell.value = text
+
+            if excel_c == (6 if is_new_layout else 5) and (email_mismatch or email_uncertain):
                 ws_cell.fill = EMAIL_MISMATCH_FILL
                 ws_cell.font = EMAIL_MISMATCH_FONT
-            elif grid_c == role_grid_col and role_unmapped:
-                ws_cell.fill = ROLE_UNMAPPED_FILL
-                ws_cell.font = LOW_CONFIDENCE_FONT
             elif conf < threshold:
                 ws_cell.fill = LOW_CONFIDENCE_FILL
                 ws_cell.font = LOW_CONFIDENCE_FONT
             else:
                 ws_cell.font = NORMAL_FONT
+
         row += 1
     return row
 
@@ -176,6 +187,7 @@ def export_to_excel(
     result: OcrResult,
     *,
     page_numbers: list[int] | None = None,
+    template_id: str | None = None,
 ) -> Path:
     """
     Export OCR result to an Excel file.
@@ -186,10 +198,24 @@ def export_to_excel(
     Args:
         result: The OcrResult to export
         page_numbers: Optional subset of page numbers to include (1-based)
+        template_id: Template profile for headers/layout (default SSO)
 
     Returns:
         Path to the generated Excel file
     """
+    from app.services.template_service import (
+        export_headers_for,
+        get_template_or_default,
+    )
+
+    profile = get_template_or_default(template_id)
+    headers = export_headers_for(profile)
+    use_sso_sheet = (
+        profile.id == "sso-agribank"
+        or profile.ocr.table_kind == "sso_agribank"
+        or profile.ocr.sso_enhance
+    )
+
     wb = Workbook()
     # Remove default sheet
     wb.remove(wb.active)
@@ -209,12 +235,24 @@ def export_to_excel(
         current_row = 1
 
         sso_tables = [t for t in page.tables if t.table_kind == "sso_agribank"]
-        if sso_tables:
+        if use_sso_sheet and sso_tables:
             current_row = 1
             for table in sso_tables:
                 if not table.cells:
                     continue
-                current_row = _export_sso_sheet(ws, table, threshold, start_row=current_row) + 2
+                current_row = _export_sso_sheet(
+                    ws, table, threshold, start_row=current_row, headers=headers
+                ) + 2
+            _auto_adjust_column_widths(ws)
+            continue
+
+        if headers and not use_sso_sheet:
+            for table in page.tables:
+                if not table.cells:
+                    continue
+                current_row = _export_template_sheet(
+                    ws, table, threshold, headers, start_row=current_row
+                ) + 2
             _auto_adjust_column_widths(ws)
             continue
 
@@ -282,6 +320,56 @@ def export_to_excel(
     logger.info("Excel exported: %s", export_file)
 
     return export_file
+
+
+def _export_template_sheet(
+    ws,
+    table,
+    threshold: float,
+    headers: list[str],
+    start_row: int = 1,
+) -> int:
+    """Export a generic table using template headers (column index aligned)."""
+    grid = {}
+    for cell in table.cells:
+        grid[(cell.row, cell.col)] = (cell.text, cell.confidence)
+
+    row = start_row
+    for c, title in enumerate(headers):
+        cell = ws.cell(row=row, column=c + 1)
+        cell.value = title
+        cell.fill = HEADER_FILL
+        cell.font = HEADER_FONT
+        cell.border = THIN_BORDER
+    row += 1
+
+    # Skip first row if it looks like a header matching template headers
+    data_start = 0
+    if table.num_rows > 0:
+        first = [grid.get((0, c), ("", 1.0))[0] for c in range(min(table.num_cols, len(headers)))]
+        hits = sum(
+            1
+            for i, h in enumerate(headers)
+            if i < len(first)
+            and _normalize_header_key(first[i]) == _normalize_header_key(h)
+        )
+        if hits >= max(2, len(headers) // 3):
+            data_start = 1
+
+    for r in range(data_start, max(table.num_rows, 1)):
+        for c in range(len(headers)):
+            text, conf = grid.get((r, c), ("", 1.0))
+            ws_cell = ws.cell(row=row, column=c + 1)
+            ws_cell.value = text
+            ws_cell.alignment = NORMAL_ALIGNMENT
+            ws_cell.border = THIN_BORDER
+            if conf < threshold:
+                ws_cell.fill = LOW_CONFIDENCE_FILL
+                ws_cell.font = LOW_CONFIDENCE_FONT
+            else:
+                ws_cell.font = NORMAL_FONT
+        row += 1
+    return row
 
 
 def import_from_excel(

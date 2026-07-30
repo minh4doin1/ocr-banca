@@ -16,6 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
 from app.routers.ocr import router as ocr_router
+from app.routers.templates import router as templates_router
 from app.routers.users import router as users_router
 from app.services.gpu_runtime import probe_gpu_runtime
 from app.services.pdf_service import check_poppler_available
@@ -102,6 +103,7 @@ from fastapi.staticfiles import StaticFiles
 
 app.include_router(ocr_router)
 app.include_router(users_router)
+app.include_router(templates_router)
 
 
 def _vietocr_gpu_health() -> bool:
@@ -197,6 +199,11 @@ async def startup_event():
     _ = settings.result_path
     _ = settings.export_path
     _ = settings.images_path
+    _ = settings.templates_path
+
+    from app.services.template_service import ensure_builtin_templates
+
+    ensure_builtin_templates()
 
     init_ocr_worker()
 

@@ -308,15 +308,35 @@ def _resolve_users_list(
     job_id: str, users: list[KeycloakUserInput]
 ) -> tuple[list[KeycloakUserInput], list[str]]:
     if job_id:
-        from app.services.table_service import get_result
+        from app.services.table_service import get_job, get_result
 
         result = get_result(job_id)
         if result is None:
             raise HTTPException(
                 status_code=404, detail=f"Khong tim thay job OCR: {job_id}"
             )
-        return map_result_to_users(result)
+        job = get_job(job_id)
+        template_id = (job.template_id if job else None) or None
+        return map_result_to_users(result, template_id=template_id)
     return list(users), []
+
+
+def _require_template_action(job_id: str, action_id: str) -> None:
+    """Raise 403 if the job's template does not enable the action."""
+    if not job_id:
+        return
+    from app.services.action_registry import template_allows
+    from app.services.table_service import get_job
+    from app.services.template_service import get_template_or_default
+
+    job = get_job(job_id)
+    template_id = (job.template_id if job else None) or settings.default_template_id
+    profile = get_template_or_default(template_id)
+    if not template_allows(profile.actions, action_id):
+        raise HTTPException(
+            status_code=403,
+            detail=f"Template '{profile.id}' không bật action '{action_id}'",
+        )
 
 
 def _enrich_users(
@@ -564,6 +584,7 @@ async def validate_users(request: ValidateUsersRequest):
 
 @router.post("/enrich", response_model=EnrichResponse)
 async def enrich_users(request: EnrichRequest):
+    _require_template_action(request.job_id, "enrich_banca")
     users, warnings = _resolve_users_list(request.job_id, request.users)
     if not users:
         detail = "Khong co user de enrich."
@@ -646,6 +667,7 @@ async def provision_batch(
     request: BatchProvisionRequest,
     target_env: str = Depends(get_target_env),
 ):
+    _require_template_action(request.job_id, "provision_keycloak")
     kc = resolve_keycloak_profile(target_env)
 
     # Resolve user-service qua factory (raise 503 nếu chưa cấu hình)
@@ -718,10 +740,13 @@ async def provision_batch(
 
 @router.get("/preview-from-job/{job_id}", response_model=UserPreviewResponse)
 async def preview_from_job(job_id: str):
-    from app.services.table_service import get_result
+    from app.services.table_service import get_job, get_result
 
+    _require_template_action(job_id, "provision_keycloak")
     result = get_result(job_id)
     if result is None:
         raise HTTPException(status_code=404, detail=f"Khong tim thay job: {job_id}")
-    users, warnings = map_result_to_users(result)
+    job = get_job(job_id)
+    template_id = (job.template_id if job else None) or None
+    users, warnings = map_result_to_users(result, template_id=template_id)
     return UserPreviewResponse(job_id=job_id, total=len(users), users=users, warnings=warnings)

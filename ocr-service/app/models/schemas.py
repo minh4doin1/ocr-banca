@@ -176,6 +176,10 @@ class JobInfo(BaseModel):
     remote_provider: RemoteProvider | None = None
     remote_url: str = ""
     remote_job_id: str = ""
+    template_id: str = Field(
+        default="sso-agribank",
+        description="Template profile used for mapping/export/actions",
+    )
     status: JobStatus
     total_pages: int = 0
     progress: int = Field(0, description="Number of pages processed")
@@ -197,6 +201,7 @@ class UploadResponse(BaseModel):
     use_gpu: bool = False
     remote_provider: RemoteProvider | None = None
     remote_url: str = ""
+    template_id: str = "sso-agribank"
     queue_position: int = 0
     message: str = "PDF uploaded successfully. Processing started."
 
@@ -512,3 +517,105 @@ class OcrValidationResponse(BaseModel):
     warnings: list[OcrCellValidationIssue] = Field(default_factory=list)
     error_count: int = 0
     warning_count: int = 0
+
+
+# ──────────────────────────────────────────────────────────────
+# Template profiles (multi-system OCR)
+# ──────────────────────────────────────────────────────────────
+
+
+class TemplateColumn(BaseModel):
+    """One column mapping in a template profile."""
+
+    index: int = Field(..., ge=0, description="0-based column index")
+    header: str = Field(default="", description="Header text as shown in sample")
+    field: str = Field(
+        default="",
+        description="Internal field name (name, email, …) or empty if unmapped",
+    )
+    required: bool = False
+
+
+class TemplateTableConfig(BaseModel):
+    """Table layout for a template."""
+
+    header_row: int = Field(default=0, ge=0)
+    columns: list[TemplateColumn] = Field(default_factory=list)
+    header_aliases: dict[str, list[str]] = Field(
+        default_factory=dict,
+        description="Optional per-field aliases overriding global header map",
+    )
+
+
+class TemplateOcrConfig(BaseModel):
+    """OCR-specific knobs for a template."""
+
+    expect_min_cols: int = Field(default=0, ge=0)
+    sso_enhance: bool = False
+    table_kind: str = Field(
+        default="",
+        description="Tag written onto TableData.table_kind when detected",
+    )
+
+
+class TemplateExportConfig(BaseModel):
+    """Export formatting for a template."""
+
+    excel_headers: list[str] = Field(default_factory=list)
+    docx_style: str = Field(default="table")
+    docx_title: str = Field(default="")
+
+
+class TemplateProfile(BaseModel):
+    """Configurable document template for multi-system OCR."""
+
+    id: str = Field(..., min_length=1, max_length=64)
+    name: str = Field(default="")
+    version: int = Field(default=1, ge=1)
+    builtin: bool = Field(
+        default=False,
+        description="True for built-in profiles that cannot be deleted",
+    )
+    source_sample: str = Field(
+        default="",
+        description="Relative path to uploaded sample file under storage/templates",
+    )
+    table: TemplateTableConfig = Field(default_factory=TemplateTableConfig)
+    ocr: TemplateOcrConfig = Field(default_factory=TemplateOcrConfig)
+    actions: list[str] = Field(
+        default_factory=lambda: ["validate", "export_excel", "export_docx"],
+        description="Enabled post-OCR actions",
+    )
+    export: TemplateExportConfig = Field(default_factory=TemplateExportConfig)
+    created_at: datetime = Field(default_factory=datetime.now)
+    updated_at: datetime = Field(default_factory=datetime.now)
+
+
+class TemplateListResponse(BaseModel):
+    templates: list[TemplateProfile] = Field(default_factory=list)
+    default_id: str = Field(default="sso-agribank")
+
+
+class TemplateInferResponse(BaseModel):
+    """Result of inferring a profile draft from an uploaded sample."""
+
+    draft: TemplateProfile
+    warnings: list[str] = Field(default_factory=list)
+
+
+class TemplateUpdateRequest(BaseModel):
+    """Partial update for an existing template."""
+
+    name: str | None = None
+    table: TemplateTableConfig | None = None
+    ocr: TemplateOcrConfig | None = None
+    actions: list[str] | None = None
+    export: TemplateExportConfig | None = None
+
+
+class AvailableActionsResponse(BaseModel):
+    actions: list[dict[str, str]] = Field(default_factory=list)
+
+
+class AvailableFieldsResponse(BaseModel):
+    fields: list[dict[str, str]] = Field(default_factory=list)

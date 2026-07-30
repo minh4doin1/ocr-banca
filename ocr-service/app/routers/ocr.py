@@ -52,6 +52,7 @@ from app.services.table_service import (
     update_result,
     reocr_page,
 )
+from app.services.template_service import get_template_or_default, validate_template_id
 
 logger = logging.getLogger(__name__)
 
@@ -216,6 +217,7 @@ async def upload_pdf(
     remote_provider: str = Form(default=""),
     remote_url: str = Form(default=""),
     remote_token: str = Form(default=""),
+    template_id: str = Form(default=""),
 ):
     """Upload a PDF file for OCR processing."""
 
@@ -235,6 +237,13 @@ async def upload_pdf(
             status_code=413,
             detail=f"File quá lớn. Tối đa: {MAX_FILE_SIZE // (1024 * 1024)} MB",
         )
+
+    try:
+        resolved_template = validate_template_id(
+            template_id.strip() or settings.default_template_id
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     job_id = str(uuid.uuid4())[:8]
     pdf_path = settings.upload_path / f"{job_id}_{file.filename}"
@@ -293,6 +302,7 @@ async def upload_pdf(
         use_gpu=use_gpu_flag,
         remote_provider=remote_provider_enum,
         remote_url=remote_url,
+        template_id=resolved_template,
     )
     if mode == ProcessingMode.REMOTE:
         set_job_remote_token(job_id, remote_token)
@@ -327,6 +337,7 @@ async def upload_pdf(
         use_gpu=use_gpu_flag,
         remote_provider=remote_provider_enum,
         remote_url=remote_url,
+        template_id=resolved_template,
         queue_position=queue_position,
         message=msg,
     )
@@ -341,6 +352,7 @@ async def upload_pdf(
 async def upload_excel(
     file: UploadFile = File(..., description="File Excel đã chỉnh"),
     job_id: str = Form(default=""),
+    template_id: str = Form(default=""),
 ):
     """Upload Excel and map its table data into OCR result structure."""
     if not file.filename:
@@ -369,11 +381,26 @@ async def upload_excel(
 
     job = get_job(target_job_id)
     if job is None:
+        try:
+            resolved_template = validate_template_id(
+                template_id.strip() or settings.default_template_id
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         create_manual_job(
             job_id=target_job_id,
             filename=file.filename,
             total_pages=result.total_pages,
+            template_id=resolved_template,
         )
+    else:
+        resolved_template = job.template_id or settings.default_template_id
+        if template_id.strip():
+            try:
+                resolved_template = validate_template_id(template_id.strip())
+                job.template_id = resolved_template
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     set_result(target_job_id, result)
 
@@ -382,6 +409,7 @@ async def upload_excel(
         filename=file.filename,
         processing_mode=ProcessingMode.LOCAL,
         use_gpu=False,
+        template_id=resolved_template,
         message="Đã nạp dữ liệu từ Excel. Có thể đối chiếu/chỉnh sửa ngay.",
     )
 
@@ -395,6 +423,7 @@ async def upload_excel(
 async def upload_docx(
     file: UploadFile = File(..., description="File Word .docx chứa bảng danh sách"),
     job_id: str = Form(default=""),
+    template_id: str = Form(default=""),
 ):
     """Đọc bảng trong file Word gốc và map vào cấu trúc OCR (không qua OCR)."""
     if not file.filename:
@@ -426,11 +455,26 @@ async def upload_docx(
 
     job = get_job(target_job_id)
     if job is None:
+        try:
+            resolved_template = validate_template_id(
+                template_id.strip() or settings.default_template_id
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         create_manual_job(
             job_id=target_job_id,
             filename=file.filename,
             total_pages=result.total_pages,
+            template_id=resolved_template,
         )
+    else:
+        resolved_template = job.template_id or settings.default_template_id
+        if template_id.strip():
+            try:
+                resolved_template = validate_template_id(template_id.strip())
+                job.template_id = resolved_template
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     set_result(target_job_id, result)
 
@@ -439,6 +483,7 @@ async def upload_docx(
         filename=file.filename,
         processing_mode=ProcessingMode.LOCAL,
         use_gpu=False,
+        template_id=resolved_template,
         message="Đã nạp dữ liệu từ Word. Có thể đối chiếu/chỉnh sửa ngay.",
     )
 
@@ -574,6 +619,17 @@ async def export_excel(job_id: str, pages: str | None = None):
             detail=f"Kết quả OCR không tìm thấy cho job: {job_id}",
         )
 
+    job = get_job(job_id)
+    template_id = (job.template_id if job else None) or settings.default_template_id
+    profile = get_template_or_default(template_id)
+    from app.services.action_registry import template_allows
+
+    if not template_allows(profile.actions, "export_excel"):
+        raise HTTPException(
+            status_code=403,
+            detail="Template này không bật action xuất Excel",
+        )
+
     page_numbers: list[int] | None = None
     if pages:
         try:
@@ -587,7 +643,9 @@ async def export_excel(job_id: str, pages: str | None = None):
             raise HTTPException(status_code=400, detail="Chưa chọn trang để xuất")
 
     try:
-        excel_path = export_to_excel(result, page_numbers=page_numbers)
+        excel_path = export_to_excel(
+            result, page_numbers=page_numbers, template_id=template_id
+        )
         return FileResponse(
             path=str(excel_path),
             filename=excel_path.name,
@@ -610,6 +668,17 @@ async def export_docx(job_id: str, pages: str | None = None):
             detail=f"Kết quả OCR không tìm thấy cho job: {job_id}",
         )
 
+    job = get_job(job_id)
+    template_id = (job.template_id if job else None) or settings.default_template_id
+    profile = get_template_or_default(template_id)
+    from app.services.action_registry import template_allows
+
+    if not template_allows(profile.actions, "export_docx"):
+        raise HTTPException(
+            status_code=403,
+            detail="Template này không bật action xuất Word",
+        )
+
     page_numbers: list[int] | None = None
     if pages:
         try:
@@ -623,7 +692,9 @@ async def export_docx(job_id: str, pages: str | None = None):
             raise HTTPException(status_code=400, detail="Chưa chọn trang để xuất")
 
     try:
-        docx_path = export_to_docx(result, page_numbers=page_numbers)
+        docx_path = export_to_docx(
+            result, page_numbers=page_numbers, template_id=template_id
+        )
         return FileResponse(
             path=str(docx_path),
             filename=docx_path.name,
