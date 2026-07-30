@@ -1,494 +1,423 @@
-# Báo Cáo Hệ Thống OCR Banca Agribank
+# BÁO CÁO HỆ THỐNG OCR BANCA AGRIBANK
 
-## 1) Executive Summary
+## 1. Tóm tắt
 
-Hệ thống `OCR Banca` là nền tảng hỗ trợ số hóa danh sách user SSO Agribank từ tài liệu đầu vào (PDF/Word/Excel), chuẩn hóa dữ liệu, kiểm tra lỗi và tạo lô người dùng lên Keycloak.  
-Giá trị chính của hệ thống:
+Hệ thống OCR Banca hỗ trợ số hóa danh sách người dùng SSO Agribank từ tài liệu đầu vào (PDF, Word, Excel), chuẩn hóa và kiểm tra dữ liệu, sau đó tạo lô người dùng trên Keycloak.
 
-- Giảm thao tác nhập tay khi onboarding user số lượng lớn.
-- Tăng độ chính xác nhờ cơ chế ưu tiên đọc text trực tiếp từ PDF số, kết hợp OCR fallback cho PDF scan.
-- Hỗ trợ quy trình vận hành hoàn chỉnh: upload, OCR/review, export, chỉnh sửa offline, re-upload, enrich, provision.
-- Có khả năng mở rộng chạy local CPU/GPU hoặc remote worker GPU nội bộ/Colab.
+Hệ thống giúp:
 
-Trạng thái hiện tại:
-
-- Đã hỗ trợ đầy đủ luồng Word/Excel trực tiếp (bỏ OCR).
-- Đã bổ sung xuất Word định dạng dễ nhìn, cho phép re-upload Word đã sửa.
-- Đã có bộ test unit + E2E API cho luồng PDF -> export Word -> re-upload.
+- Giảm thao tác nhập tay khi onboarding số lượng lớn người dùng.
+- Tăng độ chính xác nhờ ưu tiên đọc text trực tiếp từ PDF số, kết hợp OCR cho PDF scan.
+- Bao phủ đầy đủ quy trình vận hành: tải file, xử lý, rà soát, xuất file, chỉnh sửa offline, tải lại, bổ sung dữ liệu chi nhánh/đại lý và tạo lô người dùng.
+- Linh hoạt về hạ tầng xử lý: máy chủ CPU/GPU, worker GPU nội bộ hoặc Google Colab.
+- Tách lớp quản lý người dùng Keycloak thành dịch vụ riêng, bảo đảm gọi Admin API an toàn trong mạng nội bộ, không phụ thuộc đường đi bị F5/WAF chặn.
 
 ---
 
-## 2) Mục Tiêu Và Phạm Vi Hệ Thống
+## 2. Mục tiêu và phạm vi
 
-### 2.1 Mục tiêu nghiệp vụ
+### 2.1. Mục tiêu nghiệp vụ
 
-- Tự động hóa quy trình chuẩn bị dữ liệu user để tạo lô trên Keycloak.
-- Chuẩn hóa dữ liệu bắt buộc: email, IPCAS, CCCD, SĐT, mã chi nhánh, vai trò.
+- Tự động hóa chuẩn bị dữ liệu người dùng trước khi tạo lô trên Keycloak.
+- Chuẩn hóa các trường bắt buộc: email, IPCAS, CCCD, số điện thoại, mã chi nhánh, vai trò.
 - Rút ngắn thời gian xử lý và giảm sai sót thủ công.
 
-### 2.2 Phạm vi chức năng hiện có
+### 2.2. Phạm vi chức năng
 
-- Nhận đầu vào: `PDF`, `Word (.docx)`, `Excel (.xlsx/.xlsm)`.
-- OCR + text extraction theo từng trang, theo dõi tiến độ realtime.
-- Review/chỉnh sửa dữ liệu trên UI.
-- Export kết quả ra `Excel` và `Word`.
-- Re-upload file đã chỉnh (`Excel`/`Word`) để ghi đè dữ liệu job.
-- Enrich dữ liệu chi nhánh/đại lý.
-- Provision batch user lên Keycloak với xử lý conflict.
+- Nhận đầu vào: PDF, Word (.docx), Excel (.xlsx/.xlsm).
+- Trích xuất dữ liệu theo trang, theo dõi tiến độ theo thời gian thực.
+- Rà soát và chỉnh sửa trên giao diện.
+- Xuất kết quả ra Excel/Word; hỗ trợ chuyển PDF gốc sang Word.
+- Tải lại file đã chỉnh để cập nhật dữ liệu.
+- Bổ sung thông tin chi nhánh/đại lý từ hệ thống Banca Core.
+- Tạo lô người dùng Keycloak, xử lý xung đột (tạo mới / cập nhật / đặt lại mật khẩu hoặc OTP).
+- Cho phép chọn môi trường Keycloak DEV hoặc PROD trên giao diện.
+- Hỗ trợ nhiều chế độ xử lý: Local CPU/GPU, GPU nội bộ, Colab, tự động, API cloud.
 
-### 2.3 Ngoài phạm vi
+### 2.3. Ngoài phạm vi
 
 - Không thay thế hệ thống IDM/Keycloak; chỉ đóng vai trò tiền xử lý và đồng bộ dữ liệu.
 - Không xử lý tài liệu ngoài mẫu nghiệp vụ SSO đã định nghĩa.
 
 ---
 
-## 3) Luồng Chức Năng Nghiệp Vụ
+## 3. Luồng nghiệp vụ
 
-### 3.1 Luồng người dùng chuẩn
+### 3.1. Quy trình chuẩn
 
-1. Người dùng upload file đầu vào.
-2. Hệ thống xử lý:
-   - PDF có text layer -> đọc bảng trực tiếp.
-   - PDF scan -> OCR.
-   - Word/Excel -> import trực tiếp.
-3. Người dùng kiểm tra và sửa dữ liệu trên UI.
-4. Người dùng có thể export Word/Excel để chỉnh offline.
-5. Người dùng re-upload file đã chỉnh sửa.
-6. Hệ thống enrich và validate.
-7. Người dùng xác nhận tạo lô user Keycloak.
+1. Người dùng chọn môi trường Keycloak (DEV/PROD) nếu cần.
+2. Tải file và chọn chế độ xử lý.
+3. Hệ thống xử lý theo loại đầu vào:
+   - PDF có lớp text: đọc bảng trực tiếp.
+   - PDF scan: chạy OCR.
+   - Word/Excel: nhập bảng trực tiếp.
+4. Người dùng rà soát, chỉnh sửa trên giao diện; có thể xuất Excel/Word để chỉnh offline rồi tải lại.
+5. Hệ thống bổ sung và kiểm tra dữ liệu.
+6. Người dùng xác nhận tạo lô trên Keycloak.
+7. Màn hình kết quả cho phép chọn thao tác với người dùng đã tồn tại (bỏ qua, đặt lại mật khẩu, đặt lại OTP, hoặc cả hai). Trạng thái màn hình được giữ khi tải lại trang; chỉ quay về bước đầu khi người dùng chủ động chọn thao tác tương ứng.
 
-### 3.2 Sơ đồ luồng nghiệp vụ
+### 3.2. Sơ đồ luồng
 
 ```mermaid
 flowchart TD
-    user[User] --> upload[Upload PDF_or_Word_or_Excel]
-    upload --> detectInput{InputType}
-    detectInput -->|PDFText| pdfTextImport[PDFTextImport]
-    detectInput -->|PDFScan| ocrPipeline[OCRPipeline]
-    detectInput -->|DOCX| docxImport[DOCXImport]
-    detectInput -->|XLSX| excelImport[ExcelImport]
-    pdfTextImport --> review[ReviewAndEdit]
-    ocrPipeline --> review
-    docxImport --> review
-    excelImport --> review
-    review --> export[ExportExcelOrWord]
-    export --> reupload[ReuploadEditedFile]
-    reupload --> review
-    review --> enrich[EnrichAndValidate]
-    enrich --> provision[ProvisionBatchToKeycloak]
+    A[Người dùng] --> B[Tải PDF / Word / Excel]
+    B --> C{Loại đầu vào}
+    C -->|PDF có text| D[Nhập trực tiếp từ PDF]
+    C -->|PDF scan| E[Pipeline OCR]
+    C -->|Word| F[Nhập Word]
+    C -->|Excel| G[Nhập Excel]
+    D --> H[Rà soát và chỉnh sửa]
+    E --> H
+    F --> H
+    G --> H
+    H --> I[Xuất Excel / Word]
+    I --> J[Tải lại file đã sửa]
+    J --> H
+    H --> K[Bổ sung và kiểm tra]
+    K --> L[Tạo lô người dùng Keycloak]
+    L --> M[Kết quả tạo mới / cập nhật / lỗi]
 ```
 
-### 3.3 Vai trò người dùng trong vận hành
+### 3.3. Vai trò vận hành
 
-- **Nhân sự nghiệp vụ**: upload, review, sửa dữ liệu, xác nhận tạo lô.
-- **Vận hành IT**: giám sát job, health, queue, xử lý lỗi môi trường.
-- **Kỹ thuật**: tối ưu OCR, nâng cấp mapping, mở rộng tích hợp.
-
-### 3.4 Cập nhật UX mới (màn users updated)
-
-- Ở bước cuối sau khi tạo lô, người dùng chọn thao tác cho `updated users` (`skip`, `reset_password`, `reset_otp`, `reset_both`).
-- Khi **F5/reload**, hệ thống **giữ nguyên màn kết quả** và toàn bộ lựa chọn đang có.
-- Người dùng chỉ quay về từ đầu khi bấm các nút điều hướng chủ động (ví dụ `Tải file khác` hoặc `Quay lại`).
-- Sau khi bấm **Hoàn tất**, dropdown lựa chọn cho user updated **không bị khóa** để có thể đổi lại (undo) và thực hiện lại.
+| Vai trò | Trách nhiệm |
+|---|---|
+| Nhân sự nghiệp vụ | Tải file, rà soát, sửa dữ liệu, xác nhận tạo lô |
+| Vận hành CNTT | Giám sát dịch vụ, hàng đợi, sức khỏe hệ thống, xử lý sự cố môi trường |
+| Kỹ thuật | Tối ưu OCR, mở rộng tích hợp và hạ tầng |
 
 ---
 
-## 4) Kiến Trúc Và Thành Phần Kỹ Thuật
+## 4. Kiến trúc hệ thống
 
-### 4.1 Kiến trúc tổng thể
+### 4.1. Thành phần chính
 
-- **Frontend**: `ocr-fe` (HTML/JS) phục vụ upload, theo dõi tiến độ, review, export/re-upload.
-- **Backend**: `FastAPI` trong `ocr-service`.
-- **OCR stack**:
-  - `PaddleOCR`: detect/layout/table.
-  - `VietOCR`: nhận dạng text tiếng Việt.
-  - `pdfplumber`: đọc text layer cho PDF số.
-- **Lưu trữ runtime**: in-memory + JSON file dưới `storage`.
+| Thành phần | Vai trò |
+|---|---|
+| Giao diện người dùng | Tải file, theo dõi tiến độ, rà soát, xuất/tải lại, tạo lô |
+| Dịch vụ OCR | Điều phối OCR/nhập liệu, kiểm tra, bổ sung dữ liệu, gọi tạo lô |
+| Dịch vụ quản lý người dùng | CRUD người dùng Keycloak, vai trò, mật khẩu, OTP |
+| Proxy Keycloak (dự phòng) | Chuyển tiếp Admin API khi cần, tránh đường đi bị F5/WAF chặn |
+| Bộ công cụ vận hành | Script khởi động, tunnel, triển khai trên máy chủ |
+| Worker GPU từ xa | Xử lý OCR trên GPU nội bộ hoặc Google Colab |
 
-### 4.2 Sơ đồ kiến trúc kỹ thuật
+### 4.2. Sơ đồ kiến trúc
 
 ```mermaid
 flowchart LR
-    fe[Frontend ocr-fe] --> api[FastAPI API]
-    api --> tableSvc[table_service]
-    tableSvc --> pdfTextSvc[pdf_text_service]
-    tableSvc --> ocrSvc[ocr_service]
-    tableSvc --> excelSvc[excel_service]
-    tableSvc --> docxSvc[docx_service]
-    api --> userSvc[users_router_and_mapping]
-    userSvc --> bancaCore[BancaCore]
-    userSvc --> keycloak[KeycloakAdminAPI]
-    tableSvc --> storage[(storage uploads_results_exports_images)]
+    FE[Giao diện] --> OCR[Dịch vụ OCR]
+    OCR --> PIPE[Pipeline OCR / nhập liệu]
+    OCR --> CORE[Banca Core]
+    OCR -->|Xác thực dịch vụ| US[Dịch vụ quản lý người dùng]
+    OCR -.->|Dự phòng| KP[Proxy Keycloak]
+    US --> KC[Keycloak realm Agribank]
+    KP --> KC
+    PIPE --> ST[(Lưu trữ tạm: tải lên / kết quả / xuất file)]
 ```
 
-### 4.3 Thành phần chính
+### 4.3. Công nghệ xử lý tài liệu
 
-- `app/routers/ocr.py`: upload, status, result, validation, export, re-ocr.
-- `app/routers/users.py`: enrich, validate users, lookup, provision-batch.
-- `app/services/table_service.py`: điều phối pipeline OCR end-to-end.
-- `app/services/ocr_service.py`: nhận dạng bảng/cell OCR, pass-2 cho cột trọng yếu.
-- `app/services/pdf_text_service.py`: đọc bảng trực tiếp từ PDF có text.
-- `app/services/excel_service.py`: import/export Excel.
-- `app/services/docx_service.py`: import/export Word.
-- `app/services/user_mapping.py`: map table -> user + validate field.
+- PaddleOCR: phát hiện bố cục và bảng.
+- VietOCR: nhận dạng chữ tiếng Việt.
+- Đọc text layer PDF khi tài liệu là PDF số (không cần OCR).
+- Kết quả và tệp trung gian lưu theo phiên xử lý trên hệ thống tệp; siêu dữ liệu phiên xử lý lưu trong bộ nhớ dịch vụ.
 
----
+### 4.4. Chế độ xử lý
 
-## 5) Pipeline Xử Lý OCR/Text Extraction
-
-### 5.1 Luật chọn chiến lược xử lý
-
-- **PDF có text layer**: ưu tiên `import_from_pdf_text()` để bỏ OCR, tăng độ chính xác.
-- **PDF scan/ảnh**: dùng OCR pipeline.
-- **Word/Excel**: import trực tiếp bảng, confidence mặc định `1.0`.
-
-### 5.2 Pipeline OCR cho PDF scan
-
-1. Chuyển PDF -> ảnh trang (lazy convert theo trang).
-2. Detect bảng SSO, chia lưới cell.
-3. OCR cell bằng VietOCR.
-4. Post-process dữ liệu bảng.
-5. Pass-2 selective bằng Paddle cho cột trọng yếu:
-   - IPCAS
-   - CCCD
-   - Email
-   - SĐT
-   - Mã chi nhánh
-6. Lưu kết quả incremental từng trang.
-
-### 5.3 Các cải tiến độ chính xác đã áp dụng
-
-- Tách luồng `PDF text direct import` thay cho OCR khi có text layer.
-- Heuristic xác định dòng dữ liệu SSO dựa trên `QSO*`, email domain, CCCD.
-- Pass-2 Paddle cho các cột critical.
-- Chuẩn hóa email (`@agribank.com.vn`) và normalize SĐT.
-- Cải thiện nhận diện branch code (ưu tiên 4 chữ số như `3526`, `6900`).
+| Chế độ | Mô tả |
+|---|---|
+| Local CPU/GPU | Xử lý trên máy chủ OCR |
+| GPU nội bộ | Ủy thác sang worker GPU trong mạng nội bộ |
+| Google Colab | Ủy thác sang notebook GPU qua đường tunnel |
+| Tự động | Hệ thống chọn phương án phù hợp |
+| API cloud | Sử dụng nhà cung cấp OCR bên ngoài khi cần |
 
 ---
 
-## 6) Quản Lý Dữ Liệu, Mapping, Validation, Enrich
+## 5. Pipeline xử lý dữ liệu
 
-### 6.1 Mapping dữ liệu
+### 5.1. Chiến lược xử lý theo loại file
 
-- Hỗ trợ cả layout SSO 10 cột (mới) và 9 cột (cũ).
-- Header mapping linh hoạt dựa trên alias đã chuẩn hóa.
-- Dữ liệu sau map thành `KeycloakUserInput`.
+- PDF có text: nhập bảng trực tiếp để tăng độ chính xác và tốc độ.
+- PDF scan: chạy OCR đầy đủ.
+- Word/Excel: nhập bảng trực tiếp, độ tin cậy mặc định cao.
 
-### 6.2 Validation
+### 5.2. Các bước OCR với PDF scan
 
-- Validate theo trường bắt buộc và format:
-  - CCCD 12 số.
-  - SĐT bắt đầu `0`, độ dài hợp lệ.
-  - Email domain `@agribank.com.vn`.
-  - Role nằm trong danh mục hợp lệ.
-- Trả danh sách `errors` và `warnings` theo cell.
+1. Chuyển PDF thành ảnh trang (chuyển dần theo nhu cầu để giảm độ trễ trang đầu).
+2. Phát hiện bảng SSO và chia ô.
+3. Nhận dạng nội dung từng ô.
+4. Hậu xử lý bảng.
+5. Nhận dạng bổ sung tập trung vào các cột quan trọng: IPCAS, CCCD, email, số điện thoại, mã chi nhánh.
+6. Lưu kết quả theo từng trang.
 
-### 6.3 Enrich
+### 5.3. Biện pháp nâng cao độ chính xác
 
-- Enrich tự động chi nhánh/đại lý qua Banca Core.
-- Hỗ trợ lookup agency/agent thủ công qua API.
-- Hỗ trợ enrich lại sau khi chỉnh sửa dữ liệu.
-
-### 6.4 Provision lên Keycloak
-
-- Tạo mới user hoặc cập nhật user đã tồn tại.
-- Gán role client, cập nhật attributes.
-- Hỗ trợ conflict strategy: `skip`, `reset_password`, `reset_otp`, `reset_both`.
+- Ưu tiên đọc PDF số thay vì OCR khi có thể.
+- Nhận diện dòng dữ liệu SSO theo mẫu IPCAS, domain email, CCCD.
+- Chuẩn hóa email về domain Agribank và chuẩn hóa số điện thoại.
+- Nhận diện mã chi nhánh theo quy tắc nghiệp vụ.
+- Đối soát email với IPCAS khi cần.
 
 ---
 
-## 7) Hiệu Năng, Độ Chính Xác Và Kết Quả Test
+## 6. Mapping, kiểm tra, bổ sung dữ liệu và tạo lô
 
-### 7.1 Chiến lược hiệu năng
+### 6.1. Mapping
 
-- Queue job FIFO, xử lý ổn định nhiều user đồng thời.
-- Lazy convert PDF để giảm độ trễ trang đầu.
-- Pipeline overlap Poppler/OCR trong local mode.
-- Cho phép chọn local CPU/GPU, remote GPU nội bộ hoặc Colab.
+- Hỗ trợ bố cục bảng SSO 9 cột và 10 cột.
+- Ánh xạ tiêu đề linh hoạt theo tên cột đã chuẩn hóa.
+- Chuyển dữ liệu bảng thành cấu trúc đầu vào tạo người dùng Keycloak.
 
-### 7.2 Kết quả kiểm thử gần nhất
+### 6.2. Kiểm tra dữ liệu
 
-- Unit tests trọng yếu đã chạy pass:
-  - `test_docx_export.py`
-  - `test_pdf_text_import.py`
-  - `test_docx_import.py`
-- E2E script:
-  - `scripts/test_e2e_pdf_word.py`: PASS.
-  - `scripts/test_api_pdf_word.py`: PASS.
+- CCCD đủ 12 chữ số.
+- Số điện thoại bắt đầu bằng 0, độ dài hợp lệ.
+- Email thuộc domain `@agribank.com.vn`.
+- Vai trò thuộc danh mục cho phép.
+- Hệ thống trả lỗi và cảnh báo theo từng ô để người dùng sửa.
 
-### 7.3 Kết quả mẫu E2E API (gần nhất)
+### 6.3. Bổ sung dữ liệu
 
-- Upload PDF mẫu -> xử lý hoàn tất `3 trang`.
-- Trích xuất ~`13` dòng user, `13` IPCAS dạng `QSO*`.
-- Export Word thành công (~37 KB).
-- Re-upload Word đã xuất thành công.
+- Tự động khớp chi nhánh/đại lý qua Banca Core.
+- Cho phép tra cứu thủ công trên giao diện.
+- Cho phép chạy lại sau khi người dùng chỉnh sửa.
 
-Lưu ý: số lỗi validation còn phụ thuộc chất lượng tài liệu đầu vào và mức độ chuẩn dữ liệu gốc.
+### 6.4. Tạo lô người dùng
 
----
+Luồng chính:
 
-## 8) Hướng Dẫn Vận Hành/Triển Khai Nhanh
+```
+Giao diện → Dịch vụ OCR → Dịch vụ quản lý người dùng → Keycloak
+```
 
-### 8.1 Khởi động nhanh
+Hành vi chính:
 
-- Script chính: `ocr-release-kit/Start-OcrSystem.ps1`
-- Tùy chọn:
-  - `-UseGpu:$false` để chạy CPU.
-  - `-Port <port>` để đổi cổng.
+- Tạo mới hoặc cập nhật người dùng đã tồn tại.
+- Gán/gỡ vai trò, cập nhật thuộc tính, mật khẩu, OTP và các hành động bắt buộc.
+- Với người dùng đã cập nhật, hỗ trợ các chiến lược: bỏ qua, đặt lại mật khẩu, đặt lại OTP, hoặc cả hai.
+- Khi dịch vụ quản lý người dùng chưa sẵn sàng, hệ thống báo lỗi rõ ràng và không tạo lô.
 
-### 8.2 Những gì script vận hành thực hiện
-
-- Dừng process cũ trên cổng.
-- Cập nhật `.env` một số biến runtime quan trọng.
-- Start `uvicorn` backend.
-- Poll health trong tối đa 90s.
-- In URL frontend/docs + LAN/Tailscale (nếu có).
-
-### 8.3 Chỉ số cần giám sát
-
-- `GET /health`: trạng thái tổng thể, GPU, queue.
-- `GET /api/ocr/queue`: độ sâu hàng đợi.
-- `GET /api/ocr/status/{job_id}`: tiến trình từng job.
+Việc chọn môi trường DEV/PROD được truyền từ giao diện xuống dịch vụ OCR theo từng phiên làm việc.
 
 ---
 
-## 9) Hạn Chế, Backlog Cải Tiến, Lộ Trình Đề Xuất
+## 7. Triển khai và bảo mật
 
-### 9.1 Hạn chế hiện tại
+### 7.1. Mô hình triển khai
 
-- PDF scan chất lượng thấp vẫn phụ thuộc mạnh vào OCR engine.
-- Trên Windows, pipeline GPU/CPU hybrid có thể không tối ưu GPU utilization tuyệt đối.
-- Một số trường hợp OCR noise vẫn cần người dùng review thủ công.
+- Dịch vụ OCR và giao diện: chạy trên máy chủ ứng dụng hoặc host GPU nội bộ.
+- Dịch vụ quản lý người dùng: triển khai trên Kubernetes, tối thiểu 2 bản sao, có kiểm tra sống/sẵn sàng.
+- Proxy Keycloak: triển khai trên Kubernetes làm phương án dự phòng truy cập Admin API.
+- Điểm vào dịch vụ quản lý người dùng qua cổng Istio theo tên miền nội bộ được cấp phát.
+- Kết nối tới Keycloak ưu tiên qua DNS nội bộ cluster hoặc HTTPS nội bộ đã được phê duyệt.
 
-### 9.2 Backlog ưu tiên ngắn hạn (1-2 sprint)
+### 7.2. Kiểm soát truy cập
 
-- Bổ sung dashboard thống kê chất lượng OCR theo file/template.
-- Thêm mẫu benchmark tự động cho nhiều loại PDF scan khác nhau.
-- Cải thiện thông điệp lỗi/prompt sửa lỗi trên UI theo từng field cụ thể.
+| Lớp | Cơ chế |
+|---|---|
+| Gọi API OCR | Token chia sẻ giữa client/worker và dịch vụ |
+| Gọi dịch vụ quản lý người dùng | Token dịch vụ riêng giữa OCR và user-service |
+| Proxy Keycloak | Khóa proxy riêng cho đường dự phòng |
+| Mạng | NetworkPolicy hạn chế nguồn vào/ra theo namespace được phép |
+| Container | Chạy non-root, hạn chế quyền, hệ thống tệp chỉ đọc khi áp dụng |
 
-### 9.3 Lộ trình trung hạn
+### 7.3. Vận hành khởi động
 
-- Tách worker queue sang Redis/Celery để scale ngang.
-- Lưu metadata/job history trên DB thay vì in-memory + JSON file.
-- Tăng tự động hóa kiểm thử regression OCR theo bộ dataset chuẩn.
+Bộ công cụ vận hành hỗ trợ khởi động đồng thời dịch vụ OCR và dịch vụ quản lý người dùng, kiểm tra sức khỏe, công bố địa chỉ truy cập nội bộ/LAN khi cần, và hỗ trợ tunnel phục vụ kiểm thử từ xa.
 
----
+Các chỉ số cần theo dõi thường xuyên:
 
-## 10) Phụ Lục API Và Checklist UAT
-
-### 10.1 API OCR chính
-
-- `POST /api/ocr/upload`
-- `POST /api/ocr/upload-excel`
-- `POST /api/ocr/upload-docx`
-- `GET /api/ocr/status/{job_id}`
-- `GET /api/ocr/result/{job_id}`
-- `PUT /api/ocr/result/{job_id}`
-- `GET /api/ocr/result/{job_id}/validation`
-- `GET /api/ocr/result/{job_id}/export`
-- `GET /api/ocr/result/{job_id}/export-docx`
-- `GET /api/ocr/result/{job_id}/pdf-to-docx`
-- `POST /api/ocr/result/{job_id}/page/{page_number}/reocr`
-
-### 10.2 API Users/Provision
-
-- `GET /api/users/field-config`
-- `POST /api/users/validate`
-- `POST /api/users/enrich`
-- `GET /api/users/lookup/agencies`
-- `GET /api/users/lookup/agents`
-- `GET /api/users/preview-from-job/{job_id}`
-- `POST /api/users/provision-batch`
-
-### 10.3 Checklist UAT đề xuất
-
-- Upload PDF số có text -> hệ thống bỏ OCR và trích xuất đúng user.
-- Upload PDF scan -> OCR chạy đầy đủ, có thể review/edit.
-- Export Word/Excel sau OCR -> mở file và kiểm tra định dạng.
-- Re-upload Word/Excel đã sửa -> dữ liệu được cập nhật đúng job.
-- Validate báo lỗi đúng cột sai (email/CCCD/SĐT/role).
-- Enrich trả dữ liệu chi nhánh/đại lý hợp lệ.
-- Provision-batch tạo/cập nhật user đúng chiến lược conflict.
-- Ở màn kết quả batch:
-  - Chọn action cho updated users.
-  - F5/reload web vẫn giữ đúng màn và lựa chọn.
-  - Bấm Hoàn tất xong vẫn đổi lại action được và chạy lại được.
-
-### 10.4 Bộ tiêu đề đề xuất để chụp màn hình hướng dẫn
-
-Sử dụng các tiêu đề dưới đây khi làm tài liệu hướng dẫn người dùng (SOP screenshot):
-
-1. `Bước 1 - Tải dữ liệu PDF/Word/Excel`
-2. `Bước 2 - Chọn chế độ xử lý (Local/GPU nội bộ/Colab/API)`
-3. `Bước 3 - Theo dõi tiến độ OCR theo từng trang`
-4. `Bước 4 - Tải Excel/Word trong khi OCR đang chạy`
-5. `Bước 5 - OCR hoàn tất và tải file chỉnh sửa`
-6. `Bước 6 - Upload lại Excel/Word đã sửa`
-7. `Bước 7 - Kiểm tra dữ liệu và sửa lỗi bắt buộc`
-8. `Bước 8 - Enrich lại thông tin chi nhánh/đại lý`
-9. `Bước 9 - Xác nhận tạo lô user`
-10. `Bước 10 - Màn kết quả tạo lô (created/updated/failed)`
-11. `Bước 11 - Chọn thao tác cho updated users`
-12. `Bước 12 - Hoàn tất và undo lựa chọn khi cần`
-13. `Bước 13 - Reload trình duyệt và khôi phục trạng thái màn kết quả`
+- Sức khỏe dịch vụ OCR và dịch vụ quản lý người dùng.
+- Độ sâu hàng đợi xử lý.
+- Tiến trình từng phiên xử lý.
+- Tỷ lệ tạo lô thành công / thất bại.
 
 ---
 
-## 11) Khung Báo Cáo Theo Mẫu Ngân Hàng (Tham Khảo)
+## 8. Hiệu năng và kiểm thử
 
-Phần này bổ sung theo thông lệ báo cáo hệ thống công nghệ trong tổ chức tài chính: tập trung vào quản trị rủi ro công nghệ, khả dụng dịch vụ, kiểm soát truy cập, an toàn dữ liệu, DR/BCP, và bằng chứng kiểm thử.
+### 8.1. Định hướng hiệu năng
 
-### 11.1 Cấu trúc báo cáo ngân hàng thường dùng
+- Hàng đợi FIFO ổn định khi nhiều người dùng cùng làm việc.
+- Chuyển PDF sang ảnh theo từng trang để giảm độ trễ trang đầu.
+- Cho phép chuyển chế độ CPU/GPU hoặc worker từ xa khi tài nguyên thay đổi.
+- Tách tiến trình nhận dạng GPU khi cần để tránh xung đột tài nguyên.
 
-1. Bối cảnh nghiệp vụ và phạm vi hệ thống.
-2. Kiến trúc và dữ liệu (logical + deployment view).
-3. Kiểm soát bảo mật theo lớp (identity, network, app, data, ops).
-4. Quản trị rủi ro và phân loại mức độ quan trọng hệ thống.
-5. Tính sẵn sàng dịch vụ và mục tiêu SLA/SLO.
-6. Khả năng phục hồi (backup, DR, RTO, RPO, diễn tập).
-7. Quản lý thay đổi và SDLC.
-8. Kết quả test, phát hiện, kế hoạch khắc phục.
-9. Phụ lục bằng chứng (log, ticket, checklist, biên bản test).
+### 8.2. Phạm vi kiểm thử
 
-### 11.2 Đề xuất chuẩn hóa cho hệ thống OCR Banca
+Hệ thống có bộ kiểm thử đơn vị và kiểm thử luồng cho các hạng mục chính:
 
-- Chuẩn hóa mỗi kỳ báo cáo theo chu kỳ tháng/quý.
-- Tách phần "Executive" và "Technical Evidence" để phục vụ 2 nhóm độc giả.
-- Mỗi mục kiểm soát phải có:
-  - chủ sở hữu (owner),
-  - trạng thái tuân thủ,
-  - bằng chứng,
-  - thời hạn khắc phục.
+- Nhập/xuất Word, nhập PDF có text.
+- Ánh xạ và kiểm tra người dùng.
+- Client tạo lô qua dịch vụ quản lý người dùng.
+- Đối soát email, khớp chi nhánh/đại lý.
+- Kiểm thử API và luồng PDF → xuất Word → tải lại.
+
+Kết quả kiểm thử các luồng trọng yếu đạt yêu cầu đưa vào vận hành. Số lỗi kiểm tra dữ liệu trên từng hồ sơ phụ thuộc chất lượng tài liệu đầu vào.
 
 ---
 
-## 12) Ma Trận Kiểm Soát Kỹ Thuật (Control Matrix)
+## 9. Hạn chế và định hướng phát triển
 
-### 12.1 Control matrix đề xuất
+### 9.1. Hạn chế
 
-| Nhóm kiểm soát | Mục tiêu | Hiện trạng OCR Banca | Mức độ |
+- PDF scan chất lượng thấp vẫn cần rà soát thủ công.
+- Siêu dữ liệu phiên xử lý lưu trong bộ nhớ dịch vụ; khi khởi động lại có thể mất trạng thái hàng đợi (kết quả đã lưu trên đĩa vẫn còn).
+- Quản lý bí mật sản xuất còn dựa trên biến môi trường và Secret Kubernetes; chưa áp dụng vault/rotation tập trung.
+- Chưa có bộ chỉ số SLA/SLO và playbook DR/BCP được phê duyệt chính thức.
+
+### 9.2. Định hướng ngắn hạn
+
+- Chuẩn hóa cấu hình vai trò client trên mọi môi trường.
+- Bổ sung bảng theo dõi chất lượng OCR và thông báo lỗi theo từng trường trên giao diện.
+- Hoàn thiện gói triển khai đóng sẵn cho dịch vụ quản lý người dùng.
+- Thiết lập báo cáo vận hành định kỳ (hàng đợi, tỷ lệ lỗi, thời gian xử lý).
+
+### 9.3. Định hướng trung hạn
+
+- Tách hàng đợi sang nền tảng bền vững (Redis/Celery hoặc tương đương) để mở rộng ngang.
+- Lưu lịch sử phiên xử lý trên cơ sở dữ liệu.
+- Xây dựng bộ dữ liệu chuẩn và kiểm thử hồi quy OCR tự động.
+- Áp dụng quản lý bí mật tập trung và hoàn thiện DR/BCP.
+
+---
+
+## 10. Phụ lục API và checklist nghiệm thu
+
+### 10.1. API dịch vụ OCR
+
+| Nhóm | Chức năng chính |
+|---|---|
+| Cấu hình / giám sát | Sức khỏe hệ thống, hàng đợi, cấu hình runtime, môi trường DEV/PROD, sức khỏe worker |
+| Tải dữ liệu | Tải PDF, Excel, Word |
+| Theo dõi kết quả | Trạng thái phiên, kết quả, cập nhật ô, ảnh trang, OCR lại từng trang |
+| Kiểm tra / xuất | Kiểm tra dữ liệu, xuất Excel, xuất Word, chuyển PDF sang Word |
+
+### 10.2. API nghiệp vụ người dùng (qua dịch vụ OCR)
+
+| Chức năng | Mô tả |
+|---|---|
+| Cấu hình trường | Trường bắt buộc, vai trò, ánh xạ tiêu đề |
+| Kiểm tra / bổ sung | Validate danh sách; khớp chi nhánh/đại lý |
+| Tra cứu | Tìm chi nhánh, đại lý |
+| Xem trước | Xem dữ liệu người dùng từ phiên xử lý |
+| Tạo lô | Tạo/cập nhật hàng loạt trên Keycloak |
+| Chẩn đoán | Kiểm tra kết nối và quyền gán vai trò Keycloak |
+
+### 10.3. API dịch vụ quản lý người dùng
+
+Bao gồm tạo/tra cứu/cập nhật người dùng, đặt mật khẩu, thuộc tính, hành động bắt buộc, quản lý thông tin xác thực/OTP và gán/gỡ vai trò client. Mọi lời gọi đều yêu cầu xác thực dịch vụ (trừ kiểm tra sức khỏe).
+
+### 10.4. Checklist nghiệm thu đề xuất
+
+- PDF số: đọc trực tiếp, đúng danh sách người dùng.
+- PDF scan: OCR đầy đủ, rà soát và sửa được trên giao diện.
+- Các chế độ xử lý Local / GPU nội bộ / Colab hoạt động đúng cấu hình.
+- Xuất và tải lại Excel/Word cập nhật đúng dữ liệu phiên.
+- Kiểm tra dữ liệu báo đúng trường lỗi.
+- Bổ sung chi nhánh/đại lý trả kết quả hợp lệ.
+- Chuyển DEV/PROD và tạo lô đúng môi trường.
+- Tạo lô qua dịch vụ quản lý người dùng thành công; khi dịch vụ dừng thì báo lỗi rõ ràng.
+- Màn kết quả: chọn thao tác với người dùng đã cập nhật; tải lại trang vẫn giữ trạng thái; hoàn tất xong vẫn đổi và chạy lại được.
+- Kiểm tra sức khỏe các dịch vụ đạt yêu cầu.
+
+### 10.5. Đề xuất tiêu đề ảnh minh họa hướng dẫn vận hành
+
+1. Tải dữ liệu PDF/Word/Excel
+2. Chọn chế độ xử lý
+3. Chọn môi trường Keycloak DEV/PROD
+4. Theo dõi tiến độ theo trang
+5. Tải file Excel/Word trong khi đang xử lý
+6. Hoàn tất xử lý và tải file chỉnh sửa
+7. Tải lại file đã sửa
+8. Kiểm tra và sửa lỗi bắt buộc
+9. Bổ sung thông tin chi nhánh/đại lý
+10. Xác nhận tạo lô người dùng
+11. Màn kết quả tạo mới / cập nhật / lỗi
+12. Chọn thao tác với người dùng đã cập nhật
+13. Hoàn tất và điều chỉnh lại thao tác khi cần
+14. Tải lại trình duyệt và khôi phục màn kết quả
+
+---
+
+## 11. Quản trị rủi ro công nghệ và vận hành
+
+### 11.1. Ma trận kiểm soát
+
+| Nhóm kiểm soát | Mục tiêu | Hiện trạng | Đánh giá |
 |---|---|---|---|
-| IAM/API access | Chỉ client hợp lệ gọi API | Có `verify_worker_token` cho router OCR/Users | Tốt |
-| Input validation | Ngăn dữ liệu lỗi/độc hại | Kiểm tra extension, size, field validate | Tốt |
-| Data integrity | Tránh sai lệch dữ liệu đầu ra | Mapping + validate + review thủ công + reupload | Tốt |
-| Auditability | Truy vết xử lý | Có `job logs`, `status`, `result` persisted JSON | Trung bình |
-| Encryption in transit | Bảo mật truyền dữ liệu | Cần phụ thuộc reverse proxy/TLS triển khai ngoài | Cần bổ sung |
-| Secrets management | Quản lý secret an toàn | Hiện ở `.env`; cần vault cho production | Cần bổ sung |
-| Backup/DR | Khôi phục sau sự cố | Chưa tách chiến lược DR chính thức | Cần bổ sung |
-| Segregation of duties | Tách quyền vận hành/phê duyệt | Chưa formal hóa trong app layer | Cần bổ sung |
+| Kiểm soát truy cập API | Chỉ thành phần hợp lệ được gọi | Token giữa client–OCR và OCR–dịch vụ người dùng | Đạt |
+| Phân đoạn mạng | Hạn chế truy cập ngang | NetworkPolicy theo namespace và cổng được phép | Đạt |
+| Bảo vệ Admin API | Không lộ đường Admin Keycloak ra ngoài không kiểm soát | Gọi qua dịch vụ nội bộ / proxy được kiểm soát | Đạt |
+| Kiểm tra đầu vào | Ngăn dữ liệu sai/độc hại | Kiểm tra định dạng file và trường nghiệp vụ | Đạt |
+| Toàn vẹn dữ liệu | Giảm sai lệch đầu ra | Mapping, validate, rà soát thủ công, tải lại file | Đạt |
+| Củng cố container | Giảm bề mặt tấn công | Non-root, hạn chế quyền khi triển khai container | Đạt |
+| Khả năng truy vết | Phục vụ kiểm toán vận hành | Nhật ký phiên xử lý và nhật ký dịch vụ | Trung bình |
+| Mã hóa đường truyền | Bảo vệ dữ liệu trên đường truyền | Phụ thuộc TLS tại lớp ingress/proxy | Cần hoàn thiện chứng từ |
+| Quản lý bí mật | Bảo vệ khóa và token | Secret Kubernetes / biến môi trường | Cần nâng cấp |
+| Sao lưu / phục hồi | Duy trì hoạt động khi sự cố | Chưa có playbook DR chính thức | Cần bổ sung |
 
-### 12.2 Gap quan trọng cần đóng
+### 11.2. Chỉ số dịch vụ đề xuất
 
-- Thiếu chính sách quản lý bí mật (secret vault, rotation).
-- Chưa có bộ chỉ số SLA/SLO chính thức.
-- Chưa có playbook DR/BCP ở mức tài liệu phê duyệt chính thức.
+| Chỉ số | Mục tiêu đề xuất |
+|---|---|
+| Thời gian sẵn sàng dịch vụ OCR | ≥ 99,5% |
+| Thời gian sẵn sàng dịch vụ quản lý người dùng | ≥ 99,5% |
+| Tỷ lệ phiên OCR hoàn tất không lỗi hệ thống | ≥ 98% |
+| Tỷ lệ tạo lô thành công (trừ lỗi dữ liệu đầu vào) | ≥ 99% |
+| Thời gian xử lý trung bình | Theo dõi P50/P95 theo loại file |
 
----
+### 11.3. Phân hạng phục hồi đề xuất
 
-## 13) SLA/SLO, Năng Lực Vận Hành Và DR
+| Thành phần | Hạng | RTO | RPO |
+|---|---|---|---|
+| Dịch vụ OCR và hàng đợi | 1 | ≤ 4 giờ | ≤ 1 giờ |
+| Dịch vụ quản lý người dùng và đường Keycloak | 1 | ≤ 4 giờ | ≤ 1 giờ |
+| Kho kết quả / file xuất | 1 | ≤ 4 giờ | ≤ 1 giờ |
+| Tra cứu / bổ sung Banca Core | 2 | ≤ 24 giờ | ≤ 8 giờ |
+| Báo cáo nội bộ | 3 | ≤ 72 giờ | ≤ 24 giờ |
 
-### 13.1 SLA/SLO đề xuất cho hệ thống OCR Banca
+### 11.4. Phương án phục hồi
 
-| Chỉ số | Mục tiêu đề xuất | Cách đo |
+- Sao lưu thư mục kết quả, file xuất và cấu hình vận hành (không lưu bí mật dạng明文 trong bản sao lưu dùng chung).
+- Mất GPU: chuyển sang CPU hoặc worker khác.
+- Mất worker từ xa: chuyển về xử lý local hoặc nhà cung cấp API.
+- Mất dịch vụ quản lý người dùng: khôi phục triển khai và Secret; dịch vụ OCR dừng tạo lô và báo rõ trạng thái.
+- Mất máy chủ OCR: khởi động lại theo bộ công cụ vận hành và khôi phục dữ liệu đã lưu.
+- Diễn tập: rà soát trên giấy hàng quý; thử khôi phục hàng tháng; diễn tập chuyển đổi toàn phần hai lần/năm.
+
+### 11.5. Rủi ro chính và hướng xử lý
+
+| Rủi ro | Mức độ | Hướng xử lý |
 |---|---|---|
-| Uptime API OCR | >= 99.5% | Health-check + probe định kỳ |
-| OCR success rate | >= 98% job không fail hệ thống | Từ `JobStatus` |
-| Mean processing time | P50/P95 theo loại file | Log pipeline theo job |
-| Validation error rate | Xu hướng giảm theo tháng | `error_count`/tổng dòng |
-| Rework rate | % file phải reupload | Thống kê upload lại theo job |
+| OCR sai trên PDF scan kém chất lượng | Cao | Chuẩn hóa mẫu scan, tăng bước nhận dạng bổ sung, bộ dữ liệu chuẩn |
+| Lộ bí mật cấu hình | Cao | Vault, phân quyền và xoay khóa định kỳ |
+| Gián đoạn dịch vụ quản lý người dùng khi tạo lô | Cao | Duy trì tối thiểu 2 bản sao, cảnh báo sức khỏe sớm |
+| Quá tải khi nhiều phiên đồng thời | Trung bình | Tách hàng đợi, mở rộng worker |
+| Sai cấu hình vai trò client giữa môi trường | Cao | Chuẩn hóa cấu hình và checklist phát hành |
+| Thiếu playbook DR chính thức | Trung bình | Xây dựng và diễn tập theo lịch |
 
-### 13.2 Tiering hệ thống theo mức quan trọng
+### 11.6. Kế hoạch 90 ngày
 
-| Thành phần | Tier đề xuất | RTO | RPO |
-|---|---|---|---|
-| API OCR core + queue | Tier 1 | <= 4 giờ | <= 1 giờ |
-| Storage result/export | Tier 1 | <= 4 giờ | <= 1 giờ |
-| Lookup/Enrich tích hợp | Tier 2 | <= 24 giờ | <= 8 giờ |
-| Reporting nội bộ | Tier 3 | <= 72 giờ | <= 24 giờ |
+**30 ngày đầu:** chuẩn hóa giám sát vận hành; hoàn thiện quy định bảo mật bí mật và phân quyền; checklist phát hành/rollback.
 
-### 13.3 Kế hoạch DR/BCP áp dụng cho OCR Banca
+**30–60 ngày:** thiết lập bộ chỉ số dịch vụ và báo cáo tháng; mở rộng bộ mẫu PDF scan cho kiểm thử; cảnh báo sớm khi tỷ lệ lỗi tăng đột biến.
 
-- **Backup dữ liệu runtime**: `storage/results`, `storage/exports`, cấu hình `.env` (không chứa plaintext secret production).
-- **Kịch bản failover**:
-  - Mất GPU: fallback CPU/local API mode.
-  - Mất worker remote: chuyển mode local hoặc API provider.
-  - Mất node backend: khởi động lại bằng script release kit + restore data.
-- **Diễn tập định kỳ**:
-  - tabletop: hàng quý.
-  - restore test: hàng tháng.
-  - full failover drill: 2 lần/năm.
+**60–90 ngày:** thiết kế hàng đợi bền vững; hoàn thiện runbook DR và diễn tập chuyển đổi; chuẩn hóa bộ bằng chứng phục vụ kiểm toán nội bộ.
 
 ---
 
-## 14) SDLC, Quản Lý Thay Đổi Và Chất Lượng
+## 12. Kết luận
 
-### 14.1 SDLC áp dụng thực tế
+Hệ thống OCR Banca đáp ứng nhu cầu số hóa và tạo lô người dùng SSO Agribank theo quy trình khép kín từ tải tài liệu đến đồng bộ Keycloak. Kiến trúc hiện tại kết hợp xử lý tài liệu linh hoạt với lớp quản lý người dùng tách biệt, bảo đảm kiểm soát truy cập và phù hợp môi trường mạng có F5/WAF.
 
-- Phân tích yêu cầu theo lỗi nghiệp vụ thực tế (email mapping, SSO 10 cột, PDF text).
-- Triển khai theo nhánh thay đổi nhỏ, có test hồi quy.
-- Có script E2E xác nhận luồng business quan trọng:
-  - PDF -> OCR/text import -> export Word -> reupload.
-
-### 14.2 Bộ test hiện hành (đối chiếu mã nguồn)
-
-- `tests/test_api.py`
-- `tests/test_docx_import.py`
-- `tests/test_docx_export.py`
-- `tests/test_pdf_text_import.py`
-- `tests/test_users.py`
-- `tests/test_sso_enhance.py`
-- `tests/test_email_reconcile.py`
-
-### 14.3 Quản lý thay đổi đề xuất nâng chuẩn
-
-- Mỗi release phải có:
-  - release note (chức năng + ảnh hưởng dữ liệu),
-  - test evidence,
-  - rollback checklist.
-- Gắn incident/error vào backlog cải tiến OCR để giảm lỗi lặp.
+Để đáp ứng yêu cầu quản trị công nghệ tại tổ chức tài chính, hệ thống cần tiếp tục nâng chuẩn về giám sát dịch vụ, quản lý bí mật, khả năng phục hồi và bằng chứng kiểm toán theo lộ trình đã đề xuất.
 
 ---
 
-## 15) Rủi Ro Vận Hành Và Kế Hoạch Khắc Phục Theo Ưu Tiên
+## Tài liệu tham khảo
 
-### 15.1 Ma trận rủi ro ngắn gọn
-
-| Rủi ro | Tác động | Khả năng | Mức độ | Hành động ưu tiên |
-|---|---|---|---|---|
-| OCR sai với PDF scan chất lượng thấp | Sai dữ liệu user | Cao | Cao | Chuẩn hóa mẫu scan + tăng pass-2 + benchmark dataset |
-| Lộ secret qua `.env` ở production | Rủi ro bảo mật | Trung bình | Cao | Dùng secret manager + rotate key |
-| Quá tải khi nhiều job đồng thời | Tăng thời gian xử lý | Trung bình | Trung bình | Tách queue/worker, autoscale |
-| Thiếu DR playbook chính thức | Gián đoạn kéo dài | Thấp-Trung bình | Trung bình | Xây DR runbook + drill định kỳ |
-| Sai role mapping nghiệp vụ | Sai phân quyền | Trung bình | Cao | Bổ sung rule kiểm tra và approval step |
-
-### 15.2 Kế hoạch 90 ngày đề xuất
-
-**0-30 ngày**
-- Chuẩn hóa dashboard vận hành (queue depth, fail rate, mean processing).
-- Đóng gói policy bảo mật secret và phân quyền vận hành.
-- Bổ sung checklist release/rollback chuẩn.
-
-**31-60 ngày**
-- Thiết lập baseline SLA/SLO và báo cáo tháng.
-- Mở rộng bộ dữ liệu benchmark OCR theo nhiều mẫu PDF scan.
-- Tăng cường cảnh báo sớm khi lỗi OCR tăng đột biến.
-
-**61-90 ngày**
-- Thiết kế kiến trúc queue bền vững (Redis/Celery hoặc tương đương).
-- Hoàn chỉnh DR runbook và diễn tập full failover.
-- Chuẩn hóa bộ bằng chứng tuân thủ phục vụ kiểm toán nội bộ.
-
----
-
-## Kết Luận
-
-Phiên bản cập nhật này đã mở rộng báo cáo theo phong cách thường dùng trong ngân hàng: không chỉ mô tả chức năng mà còn đi sâu vào quản trị rủi ro công nghệ, kiểm soát bảo mật, vận hành dịch vụ, DR/BCP, SLA/SLO và lộ trình khắc phục có ưu tiên.  
-
-Đối với hệ thống OCR Banca, lợi thế cốt lõi vẫn là chiến lược kết hợp `PDF text direct import` + `OCR fallback`, đồng thời cần nâng chuẩn vận hành theo hướng "có thể kiểm toán được" để đáp ứng yêu cầu quản trị công nghệ ở cấp tổ chức tài chính.
-
-## Tài Liệu Tham Khảo Bố Cục Báo Cáo
-
-- [MAS Technology Risk Management Guidelines](https://www.mas.gov.sg/-/media/MAS/Regulations-and-Financial-Stability/Regulatory-and-Supervisory-Framework/Risk-Management/TRM-Guidelines-18-January-2021.pdf?la=en)
-- [Business Impact Analysis guidance (RTO/RPO focus)](https://www.metricstream.com/learn/business-impact-analysis.html)
-- [Thông tư 09/2020/TT-NHNN về an toàn hệ thống thông tin trong hoạt động ngân hàng](https://thuvienphapluat.vn/van-ban/Tien-te-Ngan-hang/Thong-tu-09-2020-TT-NHNN-an-toan-he-thong-thong-tin-trong-hoat-dong-ngan-hang-455885.aspx)
+- Thông tư 09/2020/TT-NHNN về an toàn hệ thống thông tin trong hoạt động ngân hàng
+- Hướng dẫn quản trị rủi ro công nghệ thông tin (MAS Technology Risk Management Guidelines)
+- Khung phân tích tác động nghiệp vụ (RTO/RPO) phục vụ xây dựng DR/BCP
