@@ -192,7 +192,21 @@ class VietOcrGpuClient:
         if not resp.get("ok"):
             raise RuntimeError(resp.get("error") or "predict_batch failed")
         texts = resp.get("texts") or []
-        return [(str(t).strip(), _estimate_confidence_local(t)) for t in texts]
+        scores = resp.get("scores") or []
+        out: list[tuple[str, float]] = []
+        for i, t in enumerate(texts):
+            text = str(t).strip()
+            if i < len(scores):
+                try:
+                    conf = float(scores[i])
+                except (TypeError, ValueError):
+                    conf = _estimate_confidence_local(text)
+            else:
+                conf = _estimate_confidence_local(text)
+            # Blend model score with light heuristic for empty/artifact text
+            conf = _blend_confidence(text, conf)
+            out.append((text, conf))
+        return out
 
     def shutdown(self) -> None:
         self._ready = False
@@ -214,6 +228,17 @@ class VietOcrGpuClient:
         except subprocess.TimeoutExpired:
             proc.kill()
         logger.info("VietOCR GPU worker stopped")
+
+
+def _blend_confidence(text: str, model_conf: float) -> float:
+    """Clamp model score and down-weight empty/suspicious OCR."""
+    heur = _estimate_confidence_local(text)
+    if not (text or "").strip():
+        return 0.0
+    # Prefer model score; pull down if heuristic strongly disagrees (artifacts)
+    if heur <= 0.3:
+        return min(float(model_conf), heur)
+    return float(max(0.0, min(1.0, model_conf if model_conf > 0 else heur)))
 
 
 def _estimate_confidence_local(text: str) -> float:

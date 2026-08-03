@@ -203,18 +203,114 @@ const btnCreateBatch = $('#btn-create-batch');
 const stepItems = $$('.step-item');
 const notificationCenter = $('#notification-center');
 
-// ── Notifications ──
-function notify(level, title, message = '', durationMs = 6000) {
+// ── Notifications (toast + lịch sử phiên) ──
+const NOTIFY_HISTORY_MAX = 40;
+/** @type {{id:number,level:string,title:string,message:string,at:string}[]} */
+const notifyHistory = [];
+let notifySeq = 0;
+
+function defaultNotifyDuration(level) {
+    if (level === 'error') return 16000;
+    if (level === 'warn') return 14000;
+    if (level === 'success') return 9000;
+    return 10000;
+}
+
+function notify(level, title, message = '', durationMs) {
+    const ms = durationMs == null ? defaultNotifyDuration(level) : durationMs;
+    const entry = {
+        id: ++notifySeq,
+        level,
+        title: String(title || ''),
+        message: String(message || ''),
+        at: new Date().toLocaleTimeString('vi-VN', { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
+    };
+    notifyHistory.unshift(entry);
+    if (notifyHistory.length > NOTIFY_HISTORY_MAX) notifyHistory.length = NOTIFY_HISTORY_MAX;
+    updateNotifyLogUi();
+
     if (!notificationCenter) return;
     const el = document.createElement('div');
     el.className = `toast toast-${level}`;
-    el.innerHTML = `<strong>${escapeHtml(title)}</strong>${message ? `<p>${escapeHtml(message)}</p>` : ''}`;
+    el.dataset.notifyId = String(entry.id);
+    el.innerHTML = `
+        <div class="toast-top">
+            <strong>${escapeHtml(entry.title)}</strong>
+            <button type="button" class="toast-close" aria-label="Đóng">×</button>
+        </div>
+        ${entry.message ? `<p>${escapeHtml(entry.message)}</p>` : ''}
+        <button type="button" class="toast-open-log">Xem lại</button>`;
     notificationCenter.appendChild(el);
     requestAnimationFrame(() => el.classList.add('show'));
-    setTimeout(() => {
+
+    const dismiss = () => {
         el.classList.remove('show');
         setTimeout(() => el.remove(), 300);
-    }, durationMs);
+    };
+    el.querySelector('.toast-close')?.addEventListener('click', (e) => {
+        e.stopPropagation();
+        dismiss();
+    });
+    el.querySelector('.toast-open-log')?.addEventListener('click', (e) => {
+        e.stopPropagation();
+        openNotifyLog();
+    });
+    setTimeout(dismiss, ms);
+}
+
+function updateNotifyLogUi() {
+    const badge = document.getElementById('notify-log-badge');
+    const list = document.getElementById('notify-log-list');
+    if (badge) {
+        const n = notifyHistory.length;
+        badge.textContent = String(n);
+        badge.classList.toggle('hidden', n === 0);
+    }
+    if (!list) return;
+    if (!notifyHistory.length) {
+        list.innerHTML = '<p class="notify-log-empty text-muted">Chưa có thông báo.</p>';
+        return;
+    }
+    list.innerHTML = notifyHistory.map((e) => `
+        <article class="notify-log-item notify-log-${escapeAttr(e.level)}">
+            <div class="notify-log-item-top">
+                <strong>${escapeHtml(e.title)}</strong>
+                <time>${escapeHtml(e.at)}</time>
+            </div>
+            ${e.message ? `<p>${escapeHtml(e.message)}</p>` : ''}
+        </article>`).join('');
+}
+
+function openNotifyLog() {
+    const panel = document.getElementById('notify-log-panel');
+    const btn = document.getElementById('btn-notify-log');
+    if (!panel) return;
+    panel.classList.remove('hidden');
+    btn?.setAttribute('aria-expanded', 'true');
+    updateNotifyLogUi();
+}
+
+function closeNotifyLog() {
+    const panel = document.getElementById('notify-log-panel');
+    const btn = document.getElementById('btn-notify-log');
+    panel?.classList.add('hidden');
+    btn?.setAttribute('aria-expanded', 'false');
+}
+
+function setupNotifyLog() {
+    document.getElementById('btn-notify-log')?.addEventListener('click', () => {
+        const panel = document.getElementById('notify-log-panel');
+        if (panel?.classList.contains('hidden')) openNotifyLog();
+        else closeNotifyLog();
+    });
+    document.getElementById('btn-notify-log-close')?.addEventListener('click', () => closeNotifyLog());
+    document.getElementById('btn-notify-log-clear')?.addEventListener('click', () => {
+        notifyHistory.length = 0;
+        updateNotifyLogUi();
+    });
+    document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape') closeNotifyLog();
+    });
 }
 
 function escapeHtml(str) {
@@ -229,6 +325,7 @@ function escapeAttr(str) {
 
 // ── Init ──
 document.addEventListener('DOMContentLoaded', async () => {
+    setupNotifyLog();
     await loadEnvironmentProfiles();
     if (activeEnvId === 'prod' && !prodKeycloakReady) {
         activeEnvId = 'dev';
@@ -669,9 +766,19 @@ async function uploadExcel(file, targetJobId = '') {
 
         if (!isReupload) {
             uploadSource = 'excel';
-            notify('success', 'Nạp Excel thành công', `Job ${jobId} — bỏ qua OCR, vào bước kiểm tra.`);
+            const warns = Array.isArray(data.warnings) ? data.warnings : [];
+            if (warns.length) {
+                notify('warn', 'Nạp Excel — có cảnh báo', warns.slice(0, 4).join('\n') + (warns.length > 4 ? '\n…' : ''), 12000);
+            } else {
+                notify('success', 'Nạp Excel thành công', `Job ${jobId} — bỏ qua OCR, vào bước kiểm tra.`);
+            }
         } else {
-            notify('success', 'Đã cập nhật từ Excel', 'Dữ liệu đã ghi đè, đang tải lại review.');
+            const warns = Array.isArray(data.warnings) ? data.warnings : [];
+            if (warns.length) {
+                notify('warn', 'Đã cập nhật Excel — cảnh báo', warns.slice(0, 4).join('\n'), 12000);
+            } else {
+                notify('success', 'Đã cập nhật từ Excel', 'Dữ liệu đã ghi đè, đang tải lại review.');
+            }
         }
 
         await submitReview();

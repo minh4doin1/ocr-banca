@@ -28,6 +28,7 @@ from app.models.schemas import (
     KeycloakDiagnosticsResponse,
     KeycloakUserInput,
     OnConflictAction,
+    ProvisionMode,
     ProvisionStatus,
     UserPreviewResponse,
     UserProvisionResult,
@@ -240,6 +241,10 @@ def _assign_roles_via_user_service(
 
     applied: list[str] = []
 
+    for n in resolved:
+        if n in existing_names:
+            applied.append(f"role_already:{n}")
+
     # Gán role còn thiếu
     to_assign = [n for n in resolved if n not in existing_names]
     if to_assign:
@@ -269,7 +274,10 @@ def _save_existing_user_via_user_service(
     user: KeycloakUserInput,
     attrs: dict,
 ) -> list[str]:
-    """Cập nhật user hiện có qua user-service."""
+    """Cập nhật user hiện có qua user-service.
+
+    Chỉ gửi field non-empty để giữ nguyên giá trị Keycloak khi cột để trống.
+    """
     applied: list[str] = []
     display_name = user.name.strip()
     first = user.first_name.strip() or (
@@ -278,13 +286,15 @@ def _save_existing_user_via_user_service(
     last = user.last_name.strip() or (
         " ".join(display_name.split()[:-1]) if display_name else ""
     )
-    client.update_user_details(
-        user_id,
-        email=user.email or user.username,
-        first_name=first,
-        last_name=last,
-    )
-    applied.append("save_details")
+    email = (user.email or "").strip()
+    if email or first or last:
+        client.update_user_details(
+            user_id,
+            email=email,
+            first_name=first,
+            last_name=last,
+        )
+        applied.append("save_details")
     if attrs:
         client.update_user_attributes(user_id, attrs)
         applied.append("set_attributes")
@@ -352,6 +362,7 @@ def _provision_one_via_user_service(
     temporary: bool,
     on_conflict: OnConflictAction,
     default_required_actions: list[str],
+    provision_mode: ProvisionMode = ProvisionMode.CREATE_OR_UPDATE,
 ) -> UserProvisionResult:
     """
     Provision 1 user qua user-service (Node.js BE).
@@ -364,8 +375,9 @@ def _provision_one_via_user_service(
     user = finalize_user(user)
     username = user.username.strip()
     result = UserProvisionResult(username=username, status=ProvisionStatus.FAILED)
+    is_edit = provision_mode == ProvisionMode.EDIT
 
-    missing = validate_user_fields(user)
+    missing = validate_user_fields(user, partial=is_edit)
     if missing:
         result.error = f"Thieu/khong hop le: {', '.join(missing)}"
         return result
@@ -387,6 +399,9 @@ def _provision_one_via_user_service(
         existing = client.find_user_by_username(username)
 
         if existing is None:
+            if is_edit:
+                result.error = "User khong ton tai — mode chinh sua khong tao moi."
+                return result
             required_actions = (
                 user.required_actions
                 if user.required_actions is not None
@@ -415,7 +430,11 @@ def _provision_one_via_user_service(
 
         user_id = str(existing.get("id", ""))
         result.user_id = user_id
-        action = user.on_conflict or on_conflict
+        action = (
+            OnConflictAction.SKIP
+            if is_edit
+            else (user.on_conflict or on_conflict)
+        )
 
         applied = _save_existing_user_via_user_service(
             client, user_id, user, attrs
@@ -542,8 +561,9 @@ async def field_config():
 async def validate_users(request: ValidateUsersRequest):
     items: list[UserValidationItem] = []
     valid = 0
+    partial = request.provision_mode == ProvisionMode.EDIT
     for idx, user in enumerate(request.users):
-        errors = validate_user_field_errors(user)
+        errors = validate_user_field_errors(user, partial=partial)
         missing = list(errors.keys())
         if not missing:
             valid += 1
@@ -695,6 +715,7 @@ async def provision_batch(
             temporary=temporary,
             on_conflict=request.default_on_conflict,
             default_required_actions=default_required_actions,
+            provision_mode=request.provision_mode,
         )
         response.results.append(item)
         if item.status == ProvisionStatus.CREATED:

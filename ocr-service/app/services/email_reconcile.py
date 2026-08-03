@@ -53,7 +53,12 @@ def _similarity(a: str, b: str) -> float:
     return SequenceMatcher(None, a, b).ratio()
 
 
-def reconcile_agribank_email(ocr_email: str, ipcas: str) -> tuple[str, str]:
+def reconcile_agribank_email(
+    ocr_email: str,
+    ipcas: str,
+    *,
+    ocr_confidence: float | None = None,
+) -> tuple[str, str]:
     """
     Reconcile OCR email with IPCAS username seed.
 
@@ -92,6 +97,17 @@ def reconcile_agribank_email(ocr_email: str, ipcas: str) -> tuple[str, str]:
     # Valid @agribank email from OCR — keep even when IPCAS differs (common in SSO forms).
     if ocr.endswith(_DOMAIN) and ocr_local and not _is_garbage_local(ocr_local):
         return ocr, "ocr"
+
+    # High-confidence OCR local that is almost valid — prefer OCR over blind IPCAS override
+    conf = float(ocr_confidence) if ocr_confidence is not None else None
+    if (
+        conf is not None
+        and conf >= settings.ocr_confidence_threshold
+        and ocr_local
+        and len(ocr_local) >= 3
+        and not any(frag in ocr_local for frag in _DOMAIN_FRAGMENTS)
+    ):
+        return f"{ocr_local}{_DOMAIN}", "ocr"
 
     if _is_garbage_local(ocr_local):
         return ipcas_email, "ipcas_override"

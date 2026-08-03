@@ -113,7 +113,16 @@ def _header_cell_matches_field(norm_cell: str, aliases: list[str]) -> bool:
     for alias in aliases:
         if len(alias) < 4:
             continue
-        if alias in norm_cell or norm_cell in alias:
+        if alias == norm_cell:
+            return True
+        # Tránh "chi nhanh" khớp nhầm header "ma chi nhanh" (thuộc branch_code).
+        if alias in norm_cell:
+            if norm_cell.startswith("ma ") and alias in {"chi nhanh", "chi nhanh"}:
+                continue
+            if alias.startswith("ten ") and not norm_cell.startswith("ten "):
+                continue
+            return True
+        if norm_cell in alias and len(norm_cell) >= 4:
             return True
     return False
 
@@ -317,11 +326,13 @@ def finalize_user(user: KeycloakUserInput) -> KeycloakUserInput:
 
 def _parse_branch_code_digits(raw: str) -> str:
     """Extract 4-digit branch code from cell text (e.g. 6900, 6900.0, '6900 Hội sở')."""
-    t = (raw or "").strip()
+    t = (raw or "").strip().lstrip("'").strip()
     if not t:
         return ""
+    # Bỏ hậu tố .0 từ số Excel / paste values
     compact = re.sub(r"\s", "", t)
-    m = re.fullmatch(r"(\d{4})(?:\.0+)?", compact)
+    compact = re.sub(r"\.0+$", "", compact)
+    m = re.fullmatch(r"(\d{4})", compact)
     if m:
         return m.group(1)
     m = _DEPARTMENT_CODE_RE.match(t)
@@ -396,14 +407,24 @@ def _map_header(header: list[str]) -> dict[str, int]:
         if not norm:
             continue
         best_field = ""
-        best_alias_len = 0
+        best_score = 0
         for field in _KNOWN_FIELDS:
             for alias in alias_map.get(field, []):
                 if not _header_cell_matches_field(norm, [alias]):
                     continue
-                if len(alias) > best_alias_len:
+                score = len(alias)
+                if alias == norm:
+                    score += 1000
+                # Ưu tiên branch_code cho tiêu đề "mã chi nhánh" / "mã cn"
+                if field == "branch_code" and (
+                    norm.startswith("ma ") or norm in {"ma cn", "branch code"}
+                ):
+                    score += 100
+                if field == "branch_name" and norm.startswith("ma "):
+                    score -= 200
+                if score > best_score:
                     best_field = field
-                    best_alias_len = len(alias)
+                    best_score = score
         if best_field and best_field not in col_to_field:
             col_to_field[best_field] = col_idx
     return col_to_field
@@ -434,6 +455,32 @@ def _is_sso_data_first_row(row: list[str]) -> bool:
     if "@agribank" in email or email.endswith("@agribank.com.vn"):
         return True
     return False
+
+
+def _looks_like_truncated_sso_10(matrix: list[list[str]], start_row: int = 0) -> bool:
+    """9 cột nhưng thực chất là mẫu 10 cột bị cắt cột cuối (Paste Values làm trống).
+
+    Dấu hiệu: col2 = mã CN 4 số, col3 = tên CN (không phải IPCAS), col4 = IPCAS.
+    """
+    samples = 0
+    hits = 0
+    for row in matrix[start_row : start_row + 20]:
+        if len(row) < 8:
+            continue
+        if _is_column_number_row(row):
+            continue
+        c2 = re.sub(r"\.0+$", "", re.sub(r"\s", "", (row[2] or "").strip()))
+        c3 = (row[3] or "").strip()
+        c4 = (row[4] or "").strip().upper()
+        if not c2 and not c3:
+            continue
+        samples += 1
+        code_ok = bool(re.fullmatch(r"\d{4}", c2))
+        c3_as_ipcas = bool(re.fullmatch(r"[A-Z0-9]{4,16}", c3.upper())) and c3.isascii()
+        c4_as_ipcas = bool(re.fullmatch(r"[A-Z0-9]{4,16}", c4))
+        if code_ok and not c3_as_ipcas and c4_as_ipcas:
+            hits += 1
+    return samples >= 2 and hits >= max(2, (samples + 1) // 2)
 
 
 def _sso_data_col_map(num_cols: int) -> dict[str, int]:
@@ -469,13 +516,24 @@ def _resolve_col_map(matrix: list[list[str]]) -> tuple[dict[str, int], int]:
             data_start = row_idx + 1
             while data_start < len(matrix) and _is_column_number_row(matrix[data_start]):
                 data_start += 1
+            # Header có mã CN mà không map được branch_code (bị nhầm branch_name)
+            if "branch_code" not in col_to_field:
+                for ci, title in enumerate(row):
+                    norm = _normalize_header_key(title)
+                    if norm in {"ma chi nhanh", "ma cn", "branch code", "ma chinhanh"}:
+                        col_to_field["branch_code"] = ci
+                        break
             return col_to_field, data_start
 
     for row_idx, row in enumerate(matrix):
         if _is_column_number_row(row):
             continue
         if _is_sso_data_first_row(row) and len(row) >= 8:
-            return _sso_data_col_map(len(row)), row_idx
+            n = len(row)
+            if n == 9 and _looks_like_truncated_sso_10(matrix, row_idx):
+                # Dùng map 10 cột trên dữ liệu 9 cột (cột unit có thể trống).
+                return _sso_data_col_map(10), row_idx
+            return _sso_data_col_map(n), row_idx
 
     return {}, 0
 
@@ -509,35 +567,53 @@ def _field_value(data: dict, field: str) -> str:
     return str(val or "").strip()
 
 
-def validate_user_fields(user: KeycloakUserInput) -> list[str]:
+def validate_user_fields(
+    user: KeycloakUserInput, *, partial: bool = False
+) -> list[str]:
     """Trả danh sách trường bắt buộc còn thiếu hoặc không hợp lệ."""
-    return list(validate_user_field_errors(user).keys())
+    return list(validate_user_field_errors(user, partial=partial).keys())
 
 
-def validate_user_field_errors(user: KeycloakUserInput) -> dict[str, str]:
-    """Trả map field -> thông báo lỗi tiếng Việt."""
+def validate_user_field_errors(
+    user: KeycloakUserInput, *, partial: bool = False
+) -> dict[str, str]:
+    """Trả map field -> thông báo lỗi tiếng Việt.
+
+    partial=True (mode edit): chỉ bắt username + format các field đã điền.
+    partial=False: bắt đủ cột theo USER_REQUIRED_FIELDS (hành vi tạo lô).
+    """
     user = finalize_user(user)
     errors: dict[str, str] = {}
     data = user.model_dump()
     labels = settings.field_labels_vi
 
-    for field in settings.user_required_fields_list:
-        val = _field_value(data, field)
-        if not val:
-            label = labels.get(field, field)
-            errors[field] = f"Thiếu {label}"
+    username = (user.username or "").strip()
+    if not username:
+        errors["username"] = f"Thiếu {labels.get('username', 'username')}"
 
-    # Keycloak profile hard-requirement in production realm.
-    for field in ("branch_code", "phone", "cccd"):
-        if not _field_value(data, field):
-            label = labels.get(field, field)
-            errors[field] = f"Thiếu {label}"
+    if not partial:
+        for field in settings.user_required_fields_list:
+            val = _field_value(data, field)
+            if not val:
+                label = labels.get(field, field)
+                errors[field] = f"Thiếu {label}"
 
-    roles = list(user.roles) if user.roles else (
-        normalize_roles(user.role) if user.role else []
-    )
-    if not roles and "role" in settings.user_required_fields_list:
-        errors["role"] = "Thiếu vai trò"
+        # Keycloak profile hard-requirement in production realm.
+        for field in ("branch_code", "phone", "cccd"):
+            if not _field_value(data, field):
+                label = labels.get(field, field)
+                errors[field] = f"Thiếu {label}"
+
+        roles = list(user.roles) if user.roles else (
+            normalize_roles(user.role) if user.role else []
+        )
+        if not roles and "role" in settings.user_required_fields_list:
+            errors["role"] = "Thiếu vai trò"
+    else:
+        roles = list(user.roles) if user.roles else (
+            normalize_roles(user.role) if user.role else []
+        )
+
     for r in roles:
         if r not in settings.keycloak_valid_roles:
             errors["role"] = f"Vai trò không hợp lệ: {r}"
@@ -651,6 +727,12 @@ def map_table_to_users(
         if not username:
             username = email or _derive_agribank_email(ipcas)
         if not username and not email:
+            stt = _val("stt") or str(row_idx + 1)
+            name_hint = _compose_name(_val("first_name"), _val("last_name"), _val("name"))
+            hint = f" (STT {stt}" + (f", {name_hint}" if name_hint else "") + ")"
+            warnings.append(
+                f"Dòng {row_idx + 1}{hint}: bỏ qua — thiếu email/IPCAS/username."
+            )
             continue
 
         first_name = _val("first_name")
@@ -712,7 +794,7 @@ def map_result_to_users(
     result: OcrResult,
 ) -> tuple[list[KeycloakUserInput], list[str]]:
     all_users: list[KeycloakUserInput] = []
-    warnings: list[str] = []
+    warnings: list[str] = list(getattr(result, "warnings", None) or [])
     seen: set[str] = set()
 
     for page in result.pages:

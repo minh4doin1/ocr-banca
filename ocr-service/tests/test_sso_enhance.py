@@ -289,3 +289,59 @@ def test_adjust_col_lines_splits_wide_gap_to_10_columns():
     assert _sso_data_column_count(col_lines) == 9
     adjusted = _adjust_col_lines_to_target(col_lines, 10)
     assert _sso_data_column_count(adjusted) == 10
+
+
+def test_sso_cell_needs_pass2_branch_low_conf():
+    from app.services.ocr_service import _sso_cell_needs_pass2
+
+    assert _sso_cell_needs_pass2("3526", "branch", confidence=0.95) is False
+    assert _sso_cell_needs_pass2("3526", "branch", confidence=0.5) is True
+    assert _sso_cell_needs_pass2("35", "branch", confidence=0.99) is True
+
+
+def test_sso_cell_needs_pass2_email_and_role():
+    from app.services.ocr_service import _sso_cell_needs_pass2
+
+    assert _sso_cell_needs_pass2("user@agribank.com.vn", "email", confidence=0.9) is False
+    assert _sso_cell_needs_pass2("[?] xy", "email", confidence=0.9) is True
+    assert _sso_cell_needs_pass2("dai ly vien", "role", confidence=0.99) is True
+
+
+def test_pick_field_candidate_role_and_branch():
+    from app.services.ocr_service import _pick_field_candidate
+
+    role_best = _pick_field_candidate(
+        "role",
+        [("xyz", 0.99), ("dai ly vien", 0.7)],
+    )
+    assert role_best[0]
+
+    branch_best = _pick_field_candidate(
+        "branch",
+        [("35ab", 0.9), ("3526", 0.6)],
+    )
+    assert "3526" in branch_best[0]
+
+
+def test_blend_and_normalize_confidence():
+    from app.services.ocr_service import (
+        _blend_model_confidence,
+        _estimate_confidence,
+        _normalize_vietocr_prob,
+    )
+
+    assert _normalize_vietocr_prob(None) == 0.0
+    assert 0.4 <= _normalize_vietocr_prob([0.9, 0.8, 0.7]) <= 1.0
+    assert _blend_model_confidence("", 0.9) == 0.0
+    assert _blend_model_confidence("Nguyen Van A", 0.91) >= 0.7
+    assert _estimate_confidence("") == 0.0
+
+
+def test_cell_crop_pad_preserves_diacritic_margin():
+    from app.services.ocr_service import _cell_crop_pad
+
+    cx1, cy1, cx2, cy2 = _cell_crop_pad([100, 100, 200, 140], (1000, 1000, 3))
+    assert cy1 < 100
+    assert cy2 > 140
+    assert cx1 <= 100
+    assert cx2 >= 200

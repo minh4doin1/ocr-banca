@@ -67,3 +67,26 @@ def test_email_needs_review():
     assert email_needs_review("notanemail")
     assert not email_needs_review("user@agribank.com.vn")
 
+
+def test_high_conf_ocr_preferred_over_ipcas_when_almost_valid():
+    """High-confidence OCR local that fails strict regex still beats IPCAS override."""
+    # "user.name" has a dot — _is_garbage_local is True for dots in local
+    # Use a local that is not garbage but would previously lose to IPCAS only if garbage.
+    # Case: local looks fine enough with high conf even if not perfect regex.
+    email, src = reconcile_agribank_email(
+        "user01x@agribank.com.vn",
+        "OTHERUSER",
+        ocr_confidence=0.95,
+    )
+    assert email == "user01x@agribank.com.vn"
+    assert src == "ocr"
+
+
+def test_garbage_still_overrides_with_ipcas():
+    email, src = reconcile_agribank_email(
+        "agribank.com.vn",
+        "LANLUONG",
+        ocr_confidence=0.99,
+    )
+    assert email == "lanluong@agribank.com.vn"
+    assert src == "ipcas_override"

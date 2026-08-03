@@ -21,12 +21,53 @@ let fieldConfig = null;
 let enrichedUsers = [];
 let batchShowErrorsOnly = false;
 let reviewSearchQuery = '';
+/** @type {'all' | 'limit' | 'range'} */
+let rowScopeMode = 'all';
+let rowScopeLimit = 20;
+let rowScopeFrom = 1;
+let rowScopeTo = 30;
 let lastProvisionResponse = null;
 let followUpActions = {};
 let followUpFinalized = false;
 let successShowUpdatedOnly = false;
 let successSearchQuery = '';
+/** @type {'create_or_update' | 'edit'} */
+let provisionMode = 'create_or_update';
 const SUCCESS_STATE_KEY_PREFIX = 'ocr_batch_success_state_v1';
+
+function isEditProvisionMode() {
+    return provisionMode === 'edit';
+}
+
+function getProvisionMode() {
+    const checked = document.querySelector('input[name="provision-mode"]:checked');
+    return checked?.value === 'edit' ? 'edit' : 'create_or_update';
+}
+
+function syncProvisionModeUi() {
+    provisionMode = getProvisionMode();
+    const edit = isEditProvisionMode();
+    const subtitle = document.getElementById('review-subtitle');
+    const hint = document.getElementById('provision-mode-hint');
+    const btn = typeof btnCreateBatch !== 'undefined' ? btnCreateBatch : document.getElementById('btn-create-batch');
+    const statOk = document.querySelector('#review-stats .review-stat-ok .review-stat-label');
+    if (subtitle) {
+        subtitle.textContent = edit
+            ? 'Chỉnh sửa một phần thông tin user đã có trên Keycloak'
+            : 'Rà soát lần cuối trước khi tạo lô user Keycloak';
+    }
+    if (hint) {
+        hint.textContent = edit
+            ? 'Username (email đăng nhập) bắt buộc; cột trống giữ nguyên dữ liệu hiện có. Không tạo user mới.'
+            : 'Bắt buộc đủ cột hồ sơ. User chưa có sẽ được tạo mới.';
+    }
+    if (btn) {
+        btn.textContent = edit ? 'Xác nhận & Cập nhật' : 'Xác nhận & Tạo lô User';
+    }
+    if (statOk) {
+        statOk.textContent = edit ? 'Hợp lệ' : 'Đủ dữ liệu';
+    }
+}
 
 function getSuccessStateKey() {
     const envId = typeof getActiveEnvId === 'function' ? getActiveEnvId() : 'dev';
@@ -143,22 +184,36 @@ function validateCellByField(field, text, confidence, isHeader) {
     return '';
 }
 
-function validateUserClient(user) {
+function validateUserClient(user, opts = {}) {
+    const partial = opts.partial ?? isEditProvisionMode();
     const errors = {};
-    const required = fieldConfig?.required_fields || [];
-    required.forEach(field => {
-        if (field === 'role') {
-            const roles = user.roles?.length ? user.roles : parseRolesText(user.role);
-            if (!roles.length) errors.role = 'Thiếu vai trò';
-            return;
-        }
-        const val = String(user[field] || '').trim();
-        if (!val) errors[field] = `Thiếu ${fieldLabel(field)}`;
-    });
+    const username = String(user.username || user.email || '').trim();
+    if (!username) errors.username = 'Thiếu username';
+
+    if (!partial) {
+        const required = fieldConfig?.required_fields || [];
+        required.forEach(field => {
+            if (field === 'role') {
+                const roles = user.roles?.length ? user.roles : parseRolesText(user.role);
+                if (!roles.length) errors.role = 'Thiếu vai trò';
+                return;
+            }
+            const val = String(user[field] || '').trim();
+            if (!val) errors[field] = `Thiếu ${fieldLabel(field)}`;
+        });
+    }
+
     if (user.cccd && !/^\d{12}$/.test(String(user.cccd).replace(/\s/g, ''))) errors.cccd = 'CCCD phải có 12 số';
     if (user.phone && !/^0\d{8,10}$/.test(String(user.phone).replace(/\s/g, ''))) errors.phone = 'SĐT không hợp lệ';
-    const email = String(user.email || user.username || '');
-    if (email && !email.toLowerCase().endsWith('@agribank.com.vn')) errors.email = 'Email phải thuộc @agribank.com.vn';
+    const email = String(user.email || '').trim();
+    if (email && !email.toLowerCase().endsWith('@agribank.com.vn')) {
+        errors.email = 'Email phải thuộc @agribank.com.vn';
+    } else if (!partial && !email) {
+        const fallback = String(user.username || '').trim();
+        if (fallback && !fallback.toLowerCase().endsWith('@agribank.com.vn')) {
+            errors.email = 'Email phải thuộc @agribank.com.vn';
+        }
+    }
     const roles = user.roles?.length ? user.roles : parseRolesText(user.role);
     if (roles.length && fieldConfig?.roles?.length) {
         const valid = fieldConfig.roles.map(r => r.value);
@@ -230,12 +285,13 @@ function renderBulkRoleChips() {
             notify('warn', 'Chọn vai trò', 'Tick ít nhất một vai trò trước khi áp dụng.');
             return;
         }
-        enrichedUsers.forEach(u => {
+        enrichedUsers.forEach((u, idx) => {
+            if (!userInRowScope(idx)) return;
             u.roles = [...roles];
             u.role = roles[0] || '';
         });
         renderBatchReviewTable(enrichedUsers);
-        notify('success', 'Đã áp dụng vai trò', `${roles.length} role cho ${enrichedUsers.length} user`);
+        notify('success', 'Đã áp dụng vai trò', `${roles.length} role cho ${getScopedUsers().length} user trong phạm vi`);
     });
 }
 
@@ -290,15 +346,84 @@ function rowMatchesSearch(u, q) {
     return hay.includes(q);
 }
 
+function syncRowScopeFromDom() {
+    const modeEl = document.getElementById('row-scope-mode');
+    const fromEl = document.getElementById('row-scope-from');
+    const toEl = document.getElementById('row-scope-to');
+    const rangeWrap = document.getElementById('row-scope-range');
+    const val = modeEl?.value || 'all';
+
+    if (val === 'all') {
+        rowScopeMode = 'all';
+    } else if (val === 'range') {
+        rowScopeMode = 'range';
+        rowScopeFrom = Math.max(1, parseInt(fromEl?.value || '1', 10) || 1);
+        rowScopeTo = Math.max(rowScopeFrom, parseInt(toEl?.value || String(rowScopeFrom), 10) || rowScopeFrom);
+        if (fromEl) fromEl.value = String(rowScopeFrom);
+        if (toEl) toEl.value = String(rowScopeTo);
+    } else {
+        rowScopeMode = 'limit';
+        rowScopeLimit = Math.max(1, parseInt(val, 10) || 10);
+    }
+    rangeWrap?.classList.toggle('hidden', rowScopeMode !== 'range');
+    updateRowScopeHint();
+}
+
+function userInRowScope(idx) {
+    const n = idx + 1;
+    if (rowScopeMode === 'all') return true;
+    if (rowScopeMode === 'limit') return n <= rowScopeLimit;
+    const from = Math.max(1, rowScopeFrom);
+    const to = Math.max(from, rowScopeTo);
+    return n >= from && n <= to;
+}
+
+function getScopedUserEntries() {
+    return enrichedUsers
+        .map((u, idx) => ({ u, idx }))
+        .filter(({ idx }) => userInRowScope(idx));
+}
+
+function getScopedUsers() {
+    return getScopedUserEntries().map(({ u }) => u);
+}
+
+function describeRowScope() {
+    const total = enrichedUsers.length;
+    if (!total) return 'Chưa có dữ liệu';
+    if (rowScopeMode === 'all') return `Tất cả ${total} hàng`;
+    if (rowScopeMode === 'limit') {
+        const n = Math.min(rowScopeLimit, total);
+        return `Hàng 1–${n} / ${total}`;
+    }
+    const from = Math.min(rowScopeFrom, total);
+    const to = Math.min(Math.max(rowScopeFrom, rowScopeTo), total);
+    return `Hàng ${from}–${to} / ${total}`;
+}
+
+function updateRowScopeHint() {
+    const hint = document.getElementById('row-scope-hint');
+    if (hint) hint.textContent = describeRowScope();
+}
+
 function updateBatchSummary() {
+    const scoped = getScopedUsers();
     let valid = 0;
-    enrichedUsers.forEach(u => {
+    scoped.forEach(u => {
         const errs = validateUserClient(u);
         u._field_errors = errs;
         u.missing_fields = Object.keys(errs);
         if (!Object.keys(errs).length) valid += 1;
     });
-    const total = enrichedUsers.length;
+    // Vẫn cập nhật errors cho hàng ngoài scope để không mất state khi đổi filter
+    enrichedUsers.forEach((u, idx) => {
+        if (userInRowScope(idx)) return;
+        const errs = validateUserClient(u);
+        u._field_errors = errs;
+        u.missing_fields = Object.keys(errs);
+    });
+
+    const total = scoped.length;
     const errors = total - valid;
     const pct = total ? Math.round((valid / total) * 100) : 0;
 
@@ -312,18 +437,20 @@ function updateBatchSummary() {
     if (statErrors) statErrors.textContent = String(errors);
     if (progressFill) progressFill.style.width = `${pct}%`;
     if (progressText) progressText.textContent = `${pct}% hoàn tất`;
+    updateRowScopeHint();
 
     const bar = document.getElementById('batch-summary-bar');
     if (bar) {
         bar.classList.add('hidden');
-        bar.textContent = `${valid}/${total} user đủ dữ liệu`;
+        bar.textContent = `${valid}/${total} user đủ dữ liệu (${describeRowScope()})`;
     }
 }
 
 function renderStatusCell(errors) {
     const keys = Object.keys(errors);
     if (!keys.length) {
-        return '<span class="status-pill status-ok" title="Đủ dữ liệu">OK</span>';
+        const okTitle = isEditProvisionMode() ? 'Hợp lệ để cập nhật' : 'Đủ dữ liệu';
+        return `<span class="status-pill status-ok" title="${okTitle}">OK</span>`;
     }
     const tips = keys.map(f => `${fieldLabel(f)}: ${errors[f]}`).join('\n');
     const labels = keys.map(f => fieldLabel(f)).slice(0, 3).join(', ');
@@ -358,16 +485,18 @@ function renderBatchReviewTable(users) {
     const tbody = document.getElementById('batch-review-tbody');
     if (!tbody) return;
     tbody.innerHTML = '';
+    syncRowScopeFromDom();
     updateBatchSummary();
 
     const q = reviewSearchQuery.trim().toLowerCase();
-    let displayIdx = 0;
+    let visible = 0;
 
     users.forEach((u, idx) => {
+        if (!userInRowScope(idx)) return;
         if (batchShowErrorsOnly && !(u.missing_fields || []).length) return;
         if (!rowMatchesSearch(u, q)) return;
 
-        displayIdx += 1;
+        visible += 1;
         const errors = u._field_errors || validateUserClient(u);
         const tr = document.createElement('tr');
         tr.className = Object.keys(errors).length ? 'row-error' : 'row-ok';
@@ -377,7 +506,7 @@ function renderBatchReviewTable(users) {
         const inpTitle = (f) => errors[f] ? ` title="${escapeAttr(errors[f])}"` : '';
 
         tr.innerHTML = `
-            <td class="col-stt">${displayIdx}</td>
+            <td class="col-stt" title="Hàng ${idx + 1} trong danh sách">${idx + 1}</td>
             <td class="col-email"><input class="${inpCls('email')}" data-idx="${idx}" data-f="email" value="${escapeAttr(u.email || u.username || '')}"${inpTitle('email')}></td>
             <td class="col-name"><input class="${inpCls('last_name')}" data-idx="${idx}" data-f="last_name" value="${escapeAttr(u.last_name || '')}"${inpTitle('last_name')}></td>
             <td class="col-name"><input class="${inpCls('first_name')}" data-idx="${idx}" data-f="first_name" value="${escapeAttr(u.first_name || '')}"${inpTitle('first_name')}></td>
@@ -401,6 +530,12 @@ function renderBatchReviewTable(users) {
             <td class="status-col col-status">${renderStatusCell(errors)}</td>`;
         tbody.appendChild(tr);
     });
+
+    if (!visible && users.length) {
+        const tr = document.createElement('tr');
+        tr.innerHTML = `<td colspan="12" class="text-muted" style="padding:16px;text-align:center">Không có hàng nào trong phạm vi đã chọn (${escapeHtml(describeRowScope())}).</td>`;
+        tbody.appendChild(tr);
+    }
 
     tbody.querySelectorAll('.batch-inp').forEach(el => {
         const handler = () => {
@@ -444,7 +579,9 @@ function applyBulkBatchField(field, scope) {
         notify('warn', 'Thiếu giá trị', `Nhập ${fieldLabel(field)} trước khi áp dụng hàng loạt.`);
         return;
     }
-    enrichedUsers.forEach(u => {
+    let applied = 0;
+    enrichedUsers.forEach((u, idx) => {
+        if (!userInRowScope(idx)) return;
         const errs = validateUserClient(u);
         const isError = !!errs[field] || ((fieldConfig?.required_fields || []).includes(field) && !String(u[field] || '').trim());
         if (scope === 'error' && !isError) return;
@@ -456,9 +593,10 @@ function applyBulkBatchField(field, scope) {
             u[field] = value;
             if (field === 'email') u.username = value;
         }
+        applied += 1;
     });
     renderBatchReviewTable(enrichedUsers);
-    notify('success', 'Đã áp dụng hàng loạt', `${fieldLabel(field)} → ${value}`);
+    notify('success', 'Đã áp dụng hàng loạt', `${fieldLabel(field)} → ${value} (${applied} hàng trong phạm vi)`);
 }
 
 async function openAgencyPicker(idx) {
@@ -513,6 +651,13 @@ function renderReviewPage(users) {
     if (searchInp) searchInp.value = '';
     const filterCb = document.getElementById('btn-batch-filter-errors');
     if (filterCb) filterCb.checked = false;
+    const scopeMode = document.getElementById('row-scope-mode');
+    if (scopeMode) scopeMode.value = 'all';
+    rowScopeMode = 'all';
+    const toEl = document.getElementById('row-scope-to');
+    if (toEl) toEl.value = String(Math.min(30, enrichedUsers.length || 30));
+    syncProvisionModeUi();
+    syncRowScopeFromDom();
     renderBulkRoleChips();
     renderBatchReviewTable(enrichedUsers);
     setStep(2);
@@ -536,8 +681,14 @@ function hideReviewPage() {
 }
 
 function validateBeforeProvision() {
+    syncRowScopeFromDom();
     updateBatchSummary();
-    const missingUsers = enrichedUsers.filter(u => (u.missing_fields || []).length > 0);
+    const scoped = getScopedUserEntries();
+    if (!scoped.length) {
+        notify('error', 'Không có hàng để xử lý', `Phạm vi hiện tại: ${describeRowScope()}`);
+        return false;
+    }
+    const missingUsers = scoped.filter(({ u }) => (u.missing_fields || []).length > 0).map(({ u }) => u);
     if (missingUsers.length) {
         batchShowErrorsOnly = true;
         const filterCb = document.getElementById('btn-batch-filter-errors');
@@ -548,7 +699,7 @@ function validateBeforeProvision() {
             const labels = (u.missing_fields || []).map(fieldLabel).join(', ');
             return `${u.email || u.username}: ${labels}`;
         }).join('\n');
-        notify('error', `Còn ${missingUsers.length} user thiếu/sai trường`, sample + (missingUsers.length > 5 ? '\n...' : ''), 10000);
+        notify('error', `Còn ${missingUsers.length}/${scoped.length} user thiếu/sai trường (${describeRowScope()})`, sample + (missingUsers.length > 5 ? '\n...' : ''), 10000);
         return false;
     }
     return true;
@@ -583,6 +734,7 @@ function syncRolesFromDom() {
 }
 
 function statusLabelVi(status) {
+    if (status === 'updated' && isEditProvisionMode()) return 'Đã cập nhật';
     const map = { created: 'Tạo mới', updated: 'Đã có', failed: 'Lỗi', skipped: 'Bỏ qua' };
     return map[status] || status;
 }
@@ -615,19 +767,34 @@ function updateSuccessStats(data) {
     set('success-stat-updated', data.updated);
     set('success-stat-failed', data.failed);
     const hint = document.getElementById('success-stats-hint');
+    const edit = isEditProvisionMode();
     if (hint) {
         const parts = [];
         if (data.skipped) parts.push(`${data.skipped} bỏ qua`);
-        if (data.updated) parts.push(`${data.updated} user đã có — chọn thao tác bổ sung bên dưới nếu cần`);
+        if (edit) {
+            if (data.updated) parts.push(`${data.updated} user đã cập nhật`);
+            if (data.failed) parts.push(`${data.failed} lỗi (user không tồn tại hoặc dữ liệu sai)`);
+        } else if (data.updated) {
+            parts.push(`${data.updated} user đã có — chọn thao tác bổ sung bên dưới nếu cần`);
+        }
         hint.textContent = parts.join(' · ');
     }
     const toolbar = document.getElementById('success-toolbar');
-    if (toolbar) toolbar.classList.toggle('hidden', !(data.updated > 0));
+    if (toolbar) toolbar.classList.toggle('hidden', edit || !(data.updated > 0));
+    const successTitle = document.querySelector('#view-success .success-header h2');
+    if (successTitle) {
+        successTitle.textContent = edit ? 'Cập nhật thông tin thành công' : 'Tạo lô User thành công';
+    }
 }
 
 function updateFinalizeButton() {
     const btn = document.getElementById('btn-finalize-batch');
     if (!btn) return;
+    if (isEditProvisionMode()) {
+        btn.textContent = 'Hoàn tất';
+        btn.disabled = false;
+        return;
+    }
     const pending = countPendingFollowUps();
     const updatedCount = lastProvisionResponse?.updated || 0;
     if (!updatedCount) {
@@ -671,7 +838,7 @@ function renderSuccessResultsTable() {
         const actions = formatActionsVi(r.actions_applied);
         const isUpdated = r.status === 'updated';
         const action = followUpActions[r.username] || 'skip';
-        const followUpCell = isUpdated
+        const followUpCell = (isUpdated && !isEditProvisionMode())
             ? renderConflictSelect(r.username, action)
             : '<span class="text-muted">—</span>';
 
@@ -816,30 +983,43 @@ function formatDiagnosticsHint(diag) {
 
 async function createBatch() {
     syncRolesFromDom();
+    syncProvisionModeUi();
+    syncRowScopeFromDom();
     if (!validateBeforeProvision()) return;
+    const scopedUsers = getScopedUsers();
     const btn = btnCreateBatch;
     const orig = btn?.textContent;
-    if (btn) { btn.disabled = true; btn.textContent = 'Đang tạo lô...'; }
+    const edit = isEditProvisionMode();
+    if (btn) { btn.disabled = true; btn.textContent = edit ? 'Đang cập nhật...' : 'Đang tạo lô...'; }
 
     try {
-        const payloadUsers = enrichedUsers.map(u => buildProvisionUserPayload(u));
+        const payloadUsers = scopedUsers.map(u => buildProvisionUserPayload(u));
     const res = await fetch(`${getApiBase()}/api/users/provision-batch`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', ...getTargetEnvHeaders() },
-            body: JSON.stringify({ users: payloadUsers, default_on_conflict: 'skip' }),
+            body: JSON.stringify({
+                users: payloadUsers,
+                default_on_conflict: 'skip',
+                provision_mode: provisionMode,
+            }),
         });
         const data = await res.json().catch(() => ({}));
         if (!res.ok) {
             const diag = await fetchKeycloakDiagnostics();
             const hint = formatDiagnosticsHint(diag);
-            throw new Error(hint ? `${data.detail || 'Tạo lô thất bại'}\n${hint}` : (data.detail || 'Tạo lô thất bại'));
+            const failLabel = edit ? 'Cập nhật thất bại' : 'Tạo lô thất bại';
+            throw new Error(hint ? `${data.detail || failLabel}\n${hint}` : (data.detail || failLabel));
         }
+        data._row_scope = describeRowScope();
         showBatchResults(data);
     } catch (e) {
-        notify('error', 'Lỗi tạo lô', e.message, 15000);
+        notify('error', edit ? 'Lỗi cập nhật' : 'Lỗi tạo lô', e.message, 15000);
         await fetchKeycloakDiagnostics();
     } finally {
-        if (btn) { btn.disabled = false; btn.textContent = orig || 'Xác nhận & Tạo lô User'; }
+        if (btn) {
+            btn.disabled = false;
+            btn.textContent = orig || (edit ? 'Xác nhận & Cập nhật' : 'Xác nhận & Tạo lô User');
+        }
     }
 }
 
@@ -854,7 +1034,7 @@ function showBatchResults(data) {
     }
 
     lastProvisionResponse = data;
-    followUpFinalized = false;
+    followUpFinalized = isEditProvisionMode();
     initFollowUpActions(data.results);
 
     if (successBatchCode) successBatchCode.textContent = `BATCH-${jobId.toUpperCase()}`;
@@ -864,12 +1044,20 @@ function showBatchResults(data) {
     if (data.failed > 0) {
         fetchKeycloakDiagnostics().then((diag) => {
             const hint = formatDiagnosticsHint(diag);
-            notify('warn', `Tạo lô xong — ${data.failed} lỗi`,
-                `${data.created} tạo mới, ${data.updated} đã có.${hint ? '\n' + hint : ''} Mở F12 Console hoặc logs/keycloak.log để xem chi tiết.`,
+            const title = isEditProvisionMode()
+                ? `Cập nhật xong — ${data.failed} lỗi`
+                : `Tạo lô xong — ${data.failed} lỗi`;
+            const summary = isEditProvisionMode()
+                ? `${data.updated} đã cập nhật, ${data.failed} lỗi.`
+                : `${data.created} tạo mới, ${data.updated} đã có.`;
+            notify('warn', title,
+                `${summary}${hint ? '\n' + hint : ''} Mở F12 Console hoặc logs/keycloak.log để xem chi tiết.`,
                 15000);
         });
+    } else if (isEditProvisionMode()) {
+        notify('success', 'Cập nhật thành công', `${data.updated} user đã được cập nhật${data._row_scope ? ` (${data._row_scope})` : ''}.`, 8000);
     } else {
-        notify('success', 'Tạo lô thành công', `${data.created} tạo mới, ${data.updated} đã có. Chọn reset MK/OTP nếu cần rồi bấm Hoàn tất.`, 8000);
+        notify('success', 'Tạo lô thành công', `${data.created} tạo mới, ${data.updated} đã có${data._row_scope ? ` — ${data._row_scope}` : ''}. Chọn reset MK/OTP nếu cần rồi bấm Hoàn tất.`, 8000);
     }
     stopPolling();
     setStep(3);
@@ -901,7 +1089,11 @@ async function finalizeBatch() {
     const res = await fetch(`${getApiBase()}/api/users/provision-batch`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', ...getTargetEnvHeaders() },
-            body: JSON.stringify({ users: payloadUsers, default_on_conflict: 'skip' }),
+            body: JSON.stringify({
+                users: payloadUsers,
+                default_on_conflict: 'skip',
+                provision_mode: 'create_or_update',
+            }),
         });
         const data = await res.json().catch(() => ({}));
         if (!res.ok) throw new Error(data.detail || 'Áp dụng thao tác thất bại');
@@ -970,7 +1162,10 @@ async function submitReview() {
         notify('error', 'Lỗi tải dữ liệu', e.message);
         throw e;
     } finally {
-        if (btn) { btn.disabled = false; btn.textContent = orig || 'Xác nhận & Tạo lô User'; }
+        if (btn) {
+            btn.disabled = false;
+            syncProvisionModeUi();
+        }
     }
 }
 
@@ -979,6 +1174,27 @@ async function submitBatch() {
 }
 
 function setupReviewPage() {
+    document.querySelectorAll('input[name="provision-mode"]').forEach((radio) => {
+        radio.addEventListener('change', () => {
+            syncProvisionModeUi();
+            if (enrichedUsers.length) {
+                updateBatchSummary();
+                renderBatchReviewTable(enrichedUsers);
+            }
+        });
+    });
+    syncProvisionModeUi();
+
+    const onRowScopeChange = () => {
+        syncRowScopeFromDom();
+        if (enrichedUsers.length) renderBatchReviewTable(enrichedUsers);
+    };
+    document.getElementById('row-scope-mode')?.addEventListener('change', onRowScopeChange);
+    document.getElementById('row-scope-from')?.addEventListener('change', onRowScopeChange);
+    document.getElementById('row-scope-to')?.addEventListener('change', onRowScopeChange);
+    document.getElementById('row-scope-from')?.addEventListener('input', () => updateRowScopeHint());
+    document.getElementById('row-scope-to')?.addEventListener('input', () => updateRowScopeHint());
+
     document.getElementById('btn-toggle-bulk')?.addEventListener('click', () => {
         const panel = document.getElementById('review-bulk-panel');
         panel?.classList.toggle('hidden');

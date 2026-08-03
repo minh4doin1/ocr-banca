@@ -5,6 +5,7 @@ Excel Service — Export/import OCR results as Excel files.
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime
 from pathlib import Path
 
@@ -296,17 +297,40 @@ def import_from_excel(
     - Any sheet with a plain rectangular table (non-empty used range)
     - Exported OCR workbook format where each table starts with:
       "Bảng X — ...", followed by the table grid, with blank rows between tables
+
+    File có công thức: cố gắng materialize giá trị (Excel COM / formulas /
+    dual-read); ô công thức chưa tính được sẽ để trống + warnings.
     """
     excel_path = Path(excel_path)
-    wb = load_workbook(filename=str(excel_path), data_only=True)
+    import_warnings: list[str] = []
+    materialize_path, mat_warnings = _materialize_formula_values(excel_path)
+    import_warnings.extend(mat_warnings)
+
+    try:
+        wb_data = load_workbook(filename=str(materialize_path), data_only=True)
+        wb_form = load_workbook(filename=str(excel_path), data_only=False)
+    finally:
+        if materialize_path != excel_path and materialize_path.exists():
+            try:
+                materialize_path.unlink()
+            except OSError:
+                pass
+
     pages: list[PageResult] = []
-
+    formula_empty_total = 0
     page_number = 1
-    for ws in wb.worksheets:
-        if ws.title.strip().lower() == "chú thích":
+    for ws_data in wb_data.worksheets:
+        title = ws_data.title.strip().lower()
+        if title == "chú thích":
             continue
+        ws_form = None
+        try:
+            ws_form = wb_form[ws_data.title]
+        except KeyError:
+            ws_form = None
 
-        tables = _extract_tables_from_sheet(ws)
+        tables, empty_count = _extract_tables_from_sheet(ws_data, ws_form)
+        formula_empty_total += empty_count
         if not tables:
             continue
 
@@ -323,6 +347,12 @@ def import_from_excel(
     if not pages:
         raise ValueError("Không tìm thấy dữ liệu bảng trong file Excel")
 
+    if formula_empty_total:
+        import_warnings.append(
+            f"{formula_empty_total} ô công thức chưa lấy được giá trị "
+            "(mở file bằng Excel → Save, hoặc Paste Values rồi upload lại)."
+        )
+
     now = datetime.now()
     return OcrResult(
         job_id=job_id,
@@ -330,15 +360,153 @@ def import_from_excel(
         total_pages=len(pages),
         pages=pages,
         is_complete=True,
+        warnings=import_warnings,
         created_at=now,
         updated_at=now,
     )
 
 
-def _extract_tables_from_sheet(ws) -> list[TableData]:
-    """Extract one or many tables from a worksheet."""
-    title_rows = _find_table_title_rows(ws)
+def _materialize_formula_values(excel_path: Path) -> tuple[Path, list[str]]:
+    """
+    Tạo bản workbook đã tính công thức (nếu được).
+
+    Thứ tự: Excel COM (Windows) → thư viện formulas (nếu cài) → giữ file gốc.
+    """
+    warnings: list[str] = []
+    if not _workbook_has_formulas(excel_path):
+        return excel_path, warnings
+
+    com_path = _materialize_via_excel_com(excel_path)
+    if com_path is not None:
+        warnings.append("Đã tính công thức Excel qua Microsoft Excel (COM).")
+        return com_path, warnings
+
+    formulas_path = _materialize_via_formulas_lib(excel_path)
+    if formulas_path is not None:
+        warnings.append("Đã tính công thức Excel qua thư viện formulas.")
+        return formulas_path, warnings
+
+    warnings.append(
+        "File có công thức nhưng chưa cache giá trị. "
+        "Hệ thống đọc data_only; ô chưa tính có thể trống. "
+        "Khuyến nghị: mở Excel → Ctrl+Shift+End → Copy → Paste Values → Save."
+    )
+    return excel_path, warnings
+
+
+def _workbook_has_formulas(excel_path: Path) -> bool:
+    try:
+        wb = load_workbook(filename=str(excel_path), data_only=False, read_only=True)
+    except Exception:
+        return False
+    try:
+        for ws in wb.worksheets:
+            if ws.title.strip().lower() == "chú thích":
+                continue
+            for row in ws.iter_rows(max_row=min(ws.max_row or 1, 500), max_col=min(ws.max_column or 1, 30)):
+                for cell in row:
+                    v = cell.value
+                    if isinstance(v, str) and v.startswith("="):
+                        return True
+        return False
+    finally:
+        wb.close()
+
+
+def _materialize_via_excel_com(excel_path: Path) -> Path | None:
+    """Windows + Excel + pywin32: CalculateFull rồi SaveCopyAs."""
+    try:
+        import pythoncom  # type: ignore
+        import win32com.client  # type: ignore
+    except ImportError:
+        return None
+
+    out = excel_path.with_name(f"{excel_path.stem}__values{excel_path.suffix}")
+    excel = None
+    wb = None
+    try:
+        pythoncom.CoInitialize()
+        excel = win32com.client.DispatchEx("Excel.Application")
+        excel.Visible = False
+        excel.DisplayAlerts = False
+        wb = excel.Workbooks.Open(str(excel_path.resolve()))
+        excel.CalculateFullRebuild()
+        wb.SaveCopyAs(str(out.resolve()))
+        wb.Close(SaveChanges=False)
+        wb = None
+        return out if out.exists() else None
+    except Exception as exc:
+        logger.info("Excel COM materialize skipped: %s", exc)
+        if out.exists():
+            try:
+                out.unlink()
+            except OSError:
+                pass
+        return None
+    finally:
+        try:
+            if wb is not None:
+                wb.Close(SaveChanges=False)
+        except Exception:
+            pass
+        try:
+            if excel is not None:
+                excel.Quit()
+        except Exception:
+            pass
+        try:
+            pythoncom.CoUninitialize()
+        except Exception:
+            pass
+
+
+def _materialize_via_formulas_lib(excel_path: Path) -> Path | None:
+    """Optional dependency: formulas (pip install formulas)."""
+    try:
+        import formulas  # type: ignore
+    except ImportError:
+        return None
+
+    out_dir = excel_path.parent / f".excel_calc_{excel_path.stem}"
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        xl_model = formulas.ExcelModel().loads(str(excel_path)).finish()
+        xl_model.calculate()
+        xl_model.write(dirpath=str(out_dir))
+        candidates = list(out_dir.glob("*.xlsx")) + list(out_dir.glob("*.xlsm"))
+        if not candidates:
+            return None
+        preferred = out_dir / excel_path.name
+        chosen = preferred if preferred.exists() else candidates[0]
+        out = excel_path.with_name(f"{excel_path.stem}__values{excel_path.suffix}")
+        if out.exists():
+            out.unlink()
+        chosen.replace(out)
+        return out if out.exists() else None
+    except Exception as exc:
+        logger.info("formulas lib materialize skipped: %s", exc)
+        return None
+    finally:
+        try:
+            if out_dir.exists():
+                for p in out_dir.rglob("*"):
+                    if p.is_file():
+                        p.unlink()
+                try:
+                    out_dir.rmdir()
+                except OSError:
+                    pass
+        except OSError:
+            pass
+
+
+def _extract_tables_from_sheet(
+    ws_data, ws_form=None
+) -> tuple[list[TableData], int]:
+    """Extract one or many tables from a worksheet. Returns (tables, formula_empty_count)."""
+    title_rows = _find_table_title_rows(ws_form or ws_data)
     tables: list[TableData] = []
+    formula_empty = 0
 
     if title_rows:
         for idx, title_row in enumerate(title_rows):
@@ -346,27 +514,27 @@ def _extract_tables_from_sheet(ws) -> list[TableData]:
             end_row = (
                 title_rows[idx + 1] - 2
                 if idx + 1 < len(title_rows)
-                else ws.max_row
+                else (ws_data.max_row or 1)
             )
-            matrix = _read_matrix(ws, start_row, end_row)
+            matrix, empty = _read_matrix(ws_data, start_row, end_row, ws_form=ws_form)
+            formula_empty += empty
             if not matrix:
                 continue
             tables.append(_matrix_to_table(matrix, len(tables)))
-        return tables
+        return tables, formula_empty
 
     # Fallback: parse whole used range as one table
-    matrix = _read_matrix(ws, 1, ws.max_row)
+    matrix, empty = _read_matrix(ws_data, 1, ws_data.max_row or 1, ws_form=ws_form)
+    formula_empty += empty
     if matrix:
         tables.append(_matrix_to_table(matrix, 0))
-    return tables
+    return tables, formula_empty
 
 
 def _find_table_title_rows(ws) -> list[int]:
     """Find rows that look like exported table titles: 'Bảng X — ...'."""
-    import re
-
     rows: list[int] = []
-    for r in range(1, ws.max_row + 1):
+    for r in range(1, (ws.max_row or 0) + 1):
         v = ws.cell(row=r, column=1).value
         if isinstance(v, str) and re.match(r"^\s*Bảng\s+\d+", v.strip(), re.IGNORECASE):
             rows.append(r)
@@ -377,24 +545,87 @@ def _excel_cell_text(v) -> str:
     """Normalize Excel cell value to string (whole-number floats -> int text)."""
     if v is None:
         return ""
-    if isinstance(v, float) and v.is_integer():
-        return str(int(v))
+    if isinstance(v, bool):
+        return "TRUE" if v else "FALSE"
+    if isinstance(v, float):
+        if v.is_integer() or abs(v - round(v)) < 1e-9:
+            return str(int(round(v)))
+        return str(v).strip()
     if isinstance(v, int):
         return str(v)
-    return str(v).strip()
+    text = str(v).strip()
+    if re.fullmatch(r"[+-]?\d+(?:\.\d+)?[eE][+-]?\d+", text):
+        try:
+            num = float(text)
+            if abs(num - round(num)) < 1e-6:
+                return str(int(round(num)))
+        except ValueError:
+            pass
+    return text
 
 
-def _read_matrix(ws, start_row: int, end_row: int) -> list[list[str]]:
-    """Read non-empty rectangular matrix from row range."""
+def _build_merge_anchor_map(ws) -> dict[tuple[int, int], tuple[int, int]]:
+    """Map (row,col) trong vùng merge → (top,left) anchor."""
+    mapping: dict[tuple[int, int], tuple[int, int]] = {}
+    try:
+        ranges = list(ws.merged_cells.ranges)
+    except Exception:
+        return mapping
+    for mr in ranges:
+        min_r, min_c, max_r, max_c = mr.min_row, mr.min_col, mr.max_row, mr.max_col
+        for r in range(min_r, max_r + 1):
+            for c in range(min_c, max_c + 1):
+                if (r, c) != (min_r, min_c):
+                    mapping[(r, c)] = (min_r, min_c)
+    return mapping
+
+
+def _read_matrix(
+    ws_data,
+    start_row: int,
+    end_row: int,
+    *,
+    ws_form=None,
+) -> tuple[list[list[str]], int]:
+    """Read non-empty rectangular matrix from row range.
+
+    Ưu tiên giá trị data_only; fallback formula sheet / ô merge.
+    Trả (matrix, số ô công thức trống).
+    """
     rows: list[list[str]] = []
     max_col = 0
+    formula_empty = 0
+    form = ws_form or ws_data
+    merge_map = _build_merge_anchor_map(form)
+    max_column = max(ws_data.max_column or 1, getattr(form, "max_column", 1) or 1)
 
     for r in range(start_row, end_row + 1):
         vals: list[str] = []
         row_non_empty = False
-        for c in range(1, ws.max_column + 1):
-            v = ws.cell(row=r, column=c).value
-            txt = _excel_cell_text(v)
+        for c in range(1, max_column + 1):
+            raw = ws_data.cell(row=r, column=c).value
+            form_raw = form.cell(row=r, column=c).value if form is not ws_data else raw
+            is_formula = isinstance(form_raw, str) and form_raw.startswith("=")
+
+            if raw is None and is_formula:
+                # Chưa có cache — thử resolve đơn giản từ ô tham chiếu gần
+                resolved = _try_resolve_simple_formula(form_raw, ws_data, form, r, c)
+                if resolved is not None:
+                    raw = resolved
+                else:
+                    formula_empty += 1
+            elif raw is None and form_raw is not None and not is_formula:
+                raw = form_raw
+
+            if (raw is None or raw == "") and (r, c) in merge_map:
+                ar, ac = merge_map[(r, c)]
+                raw = ws_data.cell(row=ar, column=ac).value
+                if raw is None:
+                    anchor_form = form.cell(row=ar, column=ac).value
+                    if not (isinstance(anchor_form, str) and anchor_form.startswith("=")):
+                        raw = anchor_form
+
+            txt = _excel_cell_text(raw)
             vals.append(txt)
             if txt:
                 row_non_empty = True
@@ -403,10 +634,133 @@ def _read_matrix(ws, start_row: int, end_row: int) -> list[list[str]]:
             rows.append(vals)
 
     if not rows or max_col == 0:
-        return []
+        return [], formula_empty
 
-    matrix = [r[:max_col] for r in rows]
-    return matrix
+    # Giữ tối thiểu số cột header SSO (tránh cắt cột cuối → nhầm layout 9 cột).
+    header_cols = 0
+    for row in rows[:3]:
+        filled = sum(1 for x in row if str(x or "").strip())
+        if filled >= 6:
+            header_cols = max(header_cols, filled)
+    keep_cols = max(max_col, header_cols)
+    if header_cols >= 10:
+        keep_cols = max(keep_cols, 10)
+
+    matrix = []
+    for r in rows:
+        trimmed = r[:keep_cols]
+        if len(trimmed) < keep_cols:
+            trimmed = trimmed + [""] * (keep_cols - len(trimmed))
+        matrix.append(trimmed)
+    return matrix, formula_empty
+
+
+_CELL_REF_RE = re.compile(r"^\s*=?\s*([A-Za-z]{1,3})(\d+)\s*$")
+_CONCAT_EDGE_RE = re.compile(
+    r'^\s*=\s*(?:LOWER|UPPER|TRIM)\s*\(\s*([A-Za-z]{1,3})(\d+)\s*\)\s*&\s*"([^"]*)"\s*$',
+    re.IGNORECASE,
+)
+_AMP_LITERAL_RE = re.compile(
+    r'^\s*=\s*([A-Za-z]{1,3})(\d+)\s*&\s*"([^"]*)"\s*$',
+    re.IGNORECASE,
+)
+_IF_EMPTY_RE = re.compile(
+    r'^\s*=\s*IF\s*\(\s*([A-Za-z]{1,3})(\d+)\s*=\s*""\s*,\s*""\s*,\s*(.+)\s*\)\s*$',
+    re.IGNORECASE,
+)
+
+
+def _col_letters_to_index(letters: str) -> int:
+    n = 0
+    for ch in letters.upper():
+        n = n * 26 + (ord(ch) - 64)
+    return n
+
+
+def _try_resolve_simple_formula(formula: str, ws_data, ws_form, row: int, col: int):
+    """Resolve một số công thức SSO phổ biến khi thiếu cache."""
+    f = (formula or "").strip()
+    if not f.startswith("="):
+        return None
+
+    m = _IF_EMPTY_RE.match(f)
+    if m:
+        ref_c, ref_r = _col_letters_to_index(m.group(1)), int(m.group(2))
+        seed = ws_data.cell(row=ref_r, column=ref_c).value
+        if seed is None:
+            seed_f = ws_form.cell(row=ref_r, column=ref_c).value
+            if not (isinstance(seed_f, str) and seed_f.startswith("=")):
+                seed = seed_f
+        if seed is None or _excel_cell_text(seed) == "":
+            return ""
+        inner = m.group(3).strip()
+        if not inner.startswith("="):
+            inner = "=" + inner
+        return _try_resolve_simple_formula(inner, ws_data, ws_form, row, col)
+
+    m = _CONCAT_EDGE_RE.match(f)
+    if m:
+        ref_c, ref_r = _col_letters_to_index(m.group(1)), int(m.group(2))
+        seed = ws_data.cell(row=ref_r, column=ref_c).value
+        if seed is None:
+            seed_f = ws_form.cell(row=ref_r, column=ref_c).value
+            if not (isinstance(seed_f, str) and seed_f.startswith("=")):
+                seed = seed_f
+        text = _excel_cell_text(seed)
+        if not text:
+            return None
+        fn = f.upper()
+        if "LOWER" in fn:
+            text = text.lower()
+        elif "UPPER" in fn:
+            text = text.upper()
+        return text + m.group(3)
+
+    m = _AMP_LITERAL_RE.match(f)
+    if m:
+        ref_c, ref_r = _col_letters_to_index(m.group(1)), int(m.group(2))
+        seed = ws_data.cell(row=ref_r, column=ref_c).value
+        if seed is None:
+            seed_f = ws_form.cell(row=ref_r, column=ref_c).value
+            if not (isinstance(seed_f, str) and seed_f.startswith("=")):
+                seed = seed_f
+        text = _excel_cell_text(seed)
+        if not text:
+            return None
+        return text + m.group(3)
+
+    m = _CELL_REF_RE.match(f)
+    if m:
+        ref_c, ref_r = _col_letters_to_index(m.group(1)), int(m.group(2))
+        seed = ws_data.cell(row=ref_r, column=ref_c).value
+        if seed is None:
+            seed_f = ws_form.cell(row=ref_r, column=ref_c).value
+            if isinstance(seed_f, str) and seed_f.startswith("="):
+                return _try_resolve_simple_formula(seed_f, ws_data, ws_form, ref_r, ref_c)
+            seed = seed_f
+        return seed
+
+    m = re.match(
+        r'^\s*=\s*(LOWER|UPPER|TRIM)\s*\(\s*([A-Za-z]{1,3})(\d+)\s*\)\s*$',
+        f,
+        re.IGNORECASE,
+    )
+    if m:
+        ref_c, ref_r = _col_letters_to_index(m.group(2)), int(m.group(3))
+        seed = ws_data.cell(row=ref_r, column=ref_c).value
+        if seed is None:
+            seed_f = ws_form.cell(row=ref_r, column=ref_c).value
+            if not (isinstance(seed_f, str) and seed_f.startswith("=")):
+                seed = seed_f
+        text = _excel_cell_text(seed)
+        fn = m.group(1).upper()
+        if fn == "LOWER":
+            return text.lower()
+        if fn == "UPPER":
+            return text.upper()
+        return text.strip()
+
+    return None
 
 
 def _matrix_to_table(matrix: list[list[str]], table_index: int) -> TableData:

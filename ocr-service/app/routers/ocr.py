@@ -377,12 +377,19 @@ async def upload_excel(
 
     set_result(target_job_id, result)
 
+    msg = "Đã nạp dữ liệu từ Excel. Có thể đối chiếu/chỉnh sửa ngay."
+    if result.warnings:
+        msg += " " + " | ".join(result.warnings[:3])
+        if len(result.warnings) > 3:
+            msg += f" (+{len(result.warnings) - 3} cảnh báo)"
+
     return UploadResponse(
         job_id=target_job_id,
         filename=file.filename,
         processing_mode=ProcessingMode.LOCAL,
         use_gpu=False,
-        message="Đã nạp dữ liệu từ Excel. Có thể đối chiếu/chỉnh sửa ngay.",
+        message=msg,
+        warnings=list(result.warnings or []),
     )
 
 

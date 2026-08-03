@@ -27,8 +27,25 @@
             <span class="badge-env env-dev" id="env-badge" title="Keycloak cho tạo lô user">KC DEV</span>
             <span class="badge-env" id="device-badge">CPU</span>
             <span class="badge-branch">Chi nhánh / Seller</span>
+            <button type="button" class="btn-notify-log" id="btn-notify-log" title="Xem lại thông báo trong phiên này" aria-expanded="false">
+                Thông báo
+                <span class="notify-log-badge hidden" id="notify-log-badge">0</span>
+            </button>
         </div>
     </header>
+
+    <div id="notify-log-panel" class="notify-log-panel hidden" role="dialog" aria-label="Lịch sử thông báo phiên">
+        <div class="notify-log-header">
+            <strong>Thông báo phiên này</strong>
+            <div class="notify-log-actions">
+                <button type="button" class="btn btn-ghost btn-sm" id="btn-notify-log-clear">Xóa</button>
+                <button type="button" class="btn btn-ghost btn-sm" id="btn-notify-log-close">Đóng</button>
+            </div>
+        </div>
+        <div class="notify-log-list" id="notify-log-list">
+            <p class="notify-log-empty text-muted">Chưa có thông báo.</p>
+        </div>
+    </div>
 
     <main class="app-main">
 
@@ -282,7 +299,18 @@
                 <div class="review-header">
                     <div>
                         <h2>Kiểm tra & Map dữ liệu</h2>
-                        <p class="text-muted review-subtitle">Rà soát lần cuối trước khi tạo lô user Keycloak</p>
+                        <p class="text-muted review-subtitle" id="review-subtitle">Rà soát lần cuối trước khi tạo lô user Keycloak</p>
+                        <div class="provision-mode-toggle" role="radiogroup" aria-label="Chế độ xử lý lô">
+                            <label class="radio-chip">
+                                <input type="radio" name="provision-mode" value="create_or_update" checked>
+                                <span>Tạo mới / cập nhật</span>
+                            </label>
+                            <label class="radio-chip">
+                                <input type="radio" name="provision-mode" value="edit">
+                                <span>Chỉnh sửa thông tin</span>
+                            </label>
+                        </div>
+                        <p class="text-muted provision-mode-hint" id="provision-mode-hint">Bắt buộc đủ cột hồ sơ. User chưa có sẽ được tạo mới.</p>
                     </div>
                     <div class="review-header-actions">
                         <button type="button" class="btn btn-ghost btn-sm" id="btn-review-back">← Quay lại</button>
@@ -318,6 +346,22 @@
                             <span>Chỉ dòng lỗi</span>
                         </label>
                         <input type="search" id="review-search" class="review-search" placeholder="Tìm email, IPCAS…">
+                        <div class="review-row-scope" title="Chỉ hiển thị và cập nhật các hàng trong phạm vi">
+                            <label class="review-row-scope-label" for="row-scope-mode">Số hàng</label>
+                            <select id="row-scope-mode" class="review-row-scope-select">
+                                <option value="all" selected>Tất cả</option>
+                                <option value="10">10 hàng đầu</option>
+                                <option value="20">20 hàng đầu</option>
+                                <option value="30">30 hàng đầu</option>
+                                <option value="range">Từ — đến</option>
+                            </select>
+                            <span id="row-scope-range" class="review-row-scope-range hidden">
+                                <input type="number" id="row-scope-from" class="review-row-scope-num" min="1" value="1" aria-label="Từ hàng">
+                                <span>–</span>
+                                <input type="number" id="row-scope-to" class="review-row-scope-num" min="1" value="30" aria-label="Đến hàng">
+                            </span>
+                            <span class="review-row-scope-hint text-muted" id="row-scope-hint"></span>
+                        </div>
                     </div>
                     <div class="review-toolbar-right">
                         <button type="button" class="btn btn-outline btn-sm" id="btn-toggle-bulk">Áp dụng hàng loạt</button>

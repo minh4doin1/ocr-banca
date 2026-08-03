@@ -161,6 +161,10 @@ class OcrResult(BaseModel):
     total_pages: int = 0
     pages: list[PageResult] = Field(default_factory=list)
     is_complete: bool = True
+    warnings: list[str] = Field(
+        default_factory=list,
+        description="Cảnh báo khi nạp Excel/Word (công thức, bỏ dòng, …).",
+    )
     created_at: datetime = Field(default_factory=datetime.now)
     updated_at: datetime = Field(default_factory=datetime.now)
 
@@ -199,6 +203,7 @@ class UploadResponse(BaseModel):
     remote_url: str = ""
     queue_position: int = 0
     message: str = "PDF uploaded successfully. Processing started."
+    warnings: list[str] = Field(default_factory=list)
 
 
 class RemoteWorkerHealth(BaseModel):
@@ -245,6 +250,13 @@ class OnConflictAction(str, enum.Enum):
     RESET_PASSWORD = "reset_password"
     RESET_OTP = "reset_otp"
     RESET_BOTH = "reset_both"
+
+
+class ProvisionMode(str, enum.Enum):
+    """Chế độ xử lý lô user."""
+
+    CREATE_OR_UPDATE = "create_or_update"
+    EDIT = "edit"
 
 
 class MatchStatus(str, enum.Enum):
@@ -334,6 +346,13 @@ class BatchProvisionRequest(BaseModel):
     default_on_conflict: OnConflictAction = Field(
         default=OnConflictAction.SKIP,
         description="Hành động mặc định khi user đã tồn tại.",
+    )
+    provision_mode: ProvisionMode = Field(
+        default=ProvisionMode.CREATE_OR_UPDATE,
+        description=(
+            "create_or_update: tạo mới hoặc cập nhật (bắt đủ cột). "
+            "edit: chỉ cập nhật user đã có; cột trống giữ nguyên."
+        ),
     )
     default_required_actions: list[str] | None = Field(
         default=None,
@@ -489,6 +508,10 @@ class UserValidationItem(BaseModel):
 
 class ValidateUsersRequest(BaseModel):
     users: list[KeycloakUserInput] = Field(default_factory=list)
+    provision_mode: ProvisionMode = Field(
+        default=ProvisionMode.CREATE_OR_UPDATE,
+        description="Mode validation: edit = chỉ kiểm tra username + format field đã điền.",
+    )
 
 
 class ValidateUsersResponse(BaseModel):

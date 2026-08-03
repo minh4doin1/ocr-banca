@@ -38,7 +38,12 @@ if _sys.platform == "win32":
 from app.config import settings
 from app.models.schemas import CellData, PageResult, TableData
 from app.services.gpu_runtime import setup_gpu_path, gpu_inference_lock
-from app.utils.image_utils import deskew_image, pil_to_cv2, preprocess_for_ocr
+from app.utils.image_utils import (
+    deskew_image,
+    pil_to_cv2,
+    prepare_page_for_ocr,
+    preprocess_for_ocr,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -71,8 +76,10 @@ else:
 _paddle_engine = None
 _paddle_ocr_fallback = None
 _vietocr_predictor = None
+_vietocr_pass2_predictor = None
 _vietocr_config = None
 _vietocr_disabled = False
+_vietocr_pass2_disabled = False
 _vietocr_lock = threading.Lock()
 _force_cpu = False
 _loaded_use_gpu: bool | None = None
@@ -116,6 +123,7 @@ def configure_ocr_device(use_gpu: bool) -> None:
     from the previously loaded configuration.
     """
     global _paddle_engine, _paddle_ocr_fallback, _vietocr_predictor
+    global _vietocr_pass2_predictor, _vietocr_pass2_disabled
     global _vietocr_disabled, _force_cpu, _loaded_use_gpu
 
     # Hide GPU from Paddle before it is imported the first time when we run
@@ -140,7 +148,9 @@ def configure_ocr_device(use_gpu: bool) -> None:
         _paddle_engine = None
         _paddle_ocr_fallback = None
         _vietocr_predictor = None
+        _vietocr_pass2_predictor = None
         _vietocr_disabled = False
+        _vietocr_pass2_disabled = False
 
     _loaded_use_gpu = effective
 
@@ -405,6 +415,79 @@ def _get_vietocr_predictor():
     return _vietocr_predictor
 
 
+def _get_vietocr_pass2_predictor():
+    """Lazily initialise VietOCR pass-2 model (usually vgg_transformer)."""
+    global _vietocr_pass2_predictor, _vietocr_pass2_disabled
+    if _vietocr_pass2_disabled:
+        return None
+    model_name = (settings.vietocr_model_pass2 or "").strip()
+    if not model_name:
+        return None
+    # Same model as pass-1 → reuse to save memory
+    if model_name == (settings.vietocr_model or "").strip():
+        return _get_vietocr_predictor()
+    if _vietocr_pass2_predictor is None:
+        try:
+            logger.info("Loading VietOCR pass-2 model (%s) …", model_name)
+            from vietocr.tool.config import Cfg
+            from vietocr.tool.predictor import Predictor
+
+            device = "cpu"
+            if _sys.platform != "win32" and _get_effective_use_gpu():
+                try:
+                    import torch
+
+                    if torch.cuda.is_available():
+                        device = "cuda:0"
+                except Exception:
+                    device = "cpu"
+
+            config = Cfg.load_config_from_name(model_name)
+            config["cnn"]["pretrained"] = True
+            config["device"] = device
+            config["predictor"]["beamsearch"] = False
+            _configure_torch_threads()
+            _vietocr_pass2_predictor = Predictor(config)
+            logger.info("VietOCR pass-2 loaded (device=%s)", device)
+        except Exception as e:
+            _vietocr_pass2_disabled = True
+            logger.warning("VietOCR pass-2 unavailable (%s); reuse pass-1.", e)
+            return _get_vietocr_predictor()
+    return _vietocr_pass2_predictor
+
+
+def _normalize_vietocr_prob(prob) -> float:
+    """Normalize VietOCR return_prob to [0, 1]."""
+    if prob is None:
+        return 0.0
+    try:
+        if hasattr(prob, "detach"):
+            prob = prob.detach().cpu()
+        if hasattr(prob, "tolist"):
+            prob = prob.tolist()
+        if isinstance(prob, (list, tuple)):
+            vals = [float(x) for x in prob if x is not None]
+            if not vals:
+                return 0.0
+            vals = [max(1e-6, min(1.0, v)) for v in vals]
+            return float(sum(vals) / len(vals))
+        return float(max(0.0, min(1.0, float(prob))))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _blend_model_confidence(text: str, model_conf: float) -> float:
+    """Combine model probability with light heuristic artifact check."""
+    heur = _estimate_confidence(text)
+    if not (text or "").strip():
+        return 0.0
+    if heur <= 0.3:
+        return min(float(model_conf or 0.0), heur)
+    if model_conf and model_conf > 0:
+        return float(max(0.0, min(1.0, model_conf)))
+    return heur
+
+
 # ──────────────────────────────────────────────────────────────
 # Public API
 # ──────────────────────────────────────────────────────────────
@@ -491,9 +574,11 @@ def _process_page_impl(
     if img_cv2 is None:
         raise ValueError(f"Cannot read image: {image_path}")
 
-    # Optional preprocessing for scanned documents
+    # Optional preprocessing for scanned documents (deskew + mild line enhance)
     if enable_preprocessing:
-        img_cv2 = deskew_image(img_cv2)
+        img_cv2 = prepare_page_for_ocr(
+            img_cv2, enhance_lines=settings.ocr_sso_enhance
+        )
 
     # ── Step 1: PaddleOCR PP-Structure (or full-page fallback) ──
     predictions = None
@@ -932,11 +1017,9 @@ def _reconstruct_table_from_lines(
     crops: list[np.ndarray] = []
     metas: list[tuple[int, int, int, int, int]] = []
     for (lx1, ly1, lx2, ly2, col) in segments:
-        pad = 2
-        cy1 = max(0, ly1 - pad)
-        cy2 = min(crop.shape[0], ly2 + pad)
-        cx1 = max(0, lx1 - pad)
-        cx2 = min(crop.shape[1], lx2 + pad)
+        cx1, cy1, cx2, cy2 = _cell_crop_pad(
+            [lx1, ly1, lx2, ly2], crop.shape
+        )
         line_img = crop[cy1:cy2, cx1:cx2]
         if line_img.size == 0:
             continue
@@ -1533,20 +1616,33 @@ def _recognize_critical_cell(
     *,
     col_kind: str,
 ) -> tuple[str, float]:
-    """Second-pass ensemble OCR for SSO critical columns."""
+    """Second-pass ensemble OCR for SSO critical columns (pass-2 model + Paddle)."""
     enhanced = _enhance_cell_for_ocr(crop, col_kind=col_kind)
 
     if col_kind in ("ipcas", "cccd", "phone", "branch"):
         text, conf = _recognize_with_paddle_cell(enhanced)
         if text.strip():
+            # Also try pass-2 VietOCR; keep better field-scored candidate
+            v_text, v_conf = _recognize_with_vietocr(enhanced, pass2=True)
+            if v_text.strip():
+                best = _pick_field_candidate(
+                    col_kind,
+                    [(text.strip(), conf), (v_text.strip(), v_conf)],
+                )
+                return best
             return text.strip(), conf
-        return _recognize_with_vietocr(enhanced)
+        return _recognize_with_vietocr(enhanced, pass2=True)
 
     candidates: list[tuple[str, float]] = []
 
-    v_text, v_conf = _recognize_with_vietocr(enhanced)
+    v_text, v_conf = _recognize_with_vietocr(enhanced, pass2=True)
     if v_text.strip():
         candidates.append((v_text.strip(), v_conf))
+
+    # Pass-1 as additional candidate for ensemble
+    v1_text, v1_conf = _recognize_with_vietocr(enhanced, pass2=False)
+    if v1_text.strip() and v1_text.strip() != (v_text or "").strip():
+        candidates.append((v1_text.strip(), v1_conf))
 
     p_text, p_conf = _recognize_with_paddle_cell(enhanced)
     if p_text.strip():
@@ -1556,11 +1652,7 @@ def _recognize_critical_cell(
         return "", 0.0
 
     if col_kind == "email":
-        best = max(candidates, key=lambda c: _score_email_ocr_text(c[0]))
-        lines = [c[0] for c in candidates if c[0]]
-        if settings.ocr_sso_email_fixed_domain and lines:
-            formatted, _, _ = _email_from_first_line(lines)
-            return formatted or best[0], max(c[1] for c in candidates)
+        best = max(candidates, key=lambda c: (_score_email_ocr_text(c[0]), c[1]))
         lines = [c[0] for c in candidates if c[0]]
         if settings.ocr_sso_email_fixed_domain and lines:
             formatted, _, _ = _email_from_first_line(lines)
@@ -1568,15 +1660,88 @@ def _recognize_critical_cell(
         joined = _join_multiline_ocr_lines(lines)
         return joined, max(c[1] for c in candidates)
 
-    best = max(candidates, key=lambda c: (len(c[0]), c[1]))
-    return best[0], best[1]
+    return _pick_field_candidate(col_kind, candidates)
 
 
-def _sso_cell_needs_pass2(text: str, kind: str) -> bool:
-    """Chỉ chạy pass-2 Paddle khi VietOCR sai rõ ràng."""
+def _pick_field_candidate(
+    col_kind: str,
+    candidates: list[tuple[str, float]],
+) -> tuple[str, float]:
+    """Choose best OCR candidate for a critical field."""
+    if not candidates:
+        return "", 0.0
+    if col_kind == "role":
+        from app.services.user_mapping import extract_roles_from_ocr
+
+        def _role_score(item: tuple[str, float]) -> tuple:
+            text, conf = item
+            roles = extract_roles_from_ocr(text)
+            mapped = 1 if roles else 0
+            return (mapped, len(roles), conf, len(text))
+
+        return max(candidates, key=_role_score)
+
+    if col_kind == "branch":
+        import re as _re
+
+        def _branch_score(item: tuple[str, float]) -> tuple:
+            text, conf = item
+            digits = _re.sub(r"\D", "", text)
+            exact4 = 1 if _re.fullmatch(r"\d{4}", digits) else 0
+            len_ok = 1 if _re.fullmatch(r"\d{3,5}", digits) else 0
+            return (exact4, len_ok, conf)
+
+        return max(candidates, key=_branch_score)
+
+    if col_kind == "cccd":
+        import re as _re
+
+        def _cccd_score(item: tuple[str, float]) -> tuple:
+            text, conf = item
+            digits = _re.sub(r"\D", "", text)
+            exact12 = 1 if len(digits) == 12 else 0
+            return (exact12, min(len(digits), 12), conf)
+
+        return max(candidates, key=_cccd_score)
+
+    if col_kind == "phone":
+        import re as _re
+
+        def _phone_score(item: tuple[str, float]) -> tuple:
+            text, conf = item
+            digits = _re.sub(r"\D", "", text)
+            ok = 1 if _re.fullmatch(r"0\d{8,10}", digits) else 0
+            return (ok, conf)
+
+        return max(candidates, key=_phone_score)
+
+    if col_kind == "ipcas":
+        import re as _re
+
+        def _ipcas_score(item: tuple[str, float]) -> tuple:
+            text, conf = item
+            compact = _re.sub(r"\s", "", text.upper())
+            qso = 1 if compact.startswith("QSO") else 0
+            shape = 1 if _re.fullmatch(r"[A-Z][A-Z0-9]{3,15}", compact) else 0
+            return (qso, shape, conf)
+
+        return max(candidates, key=_ipcas_score)
+
+    return max(candidates, key=lambda c: (c[1], len(c[0])))
+
+
+def _sso_cell_needs_pass2(
+    text: str,
+    kind: str,
+    confidence: float | None = None,
+) -> bool:
+    """Chỉ chạy pass-2 khi VietOCR sai rõ ràng hoặc confidence thấp."""
     import re
 
     t = (text or "").strip()
+    conf = float(confidence) if confidence is not None else None
+    low_conf = conf is not None and conf < settings.ocr_confidence_threshold
+
     if not t:
         return True
     if _is_gibberish_text(t) or _is_hallucinated_ocr_line(t):
@@ -1587,30 +1752,45 @@ def _sso_cell_needs_pass2(text: str, kind: str) -> bool:
         compact = re.sub(r"\s", "", t.upper())
         if not re.fullmatch(r"[A-Z][A-Z0-9]{3,15}", compact):
             return True
-        return not compact.startswith("QSO")
+        if not compact.startswith("QSO"):
+            return True
+        return bool(low_conf)
     if kind == "cccd":
-        return len(re.sub(r"\D", "", t)) < 9
+        digits = re.sub(r"\D", "", t)
+        if len(digits) < 9:
+            return True
+        if len(digits) != 12:
+            return True
+        return bool(low_conf)
     if kind == "phone":
         digits = re.sub(r"\D", "", t)
-        return not re.fullmatch(r"0\d{8,10}", digits)
+        if not re.fullmatch(r"0\d{8,10}", digits):
+            return True
+        return bool(low_conf)
     if kind == "branch":
         digits = re.sub(r"\D", "", t)
         if not re.fullmatch(r"\d{3,5}", digits):
             return True
-        # Mã CN SSO thường 3526, 6900… — 4 chữ số; OCR hay đọc sai 1-2 số
+        # 4 chữ số vẫn có thể sai 1–2 số → pass-2 khi conf thấp
         if len(digits) == 4:
-            return False
+            return bool(low_conf)
         return True
     if kind == "email":
-        return "@" not in t or not _extract_sso_email_local(t)
-    return False
+        if "@" not in t or not _extract_sso_email_local(t):
+            return True
+        if t.startswith("[?]"):
+            return True
+        return bool(low_conf)
+    if kind == "role":
+        return True
+    return bool(low_conf)
 
 
 def _refine_sso_critical_columns(
     image: np.ndarray,
     cells: list[CellData],
 ) -> list[CellData]:
-    """Re-OCR IPCAS/CCCD/email/SĐT/role với upscale + Paddle (pass 2)."""
+    """Re-OCR IPCAS/CCCD/email/SĐT/role với upscale + pass-2 ensemble."""
     if not settings.ocr_sso_pass2_enabled or not cells:
         return cells
 
@@ -1643,19 +1823,16 @@ def _refine_sso_critical_columns(
         if c.col not in critical or c.row in header_rows or not c.bbox or len(c.bbox) < 4:
             out.append(c)
             continue
-        x1, y1, x2, y2 = [int(v) for v in c.bbox[:4]]
-        pad = 2
-        cy1 = max(0, y1 - pad)
-        cy2 = min(image.shape[0], y2 + pad)
-        cx1 = max(0, x1 - pad)
-        cx2 = min(image.shape[1], x2 + pad)
+        cx1, cy1, cx2, cy2 = _cell_crop_pad(c.bbox, image.shape)
         crop = image[cy1:cy2, cx1:cx2]
         if crop.size == 0 or not _cell_has_ink(crop):
             out.append(c)
             continue
 
         kind = col_kind_map.get(c.col, "default")
-        if kind != "role" and not _sso_cell_needs_pass2(c.text, kind):
+        if kind != "role" and not _sso_cell_needs_pass2(
+            c.text, kind, confidence=c.confidence
+        ):
             out.append(c)
             continue
         text, conf = _recognize_critical_cell(crop, col_kind=kind)
@@ -1686,7 +1863,7 @@ def _refine_sso_branch_column(
     image: np.ndarray,
     cells: list[CellData],
 ) -> list[CellData]:
-    """Pass-2 Paddle cho cột mã chi nhánh (col 2) — VietOCR hay đọc sai số."""
+    """Pass-2 cho cột mã chi nhánh (col 2) — VietOCR hay đọc sai số."""
     import re
 
     branch_col = 2
@@ -1696,26 +1873,25 @@ def _refine_sso_branch_column(
         if c.col != branch_col or c.row in header_rows or not c.bbox or len(c.bbox) < 4:
             out.append(c)
             continue
-        x1, y1, x2, y2 = [int(v) for v in c.bbox[:4]]
-        crop = image[
-            max(0, y1 - 2) : min(image.shape[0], y2 + 2),
-            max(0, x1 - 2) : min(image.shape[1], x2 + 2),
-        ]
+        cx1, cy1, cx2, cy2 = _cell_crop_pad(c.bbox, image.shape)
+        crop = image[cy1:cy2, cx1:cx2]
         if crop.size == 0:
             out.append(c)
             continue
-        if not _sso_cell_needs_pass2(c.text, "branch"):
+        if not _sso_cell_needs_pass2(c.text, "branch", confidence=c.confidence):
             out.append(c)
             continue
-        text, conf = _recognize_with_paddle_cell(crop)
+        text, conf = _recognize_critical_cell(crop, col_kind="branch")
         if not text.strip():
             out.append(c)
             continue
+        digits = re.sub(r"\D", "", text)
+        display = digits if digits else text.strip()
         out.append(
             CellData(
                 row=c.row,
                 col=c.col,
-                text=text.strip(),
+                text=display,
                 confidence=max(c.confidence, conf),
                 bbox=c.bbox,
             )
@@ -2241,10 +2417,19 @@ def _recognize_lines(crops: list[np.ndarray]) -> list[tuple[str, float]]:
             with _vietocr_lock:
                 for start in range(0, len(pil_imgs), batch_size):
                     chunk = pil_imgs[start : start + batch_size]
-                    texts = predictor.predict_batch(chunk)
-                    results.extend(
-                        (t.strip(), _estimate_confidence(t)) for t in texts
-                    )
+                    try:
+                        texts, probs = predictor.predict_batch(
+                            chunk, return_prob=True
+                        )
+                    except TypeError:
+                        texts = predictor.predict_batch(chunk)
+                        probs = [None] * len(texts)
+                    for t, p in zip(texts, probs):
+                        text = str(t).strip()
+                        conf = _blend_model_confidence(
+                            text, _normalize_vietocr_prob(p)
+                        )
+                        results.append((text, conf))
             return results
         except Exception as e:  # noqa: BLE001
             logger.warning("VietOCR batch failed (%s); using per-line.", e)
@@ -2252,32 +2437,40 @@ def _recognize_lines(crops: list[np.ndarray]) -> list[tuple[str, float]]:
     return [_recognize_with_vietocr(c) for c in crops]
 
 
-def _recognize_with_vietocr(cell_image: np.ndarray) -> tuple[str, float]:
+def _recognize_with_vietocr(
+    cell_image: np.ndarray,
+    *,
+    pass2: bool = False,
+) -> tuple[str, float]:
     """
     Recognize Vietnamese text in a cell image using VietOCR.
 
     Args:
         cell_image: BGR numpy array of the cropped cell
+        pass2: Use vietocr_model_pass2 when available
 
     Returns:
         Tuple of (recognized_text, confidence_score)
     """
     try:
-        predictor = _get_vietocr_predictor()
+        predictor = (
+            _get_vietocr_pass2_predictor() if pass2 else _get_vietocr_predictor()
+        )
         if predictor is None:
             return _recognize_with_paddle_cell(cell_image)
 
-        # Convert to PIL (VietOCR expects PIL Image)
         pil_img = Image.fromarray(cv2.cvtColor(cell_image, cv2.COLOR_BGR2RGB))
 
-        # Predict
         with _vietocr_lock:
-            text = predictor.predict(pil_img)
-        # VietOCR doesn't return confidence directly in simple mode
-        # We estimate based on text length and character validity
-        confidence = _estimate_confidence(text)
+            try:
+                text, prob = predictor.predict(pil_img, return_prob=True)
+            except TypeError:
+                text = predictor.predict(pil_img)
+                prob = None
 
-        return text.strip(), confidence
+        text = str(text).strip()
+        confidence = _blend_model_confidence(text, _normalize_vietocr_prob(prob))
+        return text, confidence
 
     except Exception as e:
         logger.warning("VietOCR recognition failed: %s", e)
@@ -2328,9 +2521,7 @@ def _run_paddle_cell_ocr(cell_image: np.ndarray) -> tuple[str, float]:
 
 def _estimate_confidence(text: str) -> float:
     """
-    Estimate confidence score for VietOCR output.
-
-    Heuristic-based since VietOCR greedy mode doesn't return scores.
+    Heuristic confidence fallback when VietOCR does not return probabilities.
     """
     if not text or not text.strip():
         return 0.0
@@ -2346,16 +2537,35 @@ def _estimate_confidence(text: str) -> float:
 
     # Short text is often less reliable
     if len(text) <= 1:
-        return 0.7
+        return 0.55
 
     # Vietnamese characters are a good sign
-    vietnamese_chars = set("àáảãạăắằẳẵặâấầẩẫậèéẻẽẹêếềểễệìíỉĩịòóỏõọôốồổỗộơớờởỡợùúủũụưứừửữựỳýỷỹỵđ")
+    vietnamese_chars = set(
+        "àáảãạăắằẳẵặâấầẩẫậèéẻẽẹêếềểễệìíỉĩịòóỏõọôốồổỗộơớờởỡợùúủũụưứừửữựỳýỷỹỵđ"
+    )
     has_vietnamese = any(c.lower() in vietnamese_chars for c in text)
 
     if has_vietnamese:
-        return 0.92
+        return 0.75
 
-    return 0.85
+    if text.isdigit() or re.fullmatch(r"[A-Za-z0-9._@+-]+", text):
+        return 0.7
+
+    return 0.65
+
+
+def _cell_crop_pad(bbox: list[int] | tuple[int, ...], image_shape: tuple) -> tuple[int, int, int, int]:
+    """Crop cell with height-aware padding to preserve Vietnamese diacritics."""
+    x1, y1, x2, y2 = [int(v) for v in bbox[:4]]
+    h = max(1, y2 - y1)
+    w = max(1, x2 - x1)
+    pad_y = max(4, int(round(h * 0.18)))
+    pad_x = max(3, int(round(w * 0.06)))
+    cy1 = max(0, y1 - pad_y)
+    cy2 = min(image_shape[0], y2 + pad_y)
+    cx1 = max(0, x1 - pad_x)
+    cx2 = min(image_shape[1], x2 + pad_x)
+    return cx1, cy1, cx2, cy2
 
 
 def _parse_html_table(html: str) -> list[CellData]:
@@ -2460,15 +2670,10 @@ def _column_bounds_from_row_boxes(
 
 
 def _crop_line_boxes(image: np.ndarray, boxes: list[tuple[int, int, int, int]]) -> list[np.ndarray]:
-    """Crop each line box from the image (with small padding)."""
-    h, w = image.shape[:2]
+    """Crop each line box from the image (height-aware padding for diacritics)."""
     crops: list[np.ndarray] = []
     for x1, y1, x2, y2 in boxes:
-        pad = 2
-        cy1 = max(0, y1 - pad)
-        cy2 = min(h, y2 + pad)
-        cx1 = max(0, x1 - pad)
-        cx2 = min(w, x2 + pad)
+        cx1, cy1, cx2, cy2 = _cell_crop_pad([x1, y1, x2, y2], image.shape)
         crop = image[cy1:cy2, cx1:cx2]
         if crop.size:
             crops.append(crop)
@@ -2879,11 +3084,12 @@ def _ocr_table_grid(
             x1, x2 = col_lines[ci], col_lines[ci + 1]
             if x2 - x1 < 18:
                 continue
-            pad = 2
-            cy1 = min(image.shape[0], y1 + pad)
-            cy2 = max(cy1 + 1, y2 - pad)
-            cx1 = min(image.shape[1], x1 + pad)
-            cx2 = max(cx1 + 1, x2 - pad)
+            # Shrink slightly off ruling lines; keep more headroom for diacritics
+            pad_x, pad_top, pad_bot = 2, 1, 2
+            cy1 = min(image.shape[0], y1 + pad_top)
+            cy2 = max(cy1 + 1, y2 - pad_bot)
+            cx1 = min(image.shape[1], x1 + pad_x)
+            cx2 = max(cx1 + 1, x2 - pad_x)
             crop = image[cy1:cy2, cx1:cx2]
             if crop.size == 0:
                 continue
@@ -2996,7 +3202,10 @@ def _ocr_table_grid(
 
 
 def _find_best_sso_table_region(
-    image: np.ndarray, *, prefer_cols: int = 10
+    image: np.ndarray,
+    *,
+    prefer_cols: int = 10,
+    already_deskewed: bool = False,
 ) -> tuple[int, list[int], list[int]] | None:
     """
     Tìm vùng bảng SSO khi không có dòng tiêu đề (trang tiếp theo).
@@ -3011,7 +3220,7 @@ def _find_best_sso_table_region(
         if top >= h - 200:
             continue
         crop = image[top:, :]
-        if settings.ocr_sso_enhance:
+        if settings.ocr_sso_enhance and not already_deskewed:
             crop = deskew_image(crop)
         grid = _detect_sso_grid_for_crop(crop, prefer_cols=prefer_cols)
         if not grid:
@@ -3048,7 +3257,10 @@ def _find_table_top_y(
 
 
 def _prepare_sso_grid_draft(
-    image: np.ndarray, page_number: int
+    image: np.ndarray,
+    page_number: int,
+    *,
+    already_deskewed: bool = False,
 ) -> SsoGridDraft | None:
     """GPU detect + OpenCV grid — no VietOCR cell batch yet."""
     line_boxes = _detect_lines_in_region(image)
@@ -3060,6 +3272,11 @@ def _prepare_sso_grid_draft(
     sso_header = header_y is not None
     prefer_cols = 10
 
+    def _maybe_deskew(crop: np.ndarray) -> np.ndarray:
+        if settings.ocr_sso_enhance and not already_deskewed:
+            return deskew_image(crop)
+        return crop
+
     if sso_header:
         table_top = header_y
         for row in rows:
@@ -3069,17 +3286,15 @@ def _prepare_sso_grid_draft(
             if _score_sso_header_row(texts) >= 3:
                 prefer_cols = _sso_layout_from_header_text(" ".join(texts))
                 break
-        crop = image[table_top:, :]
-        if settings.ocr_sso_enhance:
-            crop = deskew_image(crop)
+        crop = _maybe_deskew(image[table_top:, :])
         grid = _detect_sso_grid_for_crop(crop, prefer_cols=prefer_cols)
     else:
-        region = _find_best_sso_table_region(image, prefer_cols=prefer_cols)
+        region = _find_best_sso_table_region(
+            image, prefer_cols=prefer_cols, already_deskewed=already_deskewed
+        )
         if region is None:
             table_top = int(image.shape[0] * 0.12)
-            crop = image[table_top:, :]
-            if settings.ocr_sso_enhance:
-                crop = deskew_image(crop)
+            crop = _maybe_deskew(image[table_top:, :])
             grid = _detect_sso_grid_for_crop(crop, prefer_cols=prefer_cols)
             if grid is None and settings.ocr_sso_grid_relax:
                 grid = _detect_grid_line_positions(
@@ -3096,9 +3311,12 @@ def _prepare_sso_grid_draft(
                 table_top=table_top,
             )
         table_top, row_lines, col_lines = region
-        crop = image[table_top:, :]
-        if settings.ocr_sso_enhance:
-            crop = deskew_image(crop)
+        crop = _maybe_deskew(image[table_top:, :])
+        # After optional deskew, re-detect grid on the crop used for OCR
+        if settings.ocr_sso_enhance and not already_deskewed:
+            grid2 = _detect_sso_grid_for_crop(crop, prefer_cols=prefer_cols)
+            if grid2 is not None:
+                row_lines, col_lines = grid2
         return SsoGridDraft(
             page_number=page_number,
             crop=crop,
@@ -3157,8 +3375,11 @@ def prepare_page_draft(
     enable_preprocessing: bool = True,
 ) -> SsoGridDraft | None:
     """Public: run detect stage for pipelined page OCR."""
-    img = deskew_image(image) if enable_preprocessing else image
-    return _prepare_sso_grid_draft(img, page_number)
+    if enable_preprocessing:
+        img = prepare_page_for_ocr(image, enhance_lines=settings.ocr_sso_enhance)
+    else:
+        img = image
+    return _prepare_sso_grid_draft(img, page_number, already_deskewed=enable_preprocessing)
 
 
 def recognize_page_draft(draft: SsoGridDraft) -> TableData | None:
@@ -3185,13 +3406,13 @@ def load_page_image(
     *,
     enable_preprocessing: bool = True,
 ) -> np.ndarray:
-    """Load a page PNG and optionally deskew."""
+    """Load a page PNG and optionally deskew + enhance lines."""
     image_path = Path(image_path)
     img = cv2.imread(str(image_path))
     if img is None:
         raise ValueError(f"Cannot read image: {image_path}")
     if enable_preprocessing:
-        img = deskew_image(img)
+        img = prepare_page_for_ocr(img, enhance_lines=settings.ocr_sso_enhance)
     return img
 
 
@@ -3217,10 +3438,15 @@ def complete_draft_page(
 
 
 def _fallback_sso_grid_lines_ocr(
-    image: np.ndarray, page_number: int
+    image: np.ndarray,
+    page_number: int,
+    *,
+    already_deskewed: bool = False,
 ) -> TableData | None:
     """SSO pipeline: detect ruling lines → OCR từng ô bằng VietOCR."""
-    draft = _prepare_sso_grid_draft(image, page_number)
+    draft = _prepare_sso_grid_draft(
+        image, page_number, already_deskewed=already_deskewed
+    )
     if draft is None:
         return None
     return _recognize_sso_grid_draft(draft)
@@ -3554,7 +3780,9 @@ def _fallback_full_page_ocr(
     Prefers SSO table pipeline (det + VietOCR); generic grid as last resort.
     """
     try:
-        table = _fallback_sso_grid_lines_ocr(image, page_number)
+        table = _fallback_sso_grid_lines_ocr(
+            image, page_number, already_deskewed=True
+        )
         if table is not None:
             return table
 

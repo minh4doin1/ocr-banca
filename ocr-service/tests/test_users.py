@@ -63,8 +63,14 @@ def _client_existing_user(
     }
     client.reset_otp.return_value = 1
     client.get_user_client_roles.return_value = existing_roles or []
-    client.assign_roles.return_value = {"assigned": [], "skipped": []}
-    client.remove_roles.return_value = {"removed": [], "skipped": []}
+    client.assign_roles.side_effect = lambda user_id, role_names, client_id=None: {
+        "assigned": list(role_names),
+        "skipped": [],
+    }
+    client.remove_roles.side_effect = lambda user_id, role_names, client_id=None: {
+        "removed": list(role_names),
+        "skipped": [],
+    }
     return client
 
 
@@ -319,3 +325,147 @@ def test_provision_generic_user_service_error():
     )
     assert result.status == ProvisionStatus.FAILED
     assert "bad payload" in result.error
+
+# -- Provision mode edit (partial update) --
+
+
+def test_provision_edit_partial_updates_existing():
+    """Edit: thieu nhieu cot van update duoc neu user da ton tai."""
+    from app.models.schemas import ProvisionMode
+
+    client = _client_existing_user()
+    user = KeycloakUserInput(
+        username='u@agribank.com.vn',
+        phone='0912345678',
+    )
+    result = _provision_one_via_user_service(
+        client,
+        user,
+        kc=_KC_DEV,
+        temporary=True,
+        on_conflict=OnConflictAction.SKIP,
+        default_required_actions=[],
+        provision_mode=ProvisionMode.EDIT,
+    )
+    assert result.status == ProvisionStatus.UPDATED
+    client.create_user.assert_not_called()
+    client.update_user_attributes.assert_called_once()
+    client.reset_password.assert_not_called()
+    client.reset_otp.assert_not_called()
+
+
+def test_provision_edit_missing_user_fails_no_create():
+    """Edit: user chua ton tai -> failed, khong create."""
+    from app.models.schemas import ProvisionMode
+
+    client = _client_new_user()
+    user = KeycloakUserInput(
+        username='missing@agribank.com.vn',
+        phone='0912345678',
+    )
+    result = _provision_one_via_user_service(
+        client,
+        user,
+        kc=_KC_DEV,
+        temporary=True,
+        on_conflict=OnConflictAction.SKIP,
+        default_required_actions=[],
+        provision_mode=ProvisionMode.EDIT,
+    )
+    assert result.status == ProvisionStatus.FAILED
+    assert 'khong ton tai' in result.error.lower() or 'khong tao moi' in result.error.lower()
+    client.create_user.assert_not_called()
+
+
+def test_provision_edit_invalid_phone_fails():
+    """Edit: field da dien van phai dung format."""
+    from app.models.schemas import ProvisionMode
+
+    client = _client_existing_user()
+    user = KeycloakUserInput(
+        username='u@agribank.com.vn',
+        phone='123',
+    )
+    result = _provision_one_via_user_service(
+        client,
+        user,
+        kc=_KC_DEV,
+        temporary=True,
+        on_conflict=OnConflictAction.SKIP,
+        default_required_actions=[],
+        provision_mode=ProvisionMode.EDIT,
+    )
+    assert result.status == ProvisionStatus.FAILED
+    assert 'phone' in result.error
+    client.update_user_details.assert_not_called()
+    client.update_user_attributes.assert_not_called()
+
+
+def test_provision_create_still_requires_fields():
+    """Create mode van bat du cot (khong partial)."""
+    client = _client_existing_user()
+    user = KeycloakUserInput(
+        username='u@agribank.com.vn',
+        phone='0912345678',
+    )
+    result = _provision_one_via_user_service(
+        client,
+        user,
+        kc=_KC_DEV,
+        temporary=True,
+        on_conflict=OnConflictAction.SKIP,
+        default_required_actions=[],
+    )
+    assert result.status == ProvisionStatus.FAILED
+    assert 'Thieu' in result.error or 'thieu' in result.error.lower()
+
+
+def test_provision_edit_keeps_existing_email_when_blank():
+    """Edit: email trong khong bi ghi de bang username."""
+    from app.models.schemas import ProvisionMode
+
+    client = _client_existing_user()
+    user = KeycloakUserInput(
+        username='HQPTEST',
+        phone='0912345678',
+    )
+    result = _provision_one_via_user_service(
+        client,
+        user,
+        kc=_KC_DEV,
+        temporary=True,
+        on_conflict=OnConflictAction.SKIP,
+        default_required_actions=[],
+        provision_mode=ProvisionMode.EDIT,
+    )
+    assert result.status == ProvisionStatus.UPDATED
+    client.update_user_details.assert_not_called()
+    client.update_user_attributes.assert_called_once()
+
+
+def test_validate_user_field_errors_partial():
+    from app.services.user_mapping import validate_user_field_errors
+
+    full_errs = validate_user_field_errors(
+        KeycloakUserInput(username='u@agribank.com.vn', phone='0912345678')
+    )
+    assert 'cccd' in full_errs or 'role' in full_errs
+
+    partial_errs = validate_user_field_errors(
+        KeycloakUserInput(username='u@agribank.com.vn', phone='0912345678'),
+        partial=True,
+    )
+    assert partial_errs == {}
+
+    bad = validate_user_field_errors(
+        KeycloakUserInput(username='u@agribank.com.vn', cccd='12'),
+        partial=True,
+    )
+    assert 'cccd' in bad
+
+    no_user = validate_user_field_errors(
+        KeycloakUserInput(username='', phone='0912345678'),
+        partial=True,
+    )
+    assert 'username' in no_user
+

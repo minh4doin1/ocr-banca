@@ -51,6 +51,27 @@ def _load_predictor(model_name: str):
     return predictor, device
 
 
+def _normalize_prob(prob) -> float:
+    """Convert VietOCR return_prob payload to a 0–1 confidence."""
+    if prob is None:
+        return 0.0
+    try:
+        if hasattr(prob, "detach"):
+            prob = prob.detach().cpu()
+        if hasattr(prob, "tolist"):
+            prob = prob.tolist()
+        if isinstance(prob, (list, tuple)):
+            vals = [float(x) for x in prob if x is not None]
+            if not vals:
+                return 0.0
+            # Token probs → geometric-ish mean via arithmetic on clipped values
+            vals = [max(1e-6, min(1.0, v)) for v in vals]
+            return float(sum(vals) / len(vals))
+        return float(max(0.0, min(1.0, float(prob))))
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def run_worker_loop() -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -85,12 +106,14 @@ def run_worker_loop() -> None:
             if cmd == "predict_batch":
                 images_b64 = req.get("images") or []
                 pil_imgs = [_decode_image(b) for b in images_b64]
-                texts = predictor.predict_batch(pil_imgs)
+                texts, probs = predictor.predict_batch(pil_imgs, return_prob=True)
+                scores = [_normalize_prob(p) for p in probs]
                 _emit(
                     {
                         "id": req_id,
                         "ok": True,
                         "texts": [str(t).strip() for t in texts],
+                        "scores": scores,
                     }
                 )
                 continue
