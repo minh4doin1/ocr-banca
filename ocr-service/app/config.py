@@ -230,6 +230,9 @@ class Settings(BaseSettings):
         "email,first_name,last_name,branch_code,ipcas_code,cccd,phone,unit_code,role"
     )
 
+    # Default template when client omits template_id
+    default_template_id: str = "sso-agribank"
+
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"
@@ -266,6 +269,13 @@ class Settings(BaseSettings):
     def images_path(self) -> Path:
         """Directory for converted PDF page images."""
         path = self.storage_path / "images"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    @property
+    def templates_path(self) -> Path:
+        """Directory for template profiles and sample files."""
+        path = self.storage_path / "templates"
         path.mkdir(parents=True, exist_ok=True)
         return path
 

@@ -131,6 +131,50 @@
 
                     <p class="excel-direct-hint">Đã có file Excel hoặc Word (.docx) chuẩn? Bấm <strong>Nạp Excel</strong> / <strong>Nạp Word</strong> để bỏ qua OCR và vào thẳng bước kiểm tra — dữ liệu đọc trực tiếp nên chính xác hơn OCR.</p>
 
+                    <div class="option-group template-select-group" id="template-select-group">
+                        <span class="option-label">Template xử lý</span>
+                        <div class="template-select-row">
+                            <select id="template-select" class="select-input" title="Chọn mẫu cột / pipeline sau OCR">
+                                <option value="sso-agribank">SSO Agribank Mẫu 01</option>
+                            </select>
+                            <button type="button" class="btn btn-outline btn-sm" id="btn-template-config">Cấu hình</button>
+                        </div>
+                        <p class="hint-text" id="template-actions-hint">Actions: validate, export, Keycloak…</p>
+                    </div>
+
+                    <details class="template-config-panel" id="template-config-panel">
+                        <summary>Quản lý template (upload mẫu · map cột · actions)</summary>
+                        <div class="template-config-body">
+                            <div class="template-config-upload">
+                                <input type="file" id="template-sample-input" accept=".xlsx,.xlsm,.docx,.pdf" hidden>
+                                <button type="button" class="btn btn-primary btn-sm" id="btn-upload-template-sample">Upload file mẫu</button>
+                                <input type="text" id="template-name-input" class="text-input" placeholder="Tên template (vd: Form hệ thống X)">
+                                <label class="check-inline">
+                                    <input type="checkbox" id="template-save-on-upload" checked>
+                                    Lưu ngay sau khi suy ra
+                                </label>
+                            </div>
+                            <div id="template-infer-warnings" class="template-warnings hidden"></div>
+                            <div class="template-editor hidden" id="template-editor">
+                                <div class="template-editor-meta">
+                                    <label>ID <input type="text" id="tpl-edit-id" class="text-input" readonly></label>
+                                    <label>Tên <input type="text" id="tpl-edit-name" class="text-input"></label>
+                                </div>
+                                <table class="format-guide-table template-map-table" id="template-map-table">
+                                    <thead>
+                                        <tr><th>#</th><th>Header mẫu</th><th>Field nội bộ</th><th>Bắt buộc</th></tr>
+                                    </thead>
+                                    <tbody id="template-map-body"></tbody>
+                                </table>
+                                <div class="template-actions-list" id="template-actions-list"></div>
+                                <div class="template-editor-actions">
+                                    <button type="button" class="btn btn-primary btn-sm" id="btn-save-template">Lưu template</button>
+                                    <button type="button" class="btn btn-outline btn-sm" id="btn-delete-template">Xóa</button>
+                                </div>
+                            </div>
+                        </div>
+                    </details>
+
                     <div class="upload-settings" id="upload-settings">
                         <div class="option-group">
                             <span class="option-label">Chế độ OCR</span>
@@ -502,7 +546,7 @@
 
     <div id="notification-center" class="notification-center" aria-live="polite"></div>
 
-    <script src="app.js?v=22"></script>
+    <script src="app.js?v=23"></script>
     <script src="batch-users.js?v=13"></script>
 </body>
 </html>

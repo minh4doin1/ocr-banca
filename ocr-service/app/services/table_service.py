@@ -189,6 +189,7 @@ def create_job(
     use_gpu: bool = False,
     remote_provider: RemoteProvider | None = None,
     remote_url: str = "",
+    template_id: str = "sso-agribank",
 ) -> JobInfo:
     """Create a new OCR job."""
     pdf_path = Path(pdf_path)
@@ -202,6 +203,7 @@ def create_job(
         use_gpu=use_gpu,
         remote_provider=remote_provider,
         remote_url=remote_url,
+        template_id=template_id or "sso-agribank",
         status=JobStatus.PENDING,
         total_pages=total_pages,
         created_at=datetime.now(),
@@ -217,6 +219,7 @@ def create_manual_job(
     job_id: str,
     filename: str,
     total_pages: int = 1,
+    template_id: str = "sso-agribank",
 ) -> JobInfo:
     """Create an already-completed job used by non-OCR imports (e.g. Excel)."""
     job = JobInfo(
@@ -224,6 +227,7 @@ def create_manual_job(
         filename=filename,
         processing_mode=ProcessingMode.LOCAL,
         use_gpu=False,
+        template_id=template_id or "sso-agribank",
         status=JobStatus.COMPLETED,
         total_pages=max(1, total_pages),
         progress=max(1, total_pages),

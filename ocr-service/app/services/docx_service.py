@@ -214,6 +214,7 @@ def export_to_docx(
     result: OcrResult,
     *,
     page_numbers: list[int] | None = None,
+    template_id: str | None = None,
 ) -> Path:
     """
     Xuất kết quả OCR/import ra file Word (.docx) — một bảng SSO mỗi trang.
@@ -233,10 +234,22 @@ def export_to_docx(
         _SSO_GRID_TO_EXCEL_COL_10,
         _SSO_GRID_TO_EXCEL_COL_9,
     )
+    from app.services.template_service import (
+        export_headers_for,
+        get_template_or_default,
+    )
     from app.services.user_mapping import (
         _parse_branch_code_digits,
         _parse_department_cell,
         normalize_roles,
+    )
+
+    profile = get_template_or_default(template_id)
+    headers = export_headers_for(profile) or list(SSO_HEADERS)
+    doc_title = (
+        profile.export.docx_title
+        or profile.name
+        or "Danh sách dữ liệu OCR"
     )
 
     page_filter = set(page_numbers) if page_numbers else None
@@ -252,7 +265,7 @@ def export_to_docx(
 
     title = doc.add_paragraph()
     title.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    tr = title.add_run("Danh sách user SSO — Agribank Banca")
+    tr = title.add_run(doc_title)
     _docx_style_run(tr, bold=True, size_pt=14, color=(0x1F, 0x4E, 0x79))
 
     meta = doc.add_paragraph()
@@ -268,14 +281,15 @@ def export_to_docx(
     table_count = 0
     for page in pages:
         sso_tables = [t for t in page.tables if t.table_kind == "sso_agribank"]
-        if not sso_tables:
+        tables_to_export = sso_tables if sso_tables else list(page.tables)
+        if not tables_to_export:
             continue
-        if len(pages) > 1 or len(sso_tables) > 1:
+        if len(pages) > 1 or len(tables_to_export) > 1:
             h = doc.add_paragraph()
             hr = h.add_run(f"Trang {page.page_number}")
             _docx_style_run(hr, bold=True, size_pt=12, color=(0x1F, 0x4E, 0x79))
 
-        for table in sso_tables:
+        for table in tables_to_export:
             if not table.cells:
                 continue
             table_count += 1
@@ -288,7 +302,7 @@ def export_to_docx(
             role_grid_col = 8 if is_new_layout else 7
             ipcas_grid_col = 4 if is_new_layout else 3
 
-            num_cols = len(SSO_HEADERS)
+            num_cols = len(headers)
             num_rows = max(table.num_rows, 1) + 1
             doc_table = doc.add_table(rows=num_rows, cols=num_cols)
             doc_table.style = "Table Grid"
@@ -297,101 +311,81 @@ def export_to_docx(
                 if ci < num_cols:
                     doc_table.columns[ci].width = width
 
-            for c, title_text in enumerate(SSO_HEADERS):
-                cell = doc_table.cell(0, c)
-                _docx_write_cell(
-                    cell,
-                    title_text,
-                    align_center=True,
-                    fill=_DOCX_HEADER_FILL,
-                    bold=True,
-                    size_pt=9,
-                    font_color=(0xFF, 0xFF, 0xFF),
-                )
+            # Header row
+            for ci, title_text in enumerate(headers):
+                cell = doc_table.rows[0].cells[ci]
+                cell.text = title_text
+                for paragraph in cell.paragraphs:
+                    for run in paragraph.runs:
+                        _docx_style_run(run, bold=True, size_pt=9, color=(0xFF, 0xFF, 0xFF))
+                _docx_set_cell_shading(cell, "1F4E79")
+
+            use_sso_layout = (
+                profile.id == "sso-agribank"
+                or profile.ocr.sso_enhance
+                or table.table_kind == "sso_agribank"
+            )
 
             for r in range(max(table.num_rows, 1)):
-                row_fill = _DOCX_ALT_ROW_FILL if r % 2 == 1 else None
-                dept_text, _ = grid.get((r, 2), ("", 1.0))
-                branch_code = (
-                    grid.get((r, 2), ("", 1.0))[0].strip()
-                    if is_new_layout
-                    else _parse_branch_code_digits(dept_text)
-                )
-                ipcas = grid.get((r, ipcas_grid_col), ("", 1.0))[0]
-                email_text, _ = grid.get((r, email_grid_col), ("", 1.0))
-                role_text, _ = grid.get((r, role_grid_col), ("", 1.0))
-                role_suggested = ";".join(normalize_roles(role_text)) if role_text else ""
-                email_mismatch = bool(
-                    ipcas and email_text and email_mismatch_with_ipcas(email_text, ipcas)
-                )
-                email_uncertain = bool(email_text and email_needs_review(email_text))
-                role_unmapped = bool(role_text.strip() and not role_suggested)
-
-                for excel_c in range(num_cols):
-                    cell = doc_table.cell(r + 1, excel_c)
-                    fill = row_fill
-                    italic = False
-                    font_color = None
-                    align_center = excel_c in (0, 2, 7)
-                    display = ""
-
-                    if excel_c == 2 and not is_new_layout:
-                        _, bc, _ = _parse_department_cell(dept_text)
-                        display = bc or branch_code
-                    elif excel_c == 3 and not is_new_layout:
-                        _, _, bn = _parse_department_cell(dept_text)
-                        display = bn or dept_text
-                    elif excel_c == 10:
-                        display = role_suggested
-                        if role_unmapped:
-                            fill = _DOCX_ROLE_WARN_FILL
-                            font_color = (0xCC, 0x66, 0x00)
-                    else:
-                        grid_c = next(
-                            (g for g, e in grid_to_excel.items() if e == excel_c),
-                            None,
-                        )
-                        if grid_c is not None:
-                            text_val, conf = grid.get((r, grid_c), ("", 1.0))
-                            display = text_val
-                            if grid_c == email_grid_col and (
-                                email_mismatch or email_uncertain
-                            ):
-                                fill = _DOCX_EMAIL_WARN_FILL
-                                font_color = (0xB7, 0x1C, 0x1C)
-                            elif grid_c == role_grid_col and role_unmapped:
-                                fill = _DOCX_ROLE_WARN_FILL
-                                font_color = (0xCC, 0x66, 0x00)
-                            elif conf < threshold:
-                                fill = _DOCX_LOW_CONF_FILL
-                                font_color = (0xCC, 0x66, 0x00)
-                                italic = True
-
-                    _docx_write_cell(
-                        cell,
-                        display,
-                        align_center=align_center,
-                        fill=fill,
-                        italic=italic,
-                        font_color=font_color,
+                if use_sso_layout and num_cols == len(SSO_HEADERS):
+                    dept_text = grid.get((r, 2), ("", 1.0))[0]
+                    branch_code = (
+                        grid.get((r, 2), ("", 1.0))[0].strip()
+                        if is_new_layout
+                        else _parse_branch_code_digits(dept_text)
                     )
+                    role_text = grid.get((r, role_grid_col), ("", 1.0))[0]
+                    role_suggested = (
+                        ";".join(normalize_roles(role_text)) if role_text else ""
+                    )
+                    for excel_c in range(num_cols):
+                        cell = doc_table.rows[r + 1].cells[excel_c]
+                        if excel_c == 2 and not is_new_layout:
+                            cell.text = branch_code
+                        elif excel_c == 3 and not is_new_layout:
+                            _, _, bn = _parse_department_cell(dept_text)
+                            cell.text = bn or dept_text
+                        elif excel_c == 10:
+                            cell.text = role_suggested
+                        else:
+                            grid_c = next(
+                                (g for g, e in grid_to_excel.items() if e == excel_c),
+                                None,
+                            )
+                            text_val = (
+                                grid.get((r, grid_c), ("", 1.0))[0]
+                                if grid_c is not None
+                                else ""
+                            )
+                            cell.text = text_val
+                        for paragraph in cell.paragraphs:
+                            for run in paragraph.runs:
+                                _docx_style_run(run, size_pt=8)
+                else:
+                    for excel_c in range(num_cols):
+                        cell = doc_table.rows[r + 1].cells[excel_c]
+                        text_val, conf = grid.get((r, excel_c), ("", 1.0))
+                        cell.text = text_val
+                        for paragraph in cell.paragraphs:
+                            for run in paragraph.runs:
+                                _docx_style_run(run, size_pt=8)
+                                if conf < threshold:
+                                    run.font.color.rgb = RGBColor(0xCC, 0x66, 0x00)
 
-            doc.add_paragraph()
-            note = doc.add_paragraph()
-            nr = note.add_run(
-                "Ghi chú: ô nền vàng = OCR độ tin cậy thấp; đỏ = email cần kiểm tra; "
-                "vàng nhạt = vai trò chưa map. Sửa xong → Upload Word đã sửa trên hệ thống."
-            )
-            _docx_style_run(nr, size_pt=8, italic=True, color=(0x88, 0x88, 0x88))
             doc.add_paragraph()
 
     if table_count == 0:
-        raise ValueError("Không có bảng SSO để xuất Word")
+        raise ValueError("Không có bảng dữ liệu để xuất Word")
 
-    out_dir = settings.export_path
-    out_dir.mkdir(parents=True, exist_ok=True)
-    stem = Path(result.filename).stem or result.job_id
-    out_path = out_dir / f"{result.job_id}_{stem}.docx"
-    doc.save(str(out_path))
-    logger.info("DOCX exported: %s", out_path.name)
-    return out_path
+    from app.config import settings as _settings
+
+    base = result.filename.rsplit(".", 1)[0]
+    if page_filter:
+        page_tag = "-".join(str(p) for p in sorted(page_filter))
+        filename = f"{result.job_id}_{base}_trang-{page_tag}.docx"
+    else:
+        filename = f"{result.job_id}_{base}.docx"
+    export_file = _settings.export_path / filename
+    doc.save(str(export_file))
+    logger.info("Word exported: %s", export_file)
+    return export_file
