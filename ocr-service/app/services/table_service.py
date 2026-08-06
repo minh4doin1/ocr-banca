@@ -259,6 +259,22 @@ def set_result(job_id: str, result: OcrResult) -> OcrResult:
     return result
 
 
+
+def _collect_ocr_warnings(pages) -> list[str]:
+    out: list[str] = []
+    for p in pages:
+        out.extend(getattr(p, "warnings", None) or [])
+        for t in getattr(p, "tables", None) or []:
+            out.extend(getattr(t, "warnings", None) or [])
+    seen: set[str] = set()
+    res: list[str] = []
+    for w in out:
+        if w and w not in seen:
+            seen.add(w)
+            res.append(w)
+    return res
+
+
 def _save_partial_result(job: JobInfo, pages: list[PageResult]) -> OcrResult:
     """Persist incremental OCR result after each page completes."""
     with _results_lock:
@@ -277,12 +293,19 @@ def _save_partial_result(job: JobInfo, pages: list[PageResult]) -> OcrResult:
             if pn not in merged_by_page:
                 merged_by_page[pn] = page
 
+        merged_pages = [merged_by_page[pn] for pn in sorted(merged_by_page)]
+        ocr_warnings = _collect_ocr_warnings(merged_pages)
+        if existing is not None and getattr(existing, "warnings", None):
+            for w in existing.warnings:
+                if w and w not in ocr_warnings:
+                    ocr_warnings.append(w)
         result = OcrResult(
             job_id=job.job_id,
             filename=job.filename,
             total_pages=job.total_pages,
-            pages=[merged_by_page[pn] for pn in sorted(merged_by_page)],
+            pages=merged_pages,
             is_complete=is_complete,
+            warnings=ocr_warnings,
             created_at=job.created_at,
             updated_at=datetime.now(),
         )
@@ -843,12 +866,18 @@ def process_remote_job(
                 raise
 
             if remote_result and remote_result.pages:
+                remote_warn = list(getattr(remote_result, "warnings", None) or [])
+                page_warn = _collect_ocr_warnings(remote_result.pages)
+                for w in page_warn:
+                    if w and w not in remote_warn:
+                        remote_warn.append(w)
                 local_result = OcrResult(
                     job_id=job.job_id,
                     filename=job.filename,
                     total_pages=remote_result.total_pages or job.total_pages,
                     pages=remote_result.pages,
                     is_complete=remote_job.status == JobStatus.COMPLETED,
+                    warnings=remote_warn,
                     created_at=job.created_at,
                     updated_at=datetime.now(),
                 )
@@ -892,12 +921,18 @@ def process_remote_job(
                             worker_token,
                         )
 
+                remote_warn = list(getattr(remote_result, "warnings", None) or [])
+                page_warn = _collect_ocr_warnings(remote_result.pages)
+                for w in page_warn:
+                    if w and w not in remote_warn:
+                        remote_warn.append(w)
                 result = OcrResult(
                     job_id=job.job_id,
                     filename=job.filename,
                     total_pages=remote_result.total_pages,
                     pages=remote_result.pages,
                     is_complete=True,
+                    warnings=remote_warn,
                     created_at=job.created_at,
                     updated_at=datetime.now(),
                 )
@@ -1043,6 +1078,12 @@ def reocr_page(job_id: str, page_number: int, use_gpu: bool | None = None) -> Pa
     new_pages.sort(key=lambda p: p.page_number)
 
     result.pages = new_pages
+    page_warn = _collect_ocr_warnings(new_pages)
+    existing_warn = list(getattr(result, "warnings", None) or [])
+    for w in page_warn:
+        if w and w not in existing_warn:
+            existing_warn.append(w)
+    result.warnings = existing_warn
     result.updated_at = datetime.now()
     _results[job_id] = result
     _save_result_to_disk(result)

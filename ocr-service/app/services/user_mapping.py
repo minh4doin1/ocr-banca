@@ -96,8 +96,17 @@ def _normalize_header_key(text: str) -> str:
 
 
 def _normalize_phone(raw: str) -> str:
-    """Bỏ khoảng trắng, dấu chấm, gạch ngang trong SĐT."""
-    return re.sub(r"[\s.\-]", "", (raw or "").strip())
+    """Bỏ khoảng trắng/dấu; gỡ domain dính; thêm 0 đầu cho mobile VN 9 số."""
+    t = (raw or "").strip()
+    t = re.sub(r"(?i)@?agribank\.?com\.?vn.*$", "", t)
+    t = re.sub(r"(?i)@?agribankcomvn.*$", "", t)
+    if "@" in t:
+        t = re.sub(r"@.*$", "", t)
+    t = re.sub(r"[\s.\-]", "", t)
+    digits = re.sub(r"\D", "", t)
+    if len(digits) == 9 and digits[:1] in "35789":
+        digits = "0" + digits
+    return digits
 
 
 def _header_cell_matches_field(norm_cell: str, aliases: list[str]) -> bool:
@@ -682,8 +691,8 @@ def validate_user_field_errors(
             errors["role"] = f"Vai trò không hợp lệ: {r}"
             break
 
-    if user.cccd and not re.fullmatch(r"\d{12}", user.cccd):
-        errors["cccd"] = "CCCD phải có 12 số"
+    if user.cccd and not re.fullmatch(r"\d{9}|\d{12}", user.cccd):
+        errors["cccd"] = "CCCD/CMND phải có 9 hoặc 12 số"
 
     if user.phone and not re.fullmatch(r"0\d{8,10}", _normalize_phone(user.phone)):
         errors["phone"] = "SĐT không hợp lệ"
@@ -903,7 +912,7 @@ def _validate_cell_for_field(field: str, text: str, confidence: float) -> str:
     if not (text or "").strip():
         label = settings.field_labels_vi.get(field, field)
         return f"Thiếu {label}"
-    if field == "cccd" and not re.fullmatch(r"\d{12}", re.sub(r"\s", "", text)):
+    if field == "cccd" and not re.fullmatch(r"\d{9}|\d{12}", re.sub(r"\s", "", text)):
         return "CCCD phải có 12 số"
     if field == "phone" and not re.fullmatch(r"0\d{8,10}", _normalize_phone(text)):
         return "SĐT không hợp lệ"

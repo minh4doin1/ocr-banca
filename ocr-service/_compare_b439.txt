@@ -1,0 +1,14 @@
+BEFORE vs AFTER quality (identity structure checks)
+overall: 0.0% -> 82.9%  (0/81 -> 63/76)
+  page 1: 0.0% -> 100.0%
+  page 2: 0.0% -> 90.9%
+  page 3: 0.0% -> 90.9%
+  page 4: 0.0% -> 72.7%
+  page 5: 0.0% -> 0.0%
+
+Sample page1:
+  1 | Phạm Phương Liên | 3000 | Hội Sở | HBIPLIEN | 113382382 | lienphamphuong@agribank.com.vn | 0338250999 | Kế toán viên | 12704001
+  2 | Nguyễn Ngọc Mai | 3000 | Hội Sở | HBINNMAI | 113253969 | mainguyenngocd@agribank.com.vn | 0868936893 | Ké toan vien | 12704001
+Sample page2:
+  8 | Bùi Thanh Hiền | 3001 |  | HLSHIEN | 113121959 | hienbuithanh@agribank.com.vn | 0911436988 | Kế toán viên | 17204007
+  9 | Nguyễn Hiền Thảo | 3001 |  | HLSNTHAO | 113229663 | thaonguyenhiend@agribank.com.vn | 0974439810 | Kê toán viên | 17204007

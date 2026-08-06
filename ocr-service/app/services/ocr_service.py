@@ -47,6 +47,14 @@ from app.utils.image_utils import (
 
 logger = logging.getLogger(__name__)
 
+_SSO_POSTPROCESS_WARNINGS: list[str] = []
+
+
+def consume_sso_postprocess_warnings() -> list[str]:
+    out = list(_SSO_POSTPROCESS_WARNINGS)
+    _SSO_POSTPROCESS_WARNINGS.clear()
+    return out
+
 # ──────────────────────────────────────────────────────────────
 # GPU guard — hide CUDA from Paddle unless GPU is explicitly enabled.
 # paddlepaddle-gpu tries to load cuDNN during inference even in "cpu"
@@ -739,6 +747,9 @@ def _extract_table(
         max_row = max((c.row for c in cell_data_list), default=0)
         max_col = max((c.col for c in cell_data_list), default=0)
 
+        sso_warnings = (
+            consume_sso_postprocess_warnings() if table_kind == "sso_agribank" else []
+        )
         return TableData(
             table_index=table_idx,
             num_rows=max_row + 1,
@@ -746,6 +757,7 @@ def _extract_table(
             cells=cell_data_list,
             html=html_str,
             table_kind=table_kind,
+            warnings=sso_warnings,
         )
 
     except Exception as e:
@@ -1249,6 +1261,15 @@ def _row_looks_like_fragment_continuation(
 
     lower_texts = list(lower_cols.values())
 
+    non_frag_count = sum(
+        1
+        for t in lower_texts
+        if not _is_email_domain_fragment(t) and not _is_cccd_date_fragment(t)
+    )
+    # Day du lieu day du (>=4 o, >=3 o khong phai fragment) -> khong merge user khac
+    if len(lower_cols) >= 4 and non_frag_count >= 3:
+        return False
+
     frag_hits = sum(
         1
         for t in lower_texts
@@ -1442,41 +1463,163 @@ def _split_leading_cccd(text: str) -> tuple[str, str]:
     return "", t
 
 
-def _normalize_cccd_text(text: str) -> str:
-    """Extract a 12-digit CCCD from noisy OCR output."""
+def _ocr_digit_confusable_replace(text: str) -> str:
+    """Thay ký tự OCR dễ nhầm thành chữ số (O/l/I/B/S/Z)."""
+    if not text:
+        return text
+    table = str.maketrans(
+        {
+            "O": "0",
+            "o": "0",
+            "D": "0",
+            "l": "1",
+            "I": "1",
+            "|": "1",
+            "B": "8",
+            "S": "5",
+            "s": "5",
+            "Z": "2",
+            "z": "2",
+        }
+    )
+    return text.translate(table)
+
+
+def _digits_after_confusable(text: str) -> str:
     import re
 
-    compact = re.sub(r"\s", "", text)
-    m = re.search(r"\d{12}", compact)
+    return re.sub(r"\D", "", _ocr_digit_confusable_replace(text or ""))
+
+
+def _normalize_cccd_text(text: str) -> str:
+    """Extract CCCD (12) hoặc CMND (9) từ OCR — không đánh [? ] cho 9 số."""
+    import re
+
+    compact = re.sub(r"\s", "", text or "")
+    conf = _ocr_digit_confusable_replace(compact)
+    m = re.search(r"\d{12}", conf)
     if m:
         return m.group(0)
-    digits = re.sub(r"\D", "", compact)
-    if len(digits) == 11:
-        return "0" + digits
-    if len(digits) >= 12:
+    digits = re.sub(r"\D", "", conf)
+    if len(digits) == 12:
+        return digits
+    if len(digits) > 12:
         return digits[:12]
-    return text.strip()
+    # 11 số: giữ nguyên, đánh dấu cần review — không tự thêm 0
+    if len(digits) == 11:
+        return f"[?]{digits}"
+    if len(digits) >= 9:
+        return digits
+    return (text or "").strip()
+
+
+def _sso_header_row_ids(cells: list[CellData]) -> set[int]:
+    """Xác định dòng header theo nội dung (không phụ thuộc index sau renumber)."""
+    from collections import defaultdict
+    import re
+
+    by_row: dict[int, list[str]] = defaultdict(list)
+    for c in cells:
+        if c.text and c.text.strip():
+            by_row[c.row].append(c.text.strip())
+    if not by_row:
+        return set()
+
+    headers: set[int] = set()
+    paren = re.compile(r"^\(\d+\)$")
+    for row, texts in by_row.items():
+        joined = _normalize_match_text(" ".join(texts))
+        c0 = _normalize_match_text(texts[0] if texts else "")
+        if "stt" in c0 or "stt" in joined[:20]:
+            headers.add(row)
+            continue
+        if (
+            "hoten" in joined
+            and any(k in joined for k in ("email", "cccd", "ipcas", "machinh", "phong"))
+        ):
+            headers.add(row)
+            continue
+        if len(texts) >= 3 and sum(1 for t in texts if paren.match(t)) >= len(texts) * 0.6:
+            headers.add(row)
+    if not headers:
+        # Không gán nhầm dòng dữ liệu (STT số) thành header khi lưới đã bỏ tiêu đề
+        import re as _re
+
+        min_r = min(by_row)
+        texts = by_row[min_r]
+        c0 = (texts[0] if texts else "").strip()
+        has_vn = any(ord(ch) > 127 for t in texts for ch in t)
+        if _re.match(r"^\d{1,3}$", c0) and has_vn:
+            return set()
+        headers.add(min_r)
+    return headers
 
 
 def _fix_cccd_email_columns(cells: list[CellData]) -> list[CellData]:
-    """Move leading CCCD numbers that landed in the email column."""
+    """Move sticky CCCD/email/phone/IPCAS pairs into the correct SSO columns."""
     from collections import defaultdict
+    import re
 
     if not cells:
         return cells
 
-    cccd_col, email_col = _find_cccd_email_cols(cells)
-    if cccd_col is None or email_col is None:
-        return cells
+    max_col = max((c.col for c in cells), default=0)
+    layout = _sso_layout_col_count(cells, max_col + 1)
+    if layout >= 10:
+        ipcas_col, cccd_col, email_col, phone_col = 4, 5, 6, 7
+    else:
+        ipcas_col, cccd_col, email_col, phone_col = 3, 4, 5, 6
 
-    header_rows = {c.row for c in cells if c.row <= 1}
+    found_cccd, found_email = _find_cccd_email_cols(cells)
+    if found_cccd is not None:
+        cccd_col = found_cccd
+    if found_email is not None:
+        email_col = found_email
+
+    header_rows = _sso_header_row_ids(cells)
     by_row: dict[int, dict[int, CellData]] = defaultdict(dict)
     for c in cells:
         by_row[c.row][c.col] = c
 
+    def _ensure_cell(row: int, col: int, conf: float) -> CellData:
+        existing = by_row[row].get(col)
+        if existing is not None:
+            return existing
+        cell = CellData(row=row, col=col, text="", confidence=conf, bbox=[])
+        by_row[row][col] = cell
+        cells.append(cell)
+        return cell
+
+    def _split_cccd_then_rest(raw: str) -> tuple[str, str]:
+        compact = re.sub(r"\s", "", raw or "")
+        conf = _ocr_digit_confusable_replace(compact)
+        m = re.match(r"^(\d{9,14})(.+)$", conf)
+        if not m:
+            return "", raw
+        digits, rest = m.group(1), m.group(2)
+        if not rest:
+            return "", raw
+        return digits, rest
+
+    def _looks_emailish(s: str) -> bool:
+        low = (s or "").lower()
+        return "@" in low or "agribank" in low or bool(re.search(r"[a-zA-Z]{3,}", s or ""))
+
+    def _looks_phoneish(s: str) -> bool:
+        if _looks_like_phone_at_domain(s):
+            return True
+        d = _digits_after_confusable(s)
+        if re.fullmatch(r"0\d{8,10}", d):
+            return True
+        if re.fullmatch(r"[35789]\d{8}", d):
+            return True
+        return d.startswith("0") and 9 <= len(d) <= 11
+
     for row, cols in by_row.items():
         if row in header_rows:
             continue
+
+        # Existing: leading CCCD stuck in email column
         email_cell = cols.get(email_col)
         if email_cell and email_cell.text.strip():
             cccd_part, remainder = _split_leading_cccd(email_cell.text)
@@ -1490,24 +1633,130 @@ def _fix_cccd_email_columns(cells: list[CellData]) -> list[CellData]:
                             remainder, col=email_col, email_col=email_col
                         )
                     )
-                    if cccd_cell:
-                        cccd_cell.text = _normalize_cccd_text(cccd_part)
-                    else:
-                        cells.append(
-                            CellData(
-                                row=row,
-                                col=cccd_col,
-                                text=_normalize_cccd_text(cccd_part),
-                                confidence=email_cell.confidence,
-                                bbox=[],
-                            )
+                    target = _ensure_cell(row, cccd_col, email_cell.confidence)
+                    target.text = _normalize_cccd_text(cccd_part)
+
+        # Phone@domain in email + role text in phone → remap (trước khi tách CCCD)
+        role_col = phone_col + 1
+        email_cell = cols.get(email_col)
+        phone_cell = cols.get(phone_col)
+        if (
+            email_cell
+            and phone_cell
+            and _looks_like_phone_at_domain(email_cell.text)
+            and _looks_like_role_text(phone_cell.text)
+        ):
+            role_dst = _ensure_cell(row, role_col, phone_cell.confidence)
+            if (not role_dst.text.strip()) or _digits_after_confusable(role_dst.text):
+                unit_col = role_col + 1
+                if role_dst.text.strip() and re.fullmatch(
+                    r"\d{6,12}", _digits_after_confusable(role_dst.text)
+                ):
+                    unit_dst = _ensure_cell(row, unit_col, role_dst.confidence)
+                    if not unit_dst.text.strip():
+                        unit_dst.text = role_dst.text.strip()
+                role_dst.text = phone_cell.text.strip()
+            phone_at = email_cell.text
+            phone_cell.text = _normalize_sso_phone(phone_at)
+            cccd_cell = cols.get(cccd_col)
+            recovered = False
+            if cccd_cell and cccd_cell.text.strip():
+                digits, rest = _split_cccd_then_rest(cccd_cell.text)
+                low = cccd_cell.text.lower()
+                if digits and rest and _looks_emailish(rest):
+                    email_cell.text = (
+                        _format_sso_email(rest)
+                        if settings.ocr_sso_email_fixed_domain
+                        else _normalize_cell_text(
+                            rest, col=email_col, email_col=email_col
                         )
+                    )
+                    cccd_cell.text = _normalize_cccd_text(digits)
+                    recovered = True
+                elif "agribank" in low or "@" in low or _looks_emailish(cccd_cell.text):
+                    email_cell.text = (
+                        _format_sso_email(cccd_cell.text)
+                        if settings.ocr_sso_email_fixed_domain
+                        else _normalize_cell_text(
+                            cccd_cell.text, col=email_col, email_col=email_col
+                        )
+                    )
+                    # giữ lại CCCD nếu có cụm số 9/12 riêng
+                    only_digits = _digits_after_confusable(cccd_cell.text)
+                    if len(only_digits) in (9, 12) and not re.search(
+                        r"[a-zA-Z]{3,}", cccd_cell.text or ""
+                    ):
+                        cccd_cell.text = _normalize_cccd_text(only_digits)
+                    else:
+                        cccd_cell.text = ""
+                    recovered = True
+            if not recovered:
+                email_cell.text = ""
+
+        # CCCD + email sticky in CCCD column
+        cccd_cell = cols.get(cccd_col)
+        if cccd_cell and cccd_cell.text.strip():
+            digits, rest = _split_cccd_then_rest(cccd_cell.text)
+            if digits and _looks_emailish(rest):
+                email_dst = _ensure_cell(row, email_col, cccd_cell.confidence)
+                if not email_dst.text.strip():
+                    email_dst.text = (
+                        _format_sso_email(rest)
+                        if settings.ocr_sso_email_fixed_domain
+                        else _normalize_cell_text(
+                            rest, col=email_col, email_col=email_col
+                        )
+                    )
+                cccd_cell.text = _normalize_cccd_text(digits)
+            elif digits and _looks_phoneish(rest):
+                phone_dst = _ensure_cell(row, phone_col, cccd_cell.confidence)
+                if not phone_dst.text.strip():
+                    phone_dst.text = _digits_after_confusable(rest)
+                cccd_cell.text = _normalize_cccd_text(digits)
+
+        # CCCD + phone sticky in phone column (leading CCCD)
+        phone_cell = cols.get(phone_col)
+        if phone_cell and phone_cell.text.strip():
+            digits, rest = _split_cccd_then_rest(phone_cell.text)
+            if digits and len(digits) >= 11 and _looks_phoneish(rest):
+                cccd_dst = cols.get(cccd_col)
+                if not (cccd_dst and cccd_dst.text.strip()):
+                    target = _ensure_cell(row, cccd_col, phone_cell.confidence)
+                    target.text = _normalize_cccd_text(digits)
+                    phone_cell.text = _digits_after_confusable(rest)
+
+        # IPCAS + CCCD sticky in IPCAS column
+        ipcas_cell = cols.get(ipcas_col)
+        if ipcas_cell and ipcas_cell.text.strip():
+            compact = re.sub(r"\s", "", ipcas_cell.text)
+            conf = _ocr_digit_confusable_replace(compact)
+            m = re.match(
+                r"^([A-Za-z][A-Za-z0-9]{2,15})(\d{9,14})$",
+                conf,
+            )
+            if m:
+                ipcas_part, cccd_part = m.group(1), m.group(2)
+                if ipcas_part.upper().startswith("QSO") or re.fullmatch(
+                    r"[A-Za-z][A-Za-z0-9]{3,15}", ipcas_part
+                ):
+                    cccd_dst = cols.get(cccd_col)
+                    if not (cccd_dst and cccd_dst.text.strip()):
+                        target = _ensure_cell(row, cccd_col, ipcas_cell.confidence)
+                        target.text = _normalize_cccd_text(cccd_part)
+                        ipcas_cell.text = ipcas_part.upper()
+
+        # Normalize phone column digits / leading 0
+        phone_cell = cols.get(phone_col)
+        if phone_cell and phone_cell.text.strip() and not _looks_like_role_text(
+            phone_cell.text
+        ):
+            phone_cell.text = _normalize_sso_phone(phone_cell.text)
+
         cccd_cell = cols.get(cccd_col)
         if cccd_cell and cccd_cell.text.strip():
             cccd_cell.text = _normalize_cccd_text(cccd_cell.text)
 
     return cells
-
 
 def _sso_email_domain() -> str:
     """Domain email SSO (luôn có prefix @)."""
@@ -1686,7 +1935,7 @@ def _pick_field_candidate(
 
         def _branch_score(item: tuple[str, float]) -> tuple:
             text, conf = item
-            digits = _re.sub(r"\D", "", text)
+            digits = _digits_after_confusable(text)
             exact4 = 1 if _re.fullmatch(r"\d{4}", digits) else 0
             len_ok = 1 if _re.fullmatch(r"\d{3,5}", digits) else 0
             return (exact4, len_ok, conf)
@@ -1698,9 +1947,10 @@ def _pick_field_candidate(
 
         def _cccd_score(item: tuple[str, float]) -> tuple:
             text, conf = item
-            digits = _re.sub(r"\D", "", text)
-            exact12 = 1 if len(digits) == 12 else 0
-            return (exact12, min(len(digits), 12), conf)
+            digits = _digits_after_confusable(text)
+            exact_ok = 1 if len(digits) in (9, 12) else 0
+            near = 1 if len(digits) in (9, 10, 11, 12, 13) else 0
+            return (exact_ok, near, min(len(digits), 12), conf)
 
         return max(candidates, key=_cccd_score)
 
@@ -1709,9 +1959,10 @@ def _pick_field_candidate(
 
         def _phone_score(item: tuple[str, float]) -> tuple:
             text, conf = item
-            digits = _re.sub(r"\D", "", text)
+            digits = _digits_after_confusable(text)
             ok = 1 if _re.fullmatch(r"0\d{8,10}", digits) else 0
-            return (ok, conf)
+            exact10 = 1 if _re.fullmatch(r"0\d{9}", digits) else 0
+            return (ok, exact10, conf)
 
         return max(candidates, key=_phone_score)
 
@@ -1729,13 +1980,12 @@ def _pick_field_candidate(
 
     return max(candidates, key=lambda c: (c[1], len(c[0])))
 
-
 def _sso_cell_needs_pass2(
     text: str,
     kind: str,
     confidence: float | None = None,
 ) -> bool:
-    """Chỉ chạy pass-2 khi VietOCR sai rõ ràng hoặc confidence thấp."""
+    """Chi chay pass-2 khi VietOCR sai ro rang hoac confidence thap."""
     import re
 
     t = (text or "").strip()
@@ -1756,25 +2006,20 @@ def _sso_cell_needs_pass2(
             return True
         return bool(low_conf)
     if kind == "cccd":
-        digits = re.sub(r"\D", "", t)
-        if len(digits) < 9:
-            return True
-        if len(digits) != 12:
+        digits = _digits_after_confusable(t)
+        if len(digits) not in (9, 12):
             return True
         return bool(low_conf)
     if kind == "phone":
-        digits = re.sub(r"\D", "", t)
+        digits = _digits_after_confusable(t)
         if not re.fullmatch(r"0\d{8,10}", digits):
             return True
         return bool(low_conf)
     if kind == "branch":
-        digits = re.sub(r"\D", "", t)
-        if not re.fullmatch(r"\d{3,5}", digits):
+        digits = _digits_after_confusable(t)
+        if not re.fullmatch(r"\d{4}", digits):
             return True
-        # 4 chữ số vẫn có thể sai 1–2 số → pass-2 khi conf thấp
-        if len(digits) == 4:
-            return bool(low_conf)
-        return True
+        return bool(low_conf)
     if kind == "email":
         if "@" not in t or not _extract_sso_email_local(t):
             return True
@@ -1784,7 +2029,6 @@ def _sso_cell_needs_pass2(
     if kind == "role":
         return True
     return bool(low_conf)
-
 
 def _refine_sso_critical_columns(
     image: np.ndarray,
@@ -1817,7 +2061,7 @@ def _refine_sso_critical_columns(
     if role_col is not None:
         col_kind_map[role_col] = "role"
 
-    header_rows = {c.row for c in cells if c.row <= 1}
+    header_rows = _sso_header_row_ids(cells)
     out: list[CellData] = []
     for c in cells:
         if c.col not in critical or c.row in header_rows or not c.bbox or len(c.bbox) < 4:
@@ -1932,20 +2176,72 @@ def _email_from_first_line(lines: list[str]) -> tuple[str, str, bool]:
     return fallback, raw, False
 
 
+def _preprocess_sso_email_raw(text: str) -> str:
+    """Chuẩn hóa OCR email trước khi tách local: q/@, khoảng trắng, domain dính."""
+    import re
+
+    t = (text or "").strip()
+    if not t:
+        return ""
+    t = re.sub(r"(?i)ag\s*ri\s*bank", "agribank", t)
+    t = re.sub(r"(?i)agribank[\s.]*com[\s.\-]*v\s*n", "agribank.com.vn", t)
+    t = re.sub(r"(?i)agribank[\s.]*com[\s.\-]*vn", "agribank.com.vn", t)
+    t = re.sub(r"(?i)agribankcomvn", "agribank.com.vn", t)
+    # "local 00agribank" / "local 0 agribank" — xử lý trước để không nuốt nhầm 00
+    t = re.sub(r"(?i)\s+[0oO]{1,2}\s*(?=agribank)", "@", t)
+    # q/Q/(/O (không gồm digit 0) ngay sau ký tự local trước agribank = @
+    t = re.sub(r"(?i)([a-z0-9._+-])\s*[qQ(O]\s*(?=agribank)", r"\1@", t)
+    # ...q@agribank (q thừa khi @ đã có)
+    t = re.sub(r"(?i)([a-z0-9._+-])[qQ](@agribank)", r"\1\2", t)
+    t = re.sub(r"\s+", "", t)
+    return t
+
+
+def _strip_trailing_agribank_domain(local: str) -> str:
+    """Gỡ domain agribank dính vào local (tránh ...agribank...@agribank.com.vn)."""
+    import re
+
+    t = local or ""
+    for _ in range(4):
+        nxt = re.sub(r"(?i)@?agribank\.com\.vn.*$", "", t)
+        nxt = re.sub(r"(?i)@?agribank\.com[\-. ]*vn.*$", "", nxt)
+        nxt = re.sub(r"(?i)@?agribankcomvn.*$", "", nxt)
+        nxt = re.sub(r"(?i)ribank\.com\.vn.*$", "", nxt)
+        nxt = re.sub(r"(?i)gribank\.com\.vn.*$", "", nxt)
+        # local glued without separators: thuyhothithanhagribank...
+        nxt = re.sub(r"(?i)agribank.*$", "", nxt)
+        # OCR variants: wagr1bank / agr1bank / agrXbank(.com.vn) before final domain
+        nxt = re.sub(
+            r"(?i)w?agr[a-z0-9]{0,3}bank(?:\.com(?:[\-.]*vn)?)?.*$",
+            "",
+            nxt,
+        )
+        if nxt == t:
+            break
+        t = nxt
+    return t
+
+
 def _extract_sso_email_local(text: str) -> str:
     """Lấy phần username từ OCR (bỏ domain cố định @agribank.com.vn)."""
     import re
 
-    t = re.sub(r"\s+", "", text.strip().lower())
+    raw = (text or "").strip()
+    if not raw:
+        return ""
+    t = _preprocess_sso_email_raw(raw).lower()
     if not t:
         return ""
-    t = re.sub(r"@?agribank\.com\.?vn.*$", "", t, flags=re.IGNORECASE)
-    t = re.sub(r"ribank\.com\.vn.*$", "", t, flags=re.IGNORECASE)
+    t = _strip_trailing_agribank_domain(t)
     t = re.sub(r"(?:@ag)+$", "", t, flags=re.IGNORECASE)
     t = t.rstrip("@")
-    if len(t) > 4 and t.endswith("ag") and re.search(r"@ag|agribank|ribank", text, re.I):
+    if len(t) > 4 and t.endswith("ag") and re.search(r"@ag|agribank|ribank", raw, re.I):
         t = t[:-2]
-    return re.sub(r"[^a-z0-9._+-]", "", t)
+    t = _strip_trailing_agribank_domain(t)
+    t = re.sub(r"[^a-z0-9._+-]", "", t)
+    # Nhiễu OCR đầu local: "88thao...", "0hieu...", "3huong..."
+    t = re.sub(r"^[0-9._+-]+(?=[a-z])", "", t)
+    return t
 
 
 def _format_sso_email(text: str) -> str:
@@ -1964,8 +2260,11 @@ def _format_sso_email(text: str) -> str:
     local = _extract_sso_email_local(text)
     if not local:
         raw = " ".join((text or "").split()).strip()
-        if raw and re.search(r"[a-zA-Z0-9]", raw):
+        if raw and re.search(r"[a-zA-Z]", raw):
             return raw
+        return ""
+    # Local chỉ toàn số (OCR nhiễu từ ô cạnh) — không tạo email giả
+    if re.fullmatch(r"\d+", local):
         return ""
     return f"{local}{_sso_email_domain()}"
 
@@ -1980,7 +2279,7 @@ def _apply_fixed_email_domain(cells: list[CellData]) -> list[CellData]:
     if email_col is None:
         return cells
 
-    header_rows = {c.row for c in cells if c.row <= 1}
+    header_rows = _sso_header_row_ids(cells)
     out: list[CellData] = []
     for c in cells:
         if c.col == email_col and c.row not in header_rows and c.text.strip():
@@ -2096,23 +2395,22 @@ def _repair_agribank_email(text: str) -> str:
     """Chuẩn hóa email @agribank.com.vn sau OCR multi-line / lỗi @ag lặp."""
     import re
 
-    t = re.sub(r"\s+", "", text.strip())
-    if not t:
-        return text.strip()
-
-    t = re.sub(r"ribank\.com\.vn", "agribank.com.vn", t, flags=re.IGNORECASE)
-    dom = re.search(r"agribank\.com\.vn", t, flags=re.IGNORECASE)
+    raw = (text or "").strip()
+    if not raw:
+        return ""
+    local = _extract_sso_email_local(raw)
+    if local:
+        return f"{local}@agribank.com.vn"
+    t = _preprocess_sso_email_raw(raw)
+    t = re.sub(r"(?i)ribank\.com\.vn", "agribank.com.vn", t)
+    dom = re.search(r"(?i)agribank\.com\.vn", t)
     if not dom:
-        return " ".join(text.split())
-
-    local = t[: dom.start()]
-    local = re.sub(r"(?:@ag)+$", "", local, flags=re.IGNORECASE)
-    local = local.rstrip("@")
-    if len(local) > 4 and local.lower().endswith("ag"):
-        local = local[:-2]
+        return " ".join(raw.split())
+    local = _strip_trailing_agribank_domain(t[: dom.start()])
+    local = re.sub(r"(?:@ag)+$", "", local, flags=re.IGNORECASE).rstrip("@")
     local = re.sub(r"[^a-z0-9._+-]", "", local.lower())
     if not local:
-        return " ".join(text.split())
+        return " ".join(raw.split())
     return f"{local}@agribank.com.vn"
 
 
@@ -2134,11 +2432,176 @@ def _looks_like_email_content(text: str) -> bool:
     return False
 
 
+def _normalize_sso_unit(text: str) -> str:
+    """Lấy mã đơn vị 6–10 số đầu (bỏ bản sao OCR / cột Ghi chú)."""
+    import re
+
+    t = (text or "").strip()
+    if not t:
+        return ""
+    m = re.search(r"\d{6,10}", t)
+    if m:
+        return m.group(0)
+    digits = _digits_after_confusable(t)
+    if 6 <= len(digits) <= 10:
+        return digits
+    if len(digits) > 10:
+        return digits[:8]
+    return t
+
+
+def _normalize_sso_phone(text: str) -> str:
+    """Chuẩn hóa SĐT SSO: bỏ domain/stamp dính, thêm 0 đầu cho mobile VN 9 số."""
+    import re
+
+    t = (text or "").strip()
+    if not t:
+        return ""
+    # Domain email OCR nhầm vào cột SĐT
+    t = re.sub(r"(?i)@?agribank\.?com\.?vn.*$", "", t)
+    t = re.sub(r"(?i)@?agribankcomvn.*$", "", t)
+    t = re.sub(r"(?i)@.*$", "", t) if "@" in t else t
+    digits = _digits_after_confusable(t)
+    if not digits:
+        return " ".join((text or "").split())
+
+    def _as_mobile(d: str) -> str | None:
+        if re.fullmatch(r"0[35789]\d{8}", d):
+            return d
+        if re.fullmatch(r"[35789]\d{8}", d):
+            return "0" + d
+        return None
+
+    # Already a clean VN mobile
+    ok = _as_mobile(digits)
+    if ok:
+        return ok
+
+    # Long OCR glue: stamp prefix 0301/0310… + real phone (e.g. 0301…983851259)
+    if len(digits) > 11:
+        def _not_stamp(cand: str) -> bool:
+            return not (
+                cand.startswith("0301")
+                or cand.startswith("0310")
+                or cand.startswith("0300")
+            )
+
+        # Prefer rightmost non-stamp 0[35789]xxxxxxxxx
+        cands = [
+            m.group(0)
+            for m in re.finditer(r"0[35789]\d{8}", digits)
+            if _not_stamp(m.group(0))
+        ]
+        if cands:
+            return cands[-1]
+        # Rightmost 9-digit mobile without leading 0
+        cands9 = list(re.finditer(r"[35789]\d{8}", digits))
+        if cands9:
+            return "0" + cands9[-1].group(0)
+        tail = _as_mobile(digits[-9:])
+        if tail:
+            return tail
+
+    # 10 digits missing leading 0 (8495833333 → 0849583333)
+    if len(digits) == 10 and digits[0] in "35789":
+        cand = _as_mobile(digits[:9])
+        if cand:
+            return cand
+
+    # Mobile VN thiếu số 0 đầu (338250999 → 0338250999)
+    if len(digits) == 9 and digits[0] in "35789":
+        return "0" + digits
+    return digits
+
+
+def _normalize_sso_role_text(text: str) -> str:
+    """Chuẩn hóa OCR vai trò SSO → nhãn tiếng Việt chuẩn."""
+    import re
+    import unicodedata
+
+    t = " ".join((text or "").split())
+    if not t:
+        return ""
+
+    folded = t.lower().replace("đ", "d")
+    folded = unicodedata.normalize("NFD", folded)
+    folded = "".join(c for c in folded if unicodedata.category(c) != "Mn")
+    folded = re.sub(r"\s+", " ", folded).strip()
+
+    # Thứ tự: cụ thể trước (phê duyệt / kiểm soát / đại lý / kế toán)
+    patterns: list[tuple[str, str]] = [
+        (r"phe\s*duyet|duyet\s*vien", "Phê duyệt viên"),
+        (r"kiem\s*soat|kiem\s*soat\s*vien", "Kiểm soát viên"),
+        (r"dai\s*l[iy]|dai\s*ly\s*vien", "Đại lý viên"),
+        (
+            r"k[eêé]\s*toan|ke\s*toan|toan\s*vien|toan\s*vien|kt\s*vien",
+            "Kế toán viên",
+        ),
+    ]
+    for pat, canon in patterns:
+        if re.search(pat, folded):
+            return canon
+    return t
+
+
+def _looks_like_role_text(text: str) -> bool:
+    low = (text or "").strip().lower()
+    if not low:
+        return False
+    keys = (
+        "kế toán", "ke toan", "ké toan", "kê toán", "ke toán", "ké toán",
+        "toán viên", "toan vien", "toán viện", "toan vien",
+        "đại lý", "dai ly", "phân quyền",
+        "kiểm soát", "kiem soat", "phê duyệt", "phe duyet",
+        "vien", "viên", "viện",
+    )
+    return any(k in low for k in keys)
+
+
+def _looks_like_phone_at_domain(text: str) -> bool:
+    import re
+
+    t = (text or "").strip()
+    if not t:
+        return False
+    low = t.lower()
+    if "agribank" not in low and "@" not in low:
+        return False
+    digits = _digits_after_confusable(re.sub(r"(?i)@.*$", "", t) if "@" in t else t)
+    if not digits:
+        digits = _digits_after_confusable(t)
+    return bool(re.fullmatch(r"0?\d{8,11}", digits)) and (
+        "@" in low or "agribank" in low
+    )
+
+
+def _normalize_sso_ipcas(text: str) -> str:
+    """Extract IPCAS token; drop stamp digits like 031000000002 glued by OCR."""
+    import re
+
+    t = " ".join((text or "").split())
+    if not t:
+        return ""
+    compact = re.sub(r"\s", "", t.upper())
+    if re.fullmatch(r"[A-Z][A-Z0-9]{3,15}", compact):
+        return compact
+    # Prefer alphabetic IPCAS tokens over digit stamps
+    tokens = re.findall(r"[A-Z][A-Z0-9]{3,15}", compact)
+    letters = [tok for tok in tokens if any(c.isalpha() for c in tok[1:])]
+    if letters:
+        # Prefer tokens with more letters (SDANOANH over 03100000000201)
+        letters.sort(key=lambda tok: (sum(c.isalpha() for c in tok), len(tok)), reverse=True)
+        return letters[0]
+    return t
+
+
 def _normalize_cell_text(
     text: str,
     *,
     col: int | None = None,
     email_col: int | None = None,
+    phone_col: int | None = None,
+    role_col: int | None = None,
 ) -> str:
     """Clean common OCR artefacts (@/&/. misreads, Agribank email domain)."""
     import re
@@ -2147,7 +2610,30 @@ def _normalize_cell_text(
     is_email_col = (
         email_col is not None and col is not None and col == email_col
     )
+    is_phone_col = (
+        phone_col is not None and col is not None and col == phone_col
+    )
+    is_role_col = (
+        role_col is not None and col is not None and col == role_col
+    )
     email_like = _looks_like_email_content(t)
+
+    if is_phone_col:
+        return _normalize_sso_phone(t)
+
+    if is_role_col:
+        return _normalize_sso_role_text(t)
+
+    # SSO 10-col: User IPCAS at col 4
+    if col == 4 and not is_email_col:
+        return _normalize_sso_ipcas(t)
+
+    # Họ tên: bỏ stamp/unit digits dính cuối (vd. "Ngô Hông Hoa 030100000000020")
+    if col == 1 and not is_email_col:
+        t = re.sub(r"\s+\d{6,}\s*$", "", t).strip()
+        if settings.ocr_sso_enhance:
+            t = _strip_leading_english_hallucination(t)
+        return t
 
     if is_email_col or (email_col is None and email_like):
         if settings.ocr_sso_email_fixed_domain and (is_email_col or email_like):
@@ -2983,12 +3469,105 @@ def _sso_data_column_count(col_lines: list[int]) -> int:
     return max(0, len(col_lines) - 1)
 
 
+def _SSO_TEMPLATE_COL_RATIOS() -> list[float]:
+    """Tỷ lệ bề rộng tương đối 10 cột form SSO (tổng ~1.0)."""
+    # STT, Họ tên, Mã CN, Tên CN, IPCAS, CCCD, Email, SĐT, Role, Mã liên NH
+    return [0.04, 0.14, 0.055, 0.14, 0.09, 0.11, 0.14, 0.09, 0.11, 0.085]
+
+
+def _fit_col_lines_from_template_ratios(
+    left: int,
+    right: int,
+    ratios: list[float],
+    detected: list[int] | None = None,
+    snap_pct: float = 0.015,
+) -> list[int]:
+    """
+    Sinh (target_cols+1) đường dọc theo tỷ lệ template, rồi snap về đường kẻ thật gần nhất.
+    """
+    width = max(1, right - left)
+    total = sum(ratios) or 1.0
+    acc = 0.0
+    ideal = [left]
+    for r in ratios:
+        acc += r / total
+        ideal.append(left + int(round(acc * width)))
+    ideal[-1] = right
+    if not detected or len(detected) < 2:
+        return ideal
+    snap_tol = max(4, int(width * snap_pct))
+    snapped: list[int] = []
+    for x in ideal:
+        nearest = min(detected, key=lambda d: abs(d - x))
+        snapped.append(nearest if abs(nearest - x) <= snap_tol else x)
+    # Đảm bảo tăng dần, không trùng
+    out = [snapped[0]]
+    for x in snapped[1:]:
+        if x <= out[-1]:
+            x = out[-1] + max(4, width // 40)
+        out.append(x)
+    out[-1] = max(out[-1], right)
+    return out
+
+
+def _score_col_lines_vs_ratios(col_lines: list[int], ratios: list[float]) -> float:
+    """Higher is better: how well column widths match expected SSO ratios."""
+    if len(col_lines) < 2 or not ratios:
+        return -1.0
+    widths = [col_lines[i + 1] - col_lines[i] for i in range(len(col_lines) - 1)]
+    if len(widths) != len(ratios):
+        return -1.0
+    total = float(sum(widths)) or 1.0
+    rtotal = float(sum(ratios)) or 1.0
+    # Negative L1 distance between normalized widths and ratios
+    err = sum(abs(w / total - r / rtotal) for w, r in zip(widths, ratios))
+    return 1.0 - err
+
+
 def _adjust_col_lines_to_target(
     col_lines: list[int], target_cols: int
 ) -> list[int]:
-    """Chèn/gộp đường kẻ dọc để lưới có đúng target_cols cột."""
+    """Fit đường kẻ dọc SSO về đúng số cột — ưu tiên bỏ đường kẻ giả trước khi template-snap."""
     if len(col_lines) < 2 or target_cols < 1:
         return col_lines
+
+    n = _sso_data_column_count(col_lines)
+    ratios = _SSO_TEMPLATE_COL_RATIOS() if target_cols == 10 else None
+
+    # Exactly one extra vertical line (common: false line near right edge / unit col).
+    # Dropping the right internal line preserves real IPCAS/CCCD/email boundaries;
+    # blind template-snap from left/right often shifts mid columns and merges fields.
+    if n == target_cols + 1 and n >= 3:
+        best: list[int] | None = None
+        best_score = -1.0
+        for drop_i in range(1, len(col_lines) - 1):
+            cand = [col_lines[i] for i in range(len(col_lines)) if i != drop_i]
+            if ratios is not None:
+                score = _score_col_lines_vs_ratios(cand, ratios)
+            else:
+                # Prefer dropping the line that removes the narrowest column
+                left_w = col_lines[drop_i] - col_lines[drop_i - 1]
+                right_w = col_lines[drop_i + 1] - col_lines[drop_i]
+                score = 1.0 / (1.0 + min(left_w, right_w))
+            if score > best_score:
+                best_score = score
+                best = cand
+        if best is not None and (
+            ratios is None or best_score >= 0.55 or best_score > _score_col_lines_vs_ratios(
+                _fit_col_lines_from_template_ratios(
+                    col_lines[0], col_lines[-1], ratios, detected=col_lines
+                ),
+                ratios,
+            )
+        ):
+            return best
+
+    if target_cols == 10 and ratios is not None:
+        return _fit_col_lines_from_template_ratios(
+            col_lines[0], col_lines[-1], ratios, detected=col_lines
+        )
+
+    # Fallback cũ cho số cột khác 10
     lines = list(col_lines)
     while _sso_data_column_count(lines) < target_cols:
         best_i, best_gap = 0, 0
@@ -3007,9 +3586,10 @@ def _adjust_col_lines_to_target(
             if gap < best_gap:
                 best_gap = gap
                 best_i = i
+        if best_gap == float("inf"):
+            break
         lines.pop(best_i + 1)
     return lines
-
 
 def _detect_sso_grid_for_crop(
     image: np.ndarray, *, prefer_cols: int = 10
@@ -3017,18 +3597,23 @@ def _detect_sso_grid_for_crop(
     """
     Thử nhiều tham số phát hiện lưới; chọn lưới gần prefer_cols cột nhất.
 
-    Mẫu 10 cột có ô hẹp — col_min_gap lớn (35px) hay gộp nhầm 2 cột thành 1.
+    col_min_gap thích ứng theo bề rộng ảnh (bảng/12) để không gộp cột hẹp ở DPI cao.
     """
+    w = int(image.shape[1]) if image is not None and image.size else 1000
+    adaptive_gap = max(12, min(28, w // 12 // 4))
     best: tuple[list[int], list[int]] | None = None
     best_dist = 999
     attempts = [
-        (6, 11, 18),
-        (6, 10, 20),
-        (6, 10, 22),
-        (6, 9, 22),
-        (6, 8, 28),
-        (8, 6, 35),
-        (5, 4, 22),
+        (6, 11, max(12, adaptive_gap - 4)),
+        (6, 10, adaptive_gap),
+        (6, 10, adaptive_gap + 2),
+        (6, 9, adaptive_gap + 2),
+        (6, 8, adaptive_gap + 6),
+        (8, 6, adaptive_gap + 10),
+        (5, 4, adaptive_gap + 2),
+        # Short last page (~4 data rows -> 5 horizontal boundaries)
+        (4, 9, adaptive_gap),
+        (4, 8, adaptive_gap + 2),
     ]
     for min_rows, min_col_lines, col_min_gap in attempts:
         grid = _detect_grid_line_positions(
@@ -3050,9 +3635,10 @@ def _detect_sso_grid_for_crop(
     if _sso_data_column_count(col_lines) != prefer_cols:
         col_lines = _adjust_col_lines_to_target(col_lines, prefer_cols)
         logger.info(
-            "SSO grid adjusted to %d columns (was %d)",
+            "SSO grid snapped to %d columns (detected %d, gap~%d)",
             prefer_cols,
             _sso_data_column_count(best[1]),
+            adaptive_gap,
         )
     return row_lines, col_lines
 
@@ -3206,20 +3792,39 @@ def _find_best_sso_table_region(
     *,
     prefer_cols: int = 10,
     already_deskewed: bool = False,
-) -> tuple[int, list[int], list[int]] | None:
+) -> tuple[int, int, list[int], list[int]] | None:
     """
     Tìm vùng bảng SSO khi không có dòng tiêu đề (trang tiếp theo).
 
-    Quét nhiều mức crop từ trên xuống, chọn lưới 10 cột có nhiều hàng nhất.
+    Quét nhiều cửa sổ crop; trả về (top, bottom, row_lines, col_lines)
+    với toạ độ đường kẻ tương đối trong crop image[top:bottom].
     """
     h = image.shape[0]
-    best: tuple[int, list[int], list[int]] | None = None
+    best: tuple[int, int, list[int], list[int]] | None = None
     best_score = -1
-    for top_pct in (0.08, 0.10, 0.12, 0.15, 0.18, 0.22, 0.26, 0.30):
+    # (top_pct, bottom_pct=None means to image bottom)
+    windows: list[tuple[float, float | None]] = [
+        (0.08, None),
+        (0.10, None),
+        (0.12, None),
+        (0.15, None),
+        (0.18, None),
+        (0.22, None),
+        (0.26, None),
+        (0.30, None),
+        # Short last-page tables: keep only the top band so vertical
+        # morphology is not dominated by signature/seal noise below.
+        (0.0, 0.22),
+        (0.0, 0.28),
+        (0.0, 0.35),
+        (0.05, 0.30),
+    ]
+    for top_pct, bottom_pct in windows:
         top = int(h * top_pct)
-        if top >= h - 200:
+        bottom = int(h * bottom_pct) if bottom_pct is not None else h
+        if bottom - top < 180:
             continue
-        crop = image[top:, :]
+        crop = image[top:bottom, :]
         if settings.ocr_sso_enhance and not already_deskewed:
             crop = deskew_image(crop)
         grid = _detect_sso_grid_for_crop(crop, prefer_cols=prefer_cols)
@@ -3228,12 +3833,15 @@ def _find_best_sso_table_region(
         row_lines, col_lines = grid
         nrows = len(row_lines) - 1
         ncols = _sso_data_column_count(col_lines)
-        if nrows < 4 or ncols < 9:
+        if nrows < 3 or ncols < 9:
             continue
         score = nrows * 20 + (12 - abs(ncols - prefer_cols))
+        # Prefer fuller pages slightly, but accept short top-band hits
+        if bottom_pct is not None:
+            score += 5
         if score > best_score:
             best_score = score
-            best = (top, row_lines, col_lines)
+            best = (top, bottom, row_lines, col_lines)
     return best
 
 
@@ -3256,6 +3864,85 @@ def _find_table_top_y(
     return best_y
 
 
+def _prepare_sso_grid_draft_opencv(
+    image: np.ndarray,
+    page_number: int,
+    *,
+    already_deskewed: bool = False,
+    prefer_cols: int = 10,
+) -> SsoGridDraft | None:
+    """
+    OpenCV-only SSO grid draft — no Paddle line detection / OneDNN.
+
+    Uses multi-crop scan via `_find_best_sso_table_region`, then falls back to
+    fixed crops. Last-page short tables need a *top band* crop: full-page
+    vertical morphology (tall kernel) erases short ruling lines above the
+    signature block.
+    """
+    def _maybe_deskew(crop: np.ndarray) -> np.ndarray:
+        if settings.ocr_sso_enhance and not already_deskewed:
+            return deskew_image(crop)
+        return crop
+
+    def _try_crop(crop: np.ndarray, table_top: int) -> SsoGridDraft | None:
+        crop = _maybe_deskew(crop)
+        grid = _detect_sso_grid_for_crop(crop, prefer_cols=prefer_cols)
+        if grid is None and settings.ocr_sso_grid_relax:
+            grid = _detect_grid_line_positions(
+                crop, min_rows=4, min_cols=8, col_min_gap=22
+            )
+        if grid is None:
+            return None
+        row_lines, col_lines = grid
+        if len(row_lines) - 1 < 3:
+            return None
+        return SsoGridDraft(
+            page_number=page_number,
+            crop=crop,
+            row_lines=row_lines,
+            col_lines=col_lines,
+            table_top=table_top,
+        )
+
+    region = _find_best_sso_table_region(
+        image, prefer_cols=prefer_cols, already_deskewed=already_deskewed
+    )
+    if region is not None:
+        table_top, table_bottom, row_lines, col_lines = region
+        crop = _maybe_deskew(image[table_top:table_bottom, :])
+        if settings.ocr_sso_enhance and not already_deskewed:
+            grid2 = _detect_sso_grid_for_crop(crop, prefer_cols=prefer_cols)
+            if grid2 is not None:
+                row_lines, col_lines = grid2
+        return SsoGridDraft(
+            page_number=page_number,
+            crop=crop,
+            row_lines=row_lines,
+            col_lines=col_lines,
+            table_top=table_top,
+        )
+
+    h = image.shape[0]
+    # Top-band crops first (short last page: 4 data rows + footer below)
+    for bottom_pct in (0.22, 0.28, 0.32, 0.38, 0.45):
+        bottom = int(h * bottom_pct)
+        if bottom < 180:
+            continue
+        draft = _try_crop(image[:bottom, :], table_top=0)
+        if draft is not None:
+            return draft
+
+    # Fixed top crops (page-1 header ~10–18%, continuation ~8–15%)
+    for top_pct in (0.10, 0.12, 0.15, 0.18, 0.08, 0.22):
+        table_top = int(h * top_pct)
+        if table_top >= h - 200:
+            continue
+        draft = _try_crop(image[table_top:, :], table_top=table_top)
+        if draft is not None:
+            return draft
+    return None
+
+
 def _prepare_sso_grid_draft(
     image: np.ndarray,
     page_number: int,
@@ -3265,7 +3952,10 @@ def _prepare_sso_grid_draft(
     """GPU detect + OpenCV grid — no VietOCR cell batch yet."""
     line_boxes = _detect_lines_in_region(image)
     if not line_boxes:
-        return None
+        # OneDNN/Paddle det broken — fall back to OpenCV ruling-line scan
+        return _prepare_sso_grid_draft_opencv(
+            image, page_number, already_deskewed=already_deskewed
+        )
 
     rows = _cluster_line_boxes_into_rows(line_boxes)
     header_y = _find_table_top_y(image, rows)
@@ -3310,8 +4000,8 @@ def _prepare_sso_grid_draft(
                 col_lines=col_lines,
                 table_top=table_top,
             )
-        table_top, row_lines, col_lines = region
-        crop = _maybe_deskew(image[table_top:, :])
+        table_top, table_bottom, row_lines, col_lines = region
+        crop = _maybe_deskew(image[table_top:table_bottom, :])
         # After optional deskew, re-detect grid on the crop used for OCR
         if settings.ocr_sso_enhance and not already_deskewed:
             grid2 = _detect_sso_grid_for_crop(crop, prefer_cols=prefer_cols)
@@ -3338,14 +4028,20 @@ def _prepare_sso_grid_draft(
     )
 
 
-def _recognize_sso_grid_draft(draft: SsoGridDraft) -> TableData | None:
+def _recognize_sso_grid_draft(
+    draft: SsoGridDraft,
+    *,
+    branch_map: dict[str, str] | None = None,
+) -> TableData | None:
     """VietOCR batch on pre-detected grid (CPU-heavy, runs overlapped with next page GPU)."""
     cells = _ocr_table_grid(draft.crop, draft.row_lines, draft.col_lines)
-    if len(cells) < 20:
+    # Last SSO page may have only ~4 data rows (+ footer noise) → allow fewer cells
+    min_cells = 8 if len(draft.row_lines) <= 8 else 20
+    if len(cells) < min_cells:
         return None
 
     cells = _offset_cells_bbox(cells, dy=draft.table_top, dx=0)
-    cells = _postprocess_sso_cells(cells)
+    cells = _postprocess_sso_cells(cells, branch_map=branch_map)
     if not cells:
         return None
 
@@ -3365,6 +4061,7 @@ def _recognize_sso_grid_draft(draft: SsoGridDraft) -> TableData | None:
         cells=cells,
         html="",
         table_kind="sso_agribank",
+        warnings=consume_sso_postprocess_warnings(),
     )
 
 
@@ -3398,6 +4095,7 @@ def build_page_result_from_table(
         image_path=str(image_path),
         tables=[table],
         raw_text="",
+        warnings=list(getattr(table, "warnings", None) or []),
     )
 
 
@@ -3540,48 +4238,133 @@ def _is_gibberish_text(text: str) -> bool:
     return False
 
 
-def _is_valid_data_row(cols: dict[int, CellData]) -> bool:
-    """Keep rows with numeric STT or enough real Vietnamese content."""
-    import re
-
-    c0 = cols.get(0)
-    stt = (c0.text.strip() if c0 else "") or ""
-    if re.match(r"^\d{1,3}$", stt):
+def _is_sso_footer_garbage_row(cols: dict[int, CellData]) -> bool:
+    """Reject signature / contact footer rows on last SSO page."""
+    joined = " ".join(c.text for c in cols.values() if c.text and c.text.strip())
+    low = joined.lower()
+    markers = (
+        "yêu cầu khác",
+        "yeu cau khac",
+        "người liên hệ",
+        "nguoi lien he",
+        "lập phiếu",
+        "lap phieu",
+        "kiểm soát",
+        "kiem soat",
+        "thủ trưởng",
+        "thu truong",
+        "phó giám đốc",
+        "pho giam doc",
+        "ký, ghi",
+        "ky, ghi",
+        "ký ghi",
+        "đóng dấu",
+        "dong dau",
+        "ngân hàng nông",
+        "nong nghiep va phat trien",
+    )
+    if any(m in low for m in markers):
         return True
+    # Signature block often splits "LẬP" / "PHIẾU" across cells
+    compact = _normalize_match_text(joined)
+    return any(
+        token in compact
+        for token in ("yeucaukhac", "nguoilienhe", "lapphieu", "kiemsoat", "thutruong")
+    )
+
+
+def _is_valid_data_row(cols: dict[int, CellData]) -> bool:
+    """Keep rows with enough SSO field signals; drop garbage OCR rows."""
+    import re
 
     texts = [c.text.strip() for c in cols.values() if c.text.strip()]
     if not texts:
         return False
 
-    name_cell = cols.get(1)
-    name = (name_cell.text.strip() if name_cell else "") or ""
-    ipcas = (cols.get(4).text if cols.get(4) else "").strip().upper()
-    if name and len(name) < 6 and ipcas and not ipcas.startswith("QSO"):
+    if _is_sso_footer_garbage_row(cols):
         return False
-    if name and not name.isascii() and len(name) >= 3:
-        cccd_raw = (cols.get(5).text if cols.get(5) else "").strip()
-        email_raw = (cols.get(6).text if cols.get(6) else "").strip()
-        if re.sub(r"\D", "", cccd_raw) and len(re.sub(r"\D", "", cccd_raw)) >= 9:
-            return True
-        if ipcas and ipcas.startswith("QSO"):
-            return True
-        if "@" in email_raw or "agribank" in email_raw.lower():
-            return True
+
+    joined_norm = _normalize_match_text(" ".join(texts))
+    header_hits = sum(
+        1
+        for k in (
+            "hovaten",
+            "hoten",
+            "machinh",
+            "tenchinhanh",
+            "phanquyen",
+            "useripcas",
+            "socccd",
+        )
+        if k in joined_norm
+    )
+    # Page-1 annotation/header band OCR'd as a fake data row
+    if header_hits >= 2:
+        return False
 
     gib = sum(1 for t in texts if _is_gibberish_text(t))
     if gib >= max(2, len(texts) // 2):
         return False
-    # At least one cell with Vietnamese diacritics or email/cccd pattern
-    for t in texts:
-        if "@" in t or re.search(r"\d{9,12}", t):
-            return True
-        if any("\u0300" <= ch <= "\u036f" or ord(ch) > 127 for ch in t):
-            return True
-    return gib == 0 and len(texts) >= 2
 
+    c0 = cols.get(0)
+    stt = (c0.text.strip() if c0 else "") or ""
+    stt_ok = bool(re.match(r"^\d{1,3}$", stt))
+    # Stamp/noise glued into STT (e.g. "0301000000039 56")
+    stt_digits = re.sub(r"\D", "", stt)
+    if stt and not stt_ok and (len(stt_digits) > 3 or stt_digits.startswith("030")):
+        return False
+
+    name_cell = cols.get(1)
+    name = (name_cell.text.strip() if name_cell else "") or ""
+    name_norm = _normalize_match_text(name)
+    if any(k in name_norm for k in ("hovaten", "hoten", "machinh", "tenchinhanh")):
+        return False
+    name_ok = bool(
+        name
+        and len(name) >= 3
+        and any(ord(ch) > 127 or ("\u0300" <= ch <= "\u036f") for ch in name)
+    )
+
+    ipcas_raw = ""
+    for icol in (3, 4):
+        cell = cols.get(icol)
+        if cell and cell.text.strip():
+            ipcas_raw = cell.text.strip()
+            compact = re.sub(r"\s", "", ipcas_raw.upper())
+            if re.fullmatch(r"[A-Z][A-Z0-9]{3,15}", compact) and (
+                compact.startswith("QSO") or len(compact) >= 4
+            ):
+                ipcas_ok = True
+                break
+    else:
+        ipcas_ok = False
+
+    cccd_ok = False
+    for ccol in (4, 5):
+        cell = cols.get(ccol)
+        if not cell:
+            continue
+        digits = _digits_after_confusable(cell.text)
+        if len(digits) >= 9:
+            cccd_ok = True
+            break
+
+    signals = sum([stt_ok, name_ok, ipcas_ok, cccd_ok])
+    if signals >= 2:
+        return True
+
+    if signals == 1 and stt_ok:
+        email_like = any("@" in t or "agribank" in t.lower() for t in texts)
+        phone_like = any(
+            re.fullmatch(r"0\d{8,10}", _digits_after_confusable(t)) for t in texts
+        )
+        if email_like or phone_like or name_ok:
+            return True
+
+    return False
 
 def _enforce_sso_target_columns(cells: list[CellData]) -> list[CellData]:
-    """Trim SSO grid về đúng số cột layout (9 mẫu cũ / 10 mẫu mới)."""
+    """Trim SSO grid về đúng số cột layout — chỉ bỏ cột thừa gần như trống."""
     if not cells:
         return cells
     max_col = max(c.col for c in cells)
@@ -3589,8 +4372,17 @@ def _enforce_sso_target_columns(cells: list[CellData]) -> list[CellData]:
     if max_col + 1 == target_cols:
         return cells
     if max_col + 1 > target_cols:
+        # Chỉ trim cột thừa nếu gần như không có dữ liệu
+        extras = [c for c in cells if c.col >= target_cols and (c.text or "").strip()]
+        if extras:
+            logger.warning(
+                "SSO table has %d columns (expected %d) but extra cols have data — keep",
+                max_col + 1,
+                target_cols,
+            )
+            return cells
         logger.warning(
-            "SSO table has %d columns — trimming to %d",
+            "SSO table has %d columns — trimming empty extras to %d",
             max_col + 1,
             target_cols,
         )
@@ -3603,19 +4395,450 @@ def _enforce_sso_target_columns(cells: list[CellData]) -> list[CellData]:
     return cells
 
 
-def _postprocess_sso_cells(cells: list[CellData]) -> list[CellData]:
-    """Chuẩn hóa lưới SSO: bỏ dòng rác, tách STT, sửa cột email/CCCD."""
+def _score_sso_field_text(field: str, text: str) -> float:
+    """Score how well cell text matches an expected SSO field (0..1)."""
+    import re
+
+    t = (text or "").strip()
+    if not t:
+        return 0.0
+    if _is_gibberish_text(t) or _is_hallucinated_ocr_line(t):
+        return 0.0
+
+    if field == "stt":
+        return 1.0 if re.fullmatch(r"\d{1,3}", t) else 0.0
+    if field == "name":
+        if len(t) < 3:
+            return 0.0
+        if any(ord(ch) > 127 for ch in t):
+            return 0.9
+        if re.search(r"[A-Za-z]{2,}", t) and not re.search(r"\d{6,}", t):
+            return 0.45
+        return 0.1
+    if field == "branch_code":
+        d = _digits_after_confusable(t)
+        if re.fullmatch(r"\d{4}", d):
+            return 1.0
+        if re.fullmatch(r"\d{3,5}", d):
+            return 0.5
+        return 0.0
+    if field == "branch_name":
+        compact = re.sub(r"\s", "", t.upper())
+        # IPCAS-looking token không phải tên chi nhánh
+        if re.fullmatch(r"[A-Z][A-Z0-9]{3,15}", compact) and not any(
+            ord(ch) > 127 for ch in t
+        ):
+            return 0.0
+        if any(ord(ch) > 127 for ch in t) and len(t) >= 3:
+            return 0.8
+        if re.search(r"[A-Za-z]{3,}", t) and not re.fullmatch(r"[A-Z0-9]{4,16}", t):
+            return 0.4
+        return 0.05
+    if field == "ipcas_code":
+        compact = re.sub(r"\s", "", t.upper())
+        if compact.startswith("QSO") and re.fullmatch(r"[A-Z][A-Z0-9]{3,15}", compact):
+            return 1.0
+        if re.fullmatch(r"[A-Z][A-Z0-9]{3,15}", compact):
+            return 0.55
+        return 0.0
+    if field == "cccd":
+        d = _digits_after_confusable(t)
+        if len(d) in (9, 12):
+            return 1.0
+        if 9 <= len(d) <= 12:
+            return 0.55
+        return 0.0
+    if field == "email":
+        low = t.lower()
+        if "@" in low and "agribank" in low:
+            return 1.0
+        if "@" in low or "agribank" in low:
+            return 0.7
+        if re.search(r"[a-z]{3,}", low):
+            return 0.25
+        return 0.0
+    if field == "phone":
+        stripped = re.sub(r"(?i)@?agribank.*$", "", t)
+        d = _digits_after_confusable(stripped) or _digits_after_confusable(t)
+        if re.fullmatch(r"0\d{9}", d):
+            return 1.0
+        if re.fullmatch(r"[35789]\d{8}", d):
+            return 0.85
+        if re.fullmatch(r"0\d{8,10}", d):
+            return 0.75
+        if ("@" in t.lower() or "agribank" in t.lower()) and len(d) >= 8:
+            return 0.7
+        return 0.0
+    if field == "role":
+        low = t.lower()
+        if any(
+            k in low
+            for k in (
+                "kế toán", "ke toan", "ké toan", "kê toán",
+                "vien", "viên", "quyen", "role", "dai ly", "đại lý",
+            )
+        ):
+            return 0.9
+        return 0.2 if len(t) >= 3 else 0.0
+    if field == "unit_code":
+        d = _digits_after_confusable(t)
+        if re.fullmatch(r"\d{6,10}", d):
+            return 0.9
+        if re.fullmatch(r"\d{4,12}", d):
+            return 0.4
+        return 0.0
+    if field == "department_name":
+        if any(ord(ch) > 127 for ch in t) and len(t) >= 3:
+            return 0.7
+        return 0.2 if len(t) >= 3 else 0.0
+    return 0.0
+
+
+def _sso_field_order(num_cols: int) -> list[str]:
+    """Field order matching user_mapping SSO layouts (includes STT at col 0)."""
+    if num_cols >= 10:
+        return [
+            "stt",
+            "name",
+            "branch_code",
+            "branch_name",
+            "ipcas_code",
+            "cccd",
+            "email",
+            "phone",
+            "role",
+            "unit_code",
+        ]
+    return [
+        "stt",
+        "name",
+        "department_name",
+        "ipcas_code",
+        "cccd",
+        "email",
+        "phone",
+        "role",
+        "unit_code",
+    ]
+
+
+def _row_matches_left_shift_from_branch(cols: dict[int, CellData]) -> bool:
+    """Mẫu lệch trái từ branch_name: col3=IPCAS, col4=CCCD, col6=phone@, col7=role."""
+    import re
+
+    def _txt(i: int) -> str:
+        cell = cols.get(i)
+        return (cell.text.strip() if cell else "") or ""
+
+    c3 = re.sub(r"\s", "", _txt(3).upper())
+    c4_digits = _digits_after_confusable(_txt(4))
+    c6 = _txt(6)
+    c7 = _txt(7)
+
+    ipcas_ok = bool(re.fullmatch(r"[A-Z][A-Z0-9]{3,15}", c3))
+    cccd_ok = len(c4_digits) in (9, 12) or 9 <= len(c4_digits) <= 12
+    phone_at_ok = _looks_like_phone_at_domain(c6)
+    role_ok = _looks_like_role_text(c7)
+    return sum([ipcas_ok, cccd_ok, phone_at_ok, role_ok]) >= 3
+
+
+def _apply_partial_column_shift(
+    cells: list[CellData],
+    *,
+    from_col: int,
+    shift: int,
+    num_fields: int,
+    header_rows: set[int] | None = None,
+) -> list[CellData]:
+    """Dịch nội dung từ from_col trở đi; giữ nguyên các cột trước đó."""
+    headers = header_rows if header_rows is not None else _sso_header_row_ids(cells)
+    remapped: list[CellData] = []
+    for c in cells:
+        if c.row in headers:
+            remapped.append(c)
+            continue
+        if c.col < from_col:
+            remapped.append(c)
+            continue
+        new_col = c.col + shift
+        if new_col < 0 or new_col >= num_fields:
+            continue
+        remapped.append(
+            CellData(
+                row=c.row,
+                col=new_col,
+                text=c.text,
+                confidence=c.confidence,
+                bbox=c.bbox,
+            )
+        )
+    return remapped
+
+
+def _detect_and_fix_sso_column_shift(
+    cells: list[CellData],
+) -> tuple[list[CellData], list[str]]:
+    """Detect systematic column shift on data rows and remap when confident."""
+    from collections import defaultdict
+
+    warnings: list[str] = []
+    if not cells:
+        return cells, warnings
+
+    max_col = max(c.col for c in cells)
+    num_cols = _sso_layout_col_count(cells, max_col + 1)
+    fields = _sso_field_order(num_cols)
+    if len(fields) < 6:
+        return cells, warnings
+
+    by_row: dict[int, dict[int, CellData]] = defaultdict(dict)
+    for c in cells:
+        by_row[c.row][c.col] = c
+
+    header_rows = _sso_header_row_ids(cells)
+    data_rows = [r for r in sorted(by_row) if r not in header_rows]
+    if len(data_rows) < 2:
+        return cells, warnings
+
+    # Pattern A: mất branch_name → IPCAS/CCCD/email/phone dịch trái 1 cột
+    if num_cols >= 10:
+        pattern_hits = sum(
+            1 for r in data_rows if _row_matches_left_shift_from_branch(by_row[r])
+        )
+        need = max(2, (len(data_rows) + 1) // 2)
+        if pattern_hits >= need:
+            remapped = _apply_partial_column_shift(
+                cells,
+                from_col=3,
+                shift=1,
+                num_fields=len(fields),
+                header_rows=header_rows,
+            )
+            warnings.append(
+                f"Phát hiện lệch cột SSO từ Tên chi nhánh (pattern {pattern_hits}/"
+                f"{len(data_rows)} dòng); đã dịch phải 1 cột để khôi phục IPCAS/CCCD/email/SĐT."
+            )
+            return remapped, warnings
+
+    def _score_shift(shift: int) -> float:
+        total = 0.0
+        weighed = 0.0
+        for row in data_rows:
+            cols = by_row[row]
+            for col, field in enumerate(fields):
+                src = col - shift
+                cell = cols.get(src)
+                text = cell.text.strip() if cell else ""
+                if not text:
+                    continue
+                w = 1.5 if field in ("cccd", "email", "ipcas_code", "phone", "stt") else 1.0
+                # Boost khi phone@domain khớp cột phone sau shift +1
+                if field == "phone" and _looks_like_phone_at_domain(text):
+                    w = 2.0
+                if field == "role" and _looks_like_role_text(text):
+                    w = 1.8
+                if field == "ipcas_code":
+                    compact = __import__("re").sub(r"\s", "", text.upper())
+                    if __import__("re").fullmatch(r"[A-Z][A-Z0-9]{3,15}", compact):
+                        w = 1.8
+                total += w * _score_sso_field_text(field, text)
+                weighed += w
+        return total / weighed if weighed else 0.0
+
+    baseline = _score_shift(0)
+    best_shift = 0
+    best_score = baseline
+    for shift in (-2, -1, 1, 2):
+        sc = _score_shift(shift)
+        if sc > best_score:
+            best_score = sc
+            best_shift = shift
+
+    # Ngưỡng thấp hơn khi shift=+1 và có tín hiệu phone@ + role
+    threshold = 0.12
+    if best_shift == 1:
+        phone_role_hits = 0
+        for row in data_rows:
+            cols = by_row[row]
+            e = cols.get(6)
+            p = cols.get(7)
+            if e and _looks_like_phone_at_domain(e.text) and p and _looks_like_role_text(p.text):
+                phone_role_hits += 1
+        if phone_role_hits >= max(2, len(data_rows) // 3):
+            threshold = 0.04
+
+    if best_shift == 0 or best_score <= baseline + threshold:
+        return cells, warnings
+
+    remapped = []
+    for c in cells:
+        if c.row in header_rows:
+            remapped.append(c)
+            continue
+        new_col = c.col + best_shift
+        if new_col < 0 or new_col >= len(fields):
+            continue
+        remapped.append(
+            CellData(
+                row=c.row,
+                col=new_col,
+                text=c.text,
+                confidence=c.confidence,
+                bbox=c.bbox,
+            )
+        )
+
+    direction = "trái" if best_shift < 0 else "phải"
+    warnings.append(
+        f"Phát hiện lệch cột SSO (dịch {abs(best_shift)} cột sang {direction}); "
+        f"đã tự động căn chỉnh (điểm {best_score:.2f} > {baseline:.2f})."
+    )
+    return remapped, warnings
+
+
+
+def _looks_like_ipcas_token(text: str) -> bool:
+    """True when text looks like User IPCAS rather than a branch name."""
+    import re
+
+    t = (text or "").strip()
+    if not t or any(ord(ch) > 127 for ch in t):
+        return False
+    compact = re.sub(r"\s", "", t.upper())
+    return bool(re.fullmatch(r"[A-Z][A-Z0-9]{3,15}", compact))
+
+
+def _fill_sso_branch_names(
+    cells: list[CellData],
+    branch_map: dict[str, str] | None = None,
+) -> list[CellData]:
+    """
+    Forward-fill Tên chi nhánh (col3) from branch_code → name map.
+
+    Builds/updates map from rows that already have both a 4-digit code and a
+    non-IPCAS branch name. Fills empty or IPCAS-looking col3 when code is known.
+    Pass a shared dict to carry names across pages.
+    """
     import re
     from collections import defaultdict
 
     if not cells:
         return cells
 
+    max_c = max((c.col for c in cells), default=0) + 1
+    layout = _sso_layout_col_count(cells, max_c)
+    # 9-col layout: col3 = IPCAS (không có Tên chi nhánh riêng)
+    # Cho phép fill khi lưới đã có ≥10 cột hoặc caller truyền shared map (multi-page).
+    if layout < 10 and max_c < 10 and not branch_map:
+        return cells
+
+    shared = branch_map if branch_map is not None else {}
+    by_row: dict[int, dict[int, CellData]] = defaultdict(dict)
+    for c in cells:
+        by_row[c.row][c.col] = c
+    header_rows = _sso_header_row_ids(cells)
+
+    for row, cols in by_row.items():
+        if row in header_rows:
+            continue
+        code_cell = cols.get(2)
+        name_cell = cols.get(3)
+        if not code_cell or not name_cell:
+            continue
+        code = re.sub(r"\D", "", code_cell.text or "")
+        name = (name_cell.text or "").strip()
+        if not re.fullmatch(r"\d{4}", code) or not name:
+            continue
+        if _looks_like_ipcas_token(name):
+            continue
+        # Strip trailing IPCAS fragment leaked from bad column crop ("Phương Lâm PLAV")
+        parts = name.split()
+        if len(parts) >= 2 and _looks_like_ipcas_token(parts[-1]):
+            name = " ".join(parts[:-1]).strip()
+        # Strip trailing OCR junk digit ("Phương Lâm 1")
+        name = re.sub(r"\s+\d$", "", name).strip()
+        if not name or _looks_like_ipcas_token(name):
+            continue
+        if _score_sso_field_text("branch_name", name) >= 0.4:
+            shared[code] = name
+
+    if not shared:
+        return cells
+
+    out: list[CellData] = []
+    rows_with_col3: set[int] = set()
+    for c in cells:
+        if c.row in header_rows or c.col != 3:
+            out.append(c)
+            continue
+        rows_with_col3.add(c.row)
+        cols = by_row[c.row]
+        code_cell = cols.get(2)
+        code = re.sub(r"\D", "", (code_cell.text if code_cell else "") or "")
+        name = (c.text or "").strip()
+        needs_fill = (not name) or _looks_like_ipcas_token(name)
+        if needs_fill and code in shared:
+            out.append(
+                CellData(
+                    row=c.row,
+                    col=3,
+                    text=shared[code],
+                    confidence=max(c.confidence, 0.55),
+                    bbox=c.bbox,
+                )
+            )
+        else:
+            out.append(c)
+
+    # After column-shift, col3 may be completely missing — insert from map
+    for row, cols in by_row.items():
+        if row in header_rows or row in rows_with_col3:
+            continue
+        code_cell = cols.get(2)
+        if not code_cell:
+            continue
+        code = re.sub(r"\D", "", code_cell.text or "")
+        if code in shared:
+            out.append(
+                CellData(
+                    row=row,
+                    col=3,
+                    text=shared[code],
+                    confidence=0.55,
+                    bbox=[],
+                )
+            )
+
+    out.sort(key=lambda c: (c.row, c.col))
+    return out
+
+
+def _postprocess_sso_cells(
+    cells: list[CellData],
+    *,
+    branch_map: dict[str, str] | None = None,
+) -> list[CellData]:
+    """Chuan hoa luoi SSO: bo dong rac, tach STT, sua cot email/CCCD, can lech cot."""
+    import re
+    from collections import defaultdict
+
+    if not cells:
+        return cells
+
+    _SSO_POSTPROCESS_WARNINGS.clear()
+
     cells = _merge_annotation_header_rows(cells)
+    # Căn lệch cột TRƯỚC sticky — tránh sticky F phá pattern phone@/role
+    cells, shift_warnings = _detect_and_fix_sso_column_shift(cells)
+    for w in shift_warnings:
+        if w and w not in _SSO_POSTPROCESS_WARNINGS:
+            _SSO_POSTPROCESS_WARNINGS.append(w)
     cells = _fix_cccd_email_columns(cells)
-    email_col = _resolve_sso_email_col(
-        max((c.col for c in cells), default=0) + 1, cells
-    )
+
+    max_c = max((c.col for c in cells), default=0) + 1
+    email_col = _resolve_sso_email_col(max_c, cells)
+    layout = _sso_layout_col_count(cells, max_c)
+    phone_col = 7 if layout >= 10 else 6
     if settings.ocr_sso_enhance and settings.ocr_sso_row_merge:
         cells = _merge_fragment_sso_rows(cells, email_col=email_col)
     cells = _apply_fixed_email_domain(cells)
@@ -3624,7 +4847,7 @@ def _postprocess_sso_cells(cells: list[CellData]) -> list[CellData]:
     for c in cells:
         by_row[c.row][c.col] = c
 
-    # Bỏ dòng rác (OCR noise trên vùng kẻ bảng)
+    # Bo dong rac (OCR noise tren vung ke bang)
     clean_rows: dict[int, dict[int, CellData]] = {}
     for row, cols in sorted(by_row.items()):
         texts = [c.text.strip() for c in cols.values() if c.text.strip()]
@@ -3634,7 +4857,7 @@ def _postprocess_sso_cells(cells: list[CellData]) -> list[CellData]:
             continue
         clean_rows[row] = cols
 
-    # Tìm dòng header (STT | Họ và tên) hoặc dòng dữ liệu đầu (cột 0 = số)
+    # Tim dong header (STT | Ho va ten) hoac dong du lieu dau (cot 0 = so)
     start_row = min(clean_rows) if clean_rows else 0
     for row, cols in sorted(clean_rows.items()):
         c0 = cols.get(0, CellData(row=0, col=0, text="", confidence=0)).text.strip()
@@ -3665,13 +4888,13 @@ def _postprocess_sso_cells(cells: list[CellData]) -> list[CellData]:
         if row < start_row:
             continue
         cols = clean_rows[row]
-        # Bỏ dòng header STT (chỉ giữ nếu là dòng duy nhất kiểu header)
+        # Bo dong header STT (chi giu neu la dong duy nhat kieu header)
         c0 = cols.get(0, CellData(row=0, col=0, text="", confidence=0)).text.strip()
         if "stt" in _normalize_match_text(c0):
             continue
         for col, cell in sorted(cols.items()):
             text = cell.text.strip()
-            # Tách STT dính cuối tên
+            # Tach STT dinh cuoi ten
             m = re.search(r"^(.+?)\s+(\d{1,3})$", text)
             if m and col == 1:
                 text = m.group(1).strip()
@@ -3680,7 +4903,11 @@ def _postprocess_sso_cells(cells: list[CellData]) -> list[CellData]:
                     row=new_idx,
                     col=col,
                     text=_normalize_cell_text(
-                        text, col=col, email_col=email_col
+                        text,
+                        col=col,
+                        email_col=email_col,
+                        phone_col=phone_col,
+                        role_col=phone_col + 1,
                     ),
                     confidence=cell.confidence,
                     bbox=cell.bbox,
@@ -3689,10 +4916,35 @@ def _postprocess_sso_cells(cells: list[CellData]) -> list[CellData]:
         new_idx += 1
 
     renumbered = _fix_cccd_email_columns(renumbered)
+    # Chuẩn hóa SĐT / role / unit sau sticky/shift
+    role_col = phone_col + 1
+    unit_col = phone_col + 2  # role, unit
+    for c in renumbered:
+        if c.col == 1 and c.text.strip():
+            c.text = re.sub(r"\s+\d{6,}\s*$", "", c.text).strip()
+        if c.col == phone_col and c.text.strip() and not _looks_like_role_text(c.text):
+            c.text = _normalize_sso_phone(c.text)
+        if c.col == role_col and c.text.strip():
+            c.text = _normalize_sso_role_text(c.text)
+        if c.col == unit_col and c.text.strip():
+            c.text = _normalize_sso_unit(c.text)
     renumbered = _enforce_sso_target_columns(renumbered)
+    # After shift, fill branch_name from code→name map (shared across pages if given)
+    renumbered = _fill_sso_branch_names(renumbered, branch_map)
     renumbered.sort(key=lambda c: (c.row, c.col))
-    return renumbered
 
+    if any(
+        (c.text or "").startswith("[?]") and c.col in (4, 5)
+        for c in renumbered
+    ):
+        msg = (
+            "Một số ô CCCD có thể thiếu/lệch chữ số (bắt đầu bằng [?]); "
+            "cần review thủ công."
+        )
+        if msg not in _SSO_POSTPROCESS_WARNINGS:
+            _SSO_POSTPROCESS_WARNINGS.append(msg)
+
+    return renumbered
 
 def _fallback_sso_table_ocr(
     image: np.ndarray, page_number: int
@@ -3768,6 +5020,7 @@ def _fallback_sso_table_ocr(
         cells=cells,
         html="",
         table_kind="sso_agribank",
+        warnings=consume_sso_postprocess_warnings(),
     )
 
 

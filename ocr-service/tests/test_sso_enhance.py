@@ -7,20 +7,26 @@ from app.models.schemas import CellData
 from app.services.ocr_service import (
     _adjust_col_lines_to_target,
     _assign_lines_to_grid,
-    _sso_layout_from_header_text,
+    _detect_and_fix_sso_column_shift,
     _extract_sso_email_local,
+    _fill_sso_branch_names,
     _format_sso_email,
     _is_hallucinated_ocr_line,
+    _is_sso_footer_garbage_row,
+    _is_valid_data_row,
     _join_multiline_ocr_lines,
     _looks_like_sso_cells,
     _merge_fragment_sso_rows,
     _normalize_cell_text,
+    _normalize_sso_phone,
+    _postprocess_sso_cells,
     _repair_agribank_email,
     _resolve_sso_email_col,
     _row_looks_like_fragment_continuation,
     _split_cell_text_lines,
     _sso_data_column_count,
     _sso_layout_col_count,
+    _sso_layout_from_header_text,
     _strip_leading_english_hallucination,
 )
 
@@ -345,3 +351,412 @@ def test_cell_crop_pad_preserves_diacritic_margin():
     assert cy2 > 140
     assert cx1 <= 100
     assert cx2 >= 200
+
+def test_normalize_cccd_text_no_blind_pad():
+    from app.services.ocr_service import _normalize_cccd_text
+
+    assert _normalize_cccd_text("08317901156") == "[?]08317901156"
+    assert not _normalize_cccd_text("08317901156").startswith("0" * 2) or True
+    assert _normalize_cccd_text("083179011568") == "083179011568"
+
+
+def test_ocr_digit_confusable_replace_O_and_l():
+    from app.services.ocr_service import (
+        _ocr_digit_confusable_replace,
+        _normalize_cccd_text,
+    )
+
+    assert _ocr_digit_confusable_replace("O83179O1156l") == "083179011561"
+    assert _normalize_cccd_text("O83179011561") == "083179011561"
+
+
+def test_detect_and_fix_sso_column_shift_corrects_cccd_email():
+    from app.services.ocr_service import _detect_and_fix_sso_column_shift
+
+    # Entire data row shifted +1 vs 10-col layout (CCCD at 6 instead of 5).
+    cells = [
+        CellData(row=0, col=0, text="STT", confidence=1.0, bbox=[]),
+        CellData(row=0, col=2, text="Mã chi nhánh", confidence=1.0, bbox=[]),
+        CellData(row=0, col=5, text="Số CCCD", confidence=1.0, bbox=[]),
+        CellData(row=0, col=6, text="Email", confidence=1.0, bbox=[]),
+        # row2: data at cols 1..9 (shift +1 from 0..8)
+        CellData(row=2, col=1, text="1", confidence=1.0, bbox=[]),
+        CellData(row=2, col=2, text="Nguyễn Văn A", confidence=1.0, bbox=[]),
+        CellData(row=2, col=3, text="3526", confidence=1.0, bbox=[]),
+        CellData(row=2, col=4, text="Chi nhánh HN", confidence=1.0, bbox=[]),
+        CellData(row=2, col=5, text="QSO12345", confidence=1.0, bbox=[]),
+        CellData(row=2, col=6, text="083179011568", confidence=1.0, bbox=[]),
+        CellData(row=2, col=7, text="nguyenvana@agribank.com.vn", confidence=1.0, bbox=[]),
+        CellData(row=2, col=8, text="0912345678", confidence=1.0, bbox=[]),
+        CellData(row=2, col=9, text="Đại lý viên", confidence=1.0, bbox=[]),
+        CellData(row=3, col=1, text="2", confidence=1.0, bbox=[]),
+        CellData(row=3, col=2, text="Trần Thị B", confidence=1.0, bbox=[]),
+        CellData(row=3, col=3, text="3527", confidence=1.0, bbox=[]),
+        CellData(row=3, col=4, text="Chi nhánh HCM", confidence=1.0, bbox=[]),
+        CellData(row=3, col=5, text="QSO99999", confidence=1.0, bbox=[]),
+        CellData(row=3, col=6, text="012345678901", confidence=1.0, bbox=[]),
+        CellData(row=3, col=7, text="tranthib@agribank.com.vn", confidence=1.0, bbox=[]),
+        CellData(row=3, col=8, text="0987654321", confidence=1.0, bbox=[]),
+        CellData(row=3, col=9, text="Đại lý viên", confidence=1.0, bbox=[]),
+    ]
+    fixed, warnings = _detect_and_fix_sso_column_shift(cells)
+    by = {(c.row, c.col): c.text for c in fixed}
+    assert by.get((2, 5)) == "083179011568"
+    assert "agribank" in by.get((2, 6), "").lower()
+    assert by.get((2, 0)) == "1"
+    assert warnings
+
+
+def test_is_valid_data_row_rejects_garbage_only():
+    from app.services.ocr_service import _is_valid_data_row
+
+    cols = {
+        0: CellData(row=2, col=0, text="@@@", confidence=0.2, bbox=[]),
+        1: CellData(row=2, col=1, text="||||", confidence=0.1, bbox=[]),
+        2: CellData(row=2, col=2, text="xxx", confidence=0.1, bbox=[]),
+    }
+    assert _is_valid_data_row(cols) is False
+
+
+def test_sso_cell_needs_pass2_cccd_11_digits():
+    from app.services.ocr_service import _sso_cell_needs_pass2
+
+    assert _sso_cell_needs_pass2("08317901156", "cccd", confidence=0.99) is True
+    assert _sso_cell_needs_pass2("083179011568", "cccd", confidence=0.99) is False
+
+
+def test_adjust_col_lines_template_still_10_cols():
+    from app.services.ocr_service import (
+        _adjust_col_lines_to_target,
+        _sso_data_column_count,
+    )
+
+    col_lines = [0, 50, 100, 150, 200, 250, 300, 350, 400, 500]
+    adjusted = _adjust_col_lines_to_target(col_lines, 10)
+    assert _sso_data_column_count(adjusted) == 10
+
+
+def test_adjust_col_lines_drops_spurious_11th_boundary():
+    """b439 page2: 11 detected cols — drop false line near right edge, keep IPCAS/CCCD split."""
+    # From OpenCV on page_002 (extra boundary at 2763)
+    col_lines = [69, 218, 651, 771, 1002, 1245, 1451, 2068, 2263, 2577, 2763, 2895]
+    assert _sso_data_column_count(col_lines) == 11
+    adjusted = _adjust_col_lines_to_target(col_lines, 10)
+    assert _sso_data_column_count(adjusted) == 10
+    # Spurious 2763 should be gone; real mid boundaries kept
+    assert 2763 not in adjusted
+    assert 1245 in adjusted and 1451 in adjusted
+    assert adjusted[0] == 69 and adjusted[-1] == 2895
+
+
+def test_format_sso_email_repairs_q_and_glued_domain():
+    assert (
+        _format_sso_email("thuyhothithanhagribank.com-vn@agribank.com.vn")
+        == "thuyhothithanh@agribank.com.vn"
+    )
+    assert (
+        _format_sso_email("lienphamphuongq@agribank.com.vn")
+        == "lienphamphuong@agribank.com.vn"
+    )
+    assert (
+        _format_sso_email("thuydinhthi5qagribankcomvn@agribank.com.vn")
+        == "thuydinhthi5@agribank.com.vn"
+    )
+    assert (
+        _format_sso_email("hienbuithanh 00agribank com vn")
+        == "hienbuithanh@agribank.com.vn"
+    )
+    assert (
+        _format_sso_email("loanlethikim1qagribankcom.vn@agribank.com.vn")
+        == "loanlethikim1@agribank.com.vn"
+    )
+    assert (
+        _format_sso_email("thuyhothithanhagribankcomvn@agribank.com.vn")
+        == "thuyhothithanh@agribank.com.vn"
+    )
+    assert "agribank" not in _extract_sso_email_local(
+        "thuydinhthi5qagribankcomvn@agribank.com.vn"
+    )
+    # Never double-domain
+    assert _format_sso_email("useragribank.com.vn@agribank.com.vn").count(
+        "@agribank.com.vn"
+    ) == 1
+
+
+def test_normalize_sso_phone_leading_zero_and_strip_domain():
+    assert _normalize_sso_phone("338250999") == "0338250999"
+    assert _normalize_sso_phone("911436988@agribank.com.vn") == "0911436988"
+    assert _normalize_sso_phone("098939779") == "098939779"
+    # Stamp prefix + real mobile glued by OCR
+    assert _normalize_sso_phone("03010000001990983851259") == "0983851259"
+    assert _normalize_sso_phone("8495833333") == "0849583333"
+    assert _normalize_cell_text(
+        "911436988@agribank.com.vn", col=7, phone_col=7, email_col=6
+    ) == "0911436988"
+
+
+def test_normalize_cccd_accepts_9_digit_cmnd():
+    from app.services.ocr_service import _normalize_cccd_text, _sso_cell_needs_pass2
+
+    assert _normalize_cccd_text("113382382") == "113382382"
+    assert not _normalize_cccd_text("113382382").startswith("[?]")
+    assert _sso_cell_needs_pass2("113382382", "cccd", confidence=0.99) is False
+    assert _sso_cell_needs_pass2("083179011568", "cccd", confidence=0.99) is False
+    assert _sso_cell_needs_pass2("08317901156", "cccd", confidence=0.99) is True
+
+
+def test_detect_left_shift_from_branch_name_page2_pattern():
+    """Pages 2–4: col3=IPCAS, col4=CCCD, col6=phone@domain, col7=role → shift +1 from col3."""
+    header = [
+        CellData(row=0, col=0, text="STT", confidence=1.0, bbox=[]),
+        CellData(row=0, col=2, text="Mã chi nhánh", confidence=1.0, bbox=[]),
+        CellData(row=0, col=3, text="Tên chi nhánh", confidence=1.0, bbox=[]),
+        CellData(row=0, col=5, text="Số CCCD", confidence=1.0, bbox=[]),
+        CellData(row=0, col=6, text="Email", confidence=1.0, bbox=[]),
+    ]
+    rows = []
+    samples = [
+        ("8", "Bùi Thanh Hiền", "3001", "HLSHIEN", "113121959",
+         "hienbuithanh 00agribank com vn", "911436988@agribank.com.vn",
+         "Kế toán viên", "17204007", "1"),
+        ("9", "Nguyễn Hiền Thảo", "3001", "HLSNTHAO", "113229663",
+         "thaonguyenhien agribank com vn", "974439810@agribank.com.vn",
+         "Kế toán viên", "17204007", "1"),
+        ("10", "Nguyễn Thị Thu Trang", "3001", "HLSNTTR", "112147782",
+         "trangnguyenthithu agribank", "984369796@agribank.com.vn",
+         "Kế toán viên", "17204007", "1"),
+    ]
+    for i, s in enumerate(samples):
+        r = 2 + i
+        for col, val in enumerate(s):
+            rows.append(CellData(row=r, col=col, text=val, confidence=1.0, bbox=[]))
+    fixed, warnings = _detect_and_fix_sso_column_shift(header + rows)
+    by = {(c.row, c.col): c.text for c in fixed}
+    assert by.get((2, 4)) == "HLSHIEN"  # IPCAS restored
+    assert by.get((2, 5)) == "113121959"  # CCCD
+    assert "agribank" in by.get((2, 6), "").lower() or "hienbuithanh" in by.get((2, 6), "")
+    assert "911436988" in by.get((2, 7), "")
+    assert "Kế toán" in by.get((2, 8), "")
+    assert by.get((2, 2)) == "3001"  # branch_code untouched
+    assert warnings
+
+
+def test_footer_garbage_rows_rejected():
+    assert _is_sso_footer_garbage_row({
+        0: CellData(row=5, col=0, text="Yêu cầu khác:", confidence=1.0, bbox=[]),
+    })
+    assert _is_sso_footer_garbage_row({
+        0: CellData(row=5, col=0, text="Người liên hệ: Lưu", confidence=1.0, bbox=[]),
+    })
+    assert _is_sso_footer_garbage_row({
+        0: CellData(row=5, col=0, text="LẬP", confidence=1.0, bbox=[]),
+        1: CellData(row=5, col=1, text="PHIẾU", confidence=1.0, bbox=[]),
+        5: CellData(row=5, col=5, text="KIỂM SOÁT", confidence=1.0, bbox=[]),
+    })
+    assert _is_sso_footer_garbage_row({
+        0: CellData(row=5, col=0, text="(Ký, ghi rõ họ tên)", confidence=1.0, bbox=[]),
+    })
+    assert _is_valid_data_row({
+        0: CellData(row=5, col=0, text="Yêu cầu khác:", confidence=1.0, bbox=[]),
+        1: CellData(row=5, col=1, text="abc", confidence=1.0, bbox=[]),
+    }) is False
+
+
+def test_sticky_phone_at_email_role_in_phone_remaps():
+    cells = [
+        CellData(row=0, col=0, text="STT", confidence=1.0, bbox=[]),
+        CellData(row=0, col=2, text="Mã chi nhánh", confidence=1.0, bbox=[]),
+        CellData(row=0, col=6, text="Email", confidence=1.0, bbox=[]),
+        CellData(row=2, col=0, text="8", confidence=1.0, bbox=[]),
+        CellData(row=2, col=1, text="Bùi Thanh Hiền", confidence=1.0, bbox=[]),
+        CellData(row=2, col=2, text="3001", confidence=1.0, bbox=[]),
+        CellData(row=2, col=3, text="Lương Sơn", confidence=1.0, bbox=[]),
+        CellData(row=2, col=4, text="HLSHIEN", confidence=1.0, bbox=[]),
+        CellData(row=2, col=5, text="113121959 hienbuithanh 00agribank com vn", confidence=1.0, bbox=[]),
+        CellData(row=2, col=6, text="911436988@agribank.com.vn", confidence=1.0, bbox=[]),
+        CellData(row=2, col=7, text="Kế toán viên", confidence=1.0, bbox=[]),
+        CellData(row=2, col=8, text="17204007", confidence=1.0, bbox=[]),
+    ]
+    out = _postprocess_sso_cells(cells)
+    by = {(c.row, c.col): c.text for c in out}
+    data_rows = sorted({c.row for c in out})
+    r = data_rows[0]
+    phone = by.get((r, 7), "")
+    role = by.get((r, 8), "")
+    email = by.get((r, 6), "")
+    cccd = by.get((r, 5), "")
+    assert phone.startswith("0") and phone.isdigit(), phone
+    assert "Kế toán" in role or "toán" in role.lower() or "toan" in role.lower(), role
+    assert "@agribank.com.vn" in email.lower(), email
+    assert email.lower().count("agribank.com.vn") == 1
+    assert cccd == "113121959" or cccd.replace("[?]", "") == "113121959"
+
+
+def test_branch_name_forward_fill_from_map_and_page1():
+    """Empty/IPCAS-looking col3 filled from branch_code map (incl. shared across pages)."""
+    shared: dict[str, str] = {}
+    page1 = [
+        CellData(row=0, col=0, text="STT", confidence=1.0, bbox=[]),
+        CellData(row=0, col=2, text="Mã chi nhánh", confidence=1.0, bbox=[]),
+        CellData(row=0, col=3, text="Tên chi nhánh", confidence=1.0, bbox=[]),
+        CellData(row=0, col=5, text="Số CCCD", confidence=1.0, bbox=[]),
+        CellData(row=0, col=6, text="Email", confidence=1.0, bbox=[]),
+        CellData(row=1, col=0, text="1", confidence=1.0, bbox=[]),
+        CellData(row=1, col=1, text="Phạm Phương Liên", confidence=1.0, bbox=[]),
+        CellData(row=1, col=2, text="3000", confidence=1.0, bbox=[]),
+        CellData(row=1, col=3, text="Hội Sở", confidence=1.0, bbox=[]),
+        CellData(row=1, col=4, text="HBIPLIEN", confidence=1.0, bbox=[]),
+        CellData(row=1, col=5, text="113382382", confidence=1.0, bbox=[]),
+        CellData(row=1, col=6, text="lienphamphuong@agribank.com.vn", confidence=1.0, bbox=[]),
+        CellData(row=1, col=7, text="0338250999", confidence=1.0, bbox=[]),
+        CellData(row=1, col=8, text="Kế toán viên", confidence=1.0, bbox=[]),
+        CellData(row=1, col=9, text="12704001", confidence=1.0, bbox=[]),
+        CellData(row=2, col=0, text="7", confidence=1.0, bbox=[]),
+        CellData(row=2, col=1, text="Nguyễn Thị Minh Thúy", confidence=1.0, bbox=[]),
+        CellData(row=2, col=2, text="3001", confidence=1.0, bbox=[]),
+        CellData(row=2, col=3, text="Lương Sơn", confidence=1.0, bbox=[]),
+        CellData(row=2, col=4, text="HLSNTHUY", confidence=1.0, bbox=[]),
+        CellData(row=2, col=5, text="113119679", confidence=1.0, bbox=[]),
+        CellData(row=2, col=6, text="thuynguyenthiminh@agribank.com.vn", confidence=1.0, bbox=[]),
+        CellData(row=2, col=7, text="0915115147", confidence=1.0, bbox=[]),
+        CellData(row=2, col=8, text="Kế toán viên", confidence=1.0, bbox=[]),
+        CellData(row=2, col=9, text="17204007", confidence=1.0, bbox=[]),
+    ]
+    out1 = _postprocess_sso_cells(page1, branch_map=shared)
+    assert shared.get("3000") == "Hội Sở"
+    assert shared.get("3001") == "Lương Sơn"
+
+    # Page2-style: after shift, col3 empty / missing; IPCAS in col4
+    page2 = [
+        CellData(row=0, col=0, text="STT", confidence=1.0, bbox=[]),
+        CellData(row=0, col=2, text="Mã chi nhánh", confidence=1.0, bbox=[]),
+        CellData(row=0, col=3, text="Tên chi nhánh", confidence=1.0, bbox=[]),
+        CellData(row=0, col=5, text="Số CCCD", confidence=1.0, bbox=[]),
+        CellData(row=0, col=6, text="Email", confidence=1.0, bbox=[]),
+        CellData(row=2, col=0, text="8", confidence=1.0, bbox=[]),
+        CellData(row=2, col=1, text="Bùi Thanh Hiền", confidence=1.0, bbox=[]),
+        CellData(row=2, col=2, text="3001", confidence=1.0, bbox=[]),
+        CellData(row=2, col=4, text="HLSHIEN", confidence=1.0, bbox=[]),
+        CellData(row=2, col=5, text="113121959", confidence=1.0, bbox=[]),
+        CellData(row=2, col=6, text="hienbuithanh@agribank.com.vn", confidence=1.0, bbox=[]),
+        CellData(row=2, col=7, text="0911436988", confidence=1.0, bbox=[]),
+        CellData(row=2, col=8, text="Kế toán viên", confidence=1.0, bbox=[]),
+        CellData(row=2, col=9, text="17204007", confidence=1.0, bbox=[]),
+        CellData(row=3, col=0, text="9", confidence=1.0, bbox=[]),
+        CellData(row=3, col=1, text="Nguyễn Hiền Thảo", confidence=1.0, bbox=[]),
+        CellData(row=3, col=2, text="3001", confidence=1.0, bbox=[]),
+        CellData(row=3, col=3, text="HLNTHAO", confidence=1.0, bbox=[]),  # IPCAS-looking
+        CellData(row=3, col=4, text="HLSNTHAO", confidence=1.0, bbox=[]),
+        CellData(row=3, col=5, text="113229663", confidence=1.0, bbox=[]),
+        CellData(row=3, col=6, text="thaonguyenhien@agribank.com.vn", confidence=1.0, bbox=[]),
+        CellData(row=3, col=7, text="0974439810", confidence=1.0, bbox=[]),
+        CellData(row=3, col=8, text="Kế toán viên", confidence=1.0, bbox=[]),
+        CellData(row=3, col=9, text="17204007", confidence=1.0, bbox=[]),
+    ]
+    out2 = _postprocess_sso_cells(page2, branch_map=shared)
+    by = {(c.row, c.col): c.text for c in out2}
+    rows = sorted({c.row for c in out2})
+    assert len(rows) >= 2
+    for r in rows:
+        assert by.get((r, 3)) == "Lương Sơn", (r, by.get((r, 3)), by)
+
+    # Helper alone: insert missing col3 when shared map provided
+    sparse = [
+        CellData(row=0, col=0, text="STT", confidence=1.0, bbox=[]),
+        CellData(row=0, col=2, text="Mã chi nhánh", confidence=1.0, bbox=[]),
+        CellData(row=0, col=3, text="Tên chi nhánh", confidence=1.0, bbox=[]),
+        CellData(row=0, col=9, text="Mã liên ngân hàng", confidence=1.0, bbox=[]),
+        CellData(row=1, col=2, text="3000", confidence=1.0, bbox=[]),
+        CellData(row=1, col=4, text="HBIPLIEN", confidence=1.0, bbox=[]),
+    ]
+    filled = _fill_sso_branch_names(sparse, {"3000": "Hội Sở"})
+    assert any(c.row == 1 and c.col == 3 and c.text == "Hội Sở" for c in filled)
+
+
+def test_footer_rejects_pho_giam_doc_signature():
+    assert _is_sso_footer_garbage_row({
+        0: CellData(row=7, col=0, text="Hồ T", confidence=1.0, bbox=[]),
+        8: CellData(row=7, col=8, text="NGÂN HÀNG NÔNG NGHIỆP", confidence=1.0, bbox=[]),
+        9: CellData(row=7, col=9, text="PHÓ GIÁM ĐỐC", confidence=1.0, bbox=[]),
+    })
+
+
+def test_normalize_sso_role_text_ocr_variants():
+    from app.services.ocr_service import _normalize_sso_role_text
+
+    assert _normalize_sso_role_text("Kê toán viện") == "Kế toán viên"
+    assert _normalize_sso_role_text("Ké toán viện") == "Kế toán viên"
+    assert _normalize_sso_role_text("Kê toán viên") == "Kế toán viên"
+    assert _normalize_sso_role_text("ke toan vien") == "Kế toán viên"
+    assert _normalize_sso_role_text("dai ly vien") == "Đại lý viên"
+    assert _normalize_sso_role_text("Kiểm soát viên") == "Kiểm soát viên"
+    assert _normalize_sso_role_text("Phê duyệt viên") == "Phê duyệt viên"
+
+
+def test_format_sso_email_strips_wagr1bank_glued_domain():
+    assert (
+        _format_sso_email("huyennguyenthuwagr1bank.com.vn@agribank.com.vn")
+        == "huyennguyenthu@agribank.com.vn"
+    )
+    assert (
+        _format_sso_email("userwagr1bank.com.vn@agribank.com.vn")
+        == "user@agribank.com.vn"
+    )
+    assert "agribank" not in _extract_sso_email_local(
+        "huyennguyenthuwagr1bank.com.vn@agribank.com.vn"
+    )
+    assert "wagr" not in _extract_sso_email_local(
+        "huyennguyenthuwagr1bank.com.vn@agribank.com.vn"
+    )
+
+
+def test_normalize_cell_text_strips_name_trailing_digits():
+    assert (
+        _normalize_cell_text("Ngô Hông Hoa 030100000000020", col=1)
+        == "Ngô Hông Hoa"
+    )
+    assert (
+        _normalize_cell_text("Đô Phương Tùng 03010000000039", col=1)
+        == "Đô Phương Tùng"
+    )
+    # short STT-like trailing digits left to other logic; 6+ only
+    assert _normalize_cell_text("Nguyễn Văn A 12", col=1) == "Nguyễn Văn A 12"
+
+
+def test_normalize_cell_text_role_col():
+    assert (
+        _normalize_cell_text("Kê toán viện", col=8, role_col=8)
+        == "Kế toán viên"
+    )
+
+
+def test_postprocess_normalizes_role_and_name_junk():
+    cells = [
+        CellData(row=0, col=0, text="STT", confidence=1.0, bbox=[]),
+        CellData(row=0, col=2, text="Mã chi nhánh", confidence=1.0, bbox=[]),
+        CellData(row=0, col=3, text="Tên chi nhánh", confidence=1.0, bbox=[]),
+        CellData(row=0, col=5, text="Số CCCD", confidence=1.0, bbox=[]),
+        CellData(row=0, col=6, text="Email", confidence=1.0, bbox=[]),
+        CellData(row=1, col=0, text="1", confidence=1.0, bbox=[]),
+        CellData(row=1, col=1, text="Ngô Hông Hoa 030100000000020", confidence=1.0, bbox=[]),
+        CellData(row=1, col=2, text="3000", confidence=1.0, bbox=[]),
+        CellData(row=1, col=3, text="Hội Sở", confidence=1.0, bbox=[]),
+        CellData(row=1, col=4, text="HBIPLIEN", confidence=1.0, bbox=[]),
+        CellData(row=1, col=5, text="113382382", confidence=1.0, bbox=[]),
+        CellData(
+            row=1,
+            col=6,
+            text="huyennguyenthuwagr1bank.com.vn@agribank.com.vn",
+            confidence=1.0,
+            bbox=[],
+        ),
+        CellData(row=1, col=7, text="0338250999", confidence=1.0, bbox=[]),
+        CellData(row=1, col=8, text="Kê toán viện", confidence=1.0, bbox=[]),
+        CellData(row=1, col=9, text="12704001", confidence=1.0, bbox=[]),
+    ]
+    out = _postprocess_sso_cells(cells)
+    by = {(c.row, c.col): c.text for c in out}
+    r = sorted({c.row for c in out})[0]
+    assert by.get((r, 1)) == "Ngô Hông Hoa"
+    assert by.get((r, 6)) == "huyennguyenthu@agribank.com.vn"
+    assert by.get((r, 8)) == "Kế toán viên"

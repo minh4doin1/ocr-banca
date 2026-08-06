@@ -140,6 +140,10 @@ class TableData(BaseModel):
         default="",
         description="sso_agribank when Agribank SSO 10-column form detected",
     )
+    warnings: list[str] = Field(
+        default_factory=list,
+        description="Canh bao OCR bang (lech cot, CCCD can review, ...).",
+    )
 
 
 class PageResult(BaseModel):
@@ -150,6 +154,10 @@ class PageResult(BaseModel):
     tables: list[TableData] = Field(default_factory=list)
     raw_text: str = Field(
         default="", description="Full page text (non-table regions)"
+    )
+    warnings: list[str] = Field(
+        default_factory=list,
+        description="Canh bao OCR trang (gom tu bang / postprocess).",
     )
 
 

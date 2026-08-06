@@ -5,8 +5,11 @@ Benchmark SSO OCR field accuracy on a PDF file.
 Usage:
   python scripts/benchmark_sso_columns.py path/to/sso.pdf
   python scripts/benchmark_sso_columns.py path/to/sso.pdf --json out.json
+  python scripts/benchmark_sso_columns.py path/to/sso.pdf \\
+      --golden path/to/answer.xlsx --json out.json
 
 Reports per-field pass rates for email, role, CCCD, IPCAS, branch_code.
+With --golden, also compares OCR users to Excel ground truth column by column.
 """
 
 from __future__ import annotations
@@ -24,6 +27,21 @@ if str(_ROOT) not in sys.path:
 
 from app.config import settings
 from app.services.user_mapping import map_result_to_users, normalize_roles
+
+_GOLDEN_FIELDS = (
+    "email",
+    "ipcas_code",
+    "cccd",
+    "phone",
+    "branch_code",
+    "unit_code",
+    "role",
+    "name",
+)
+
+
+def _norm(val: str) -> str:
+    return re.sub(r"\s+", "", (val or "").strip().lower())
 
 
 def _field_metrics(users: list) -> dict[str, dict[str, float | int]]:
@@ -60,11 +78,93 @@ def _field_metrics(users: list) -> dict[str, dict[str, float | int]]:
     }
 
 
+def _load_golden_users(xlsx: Path) -> list:
+    from app.services.excel_service import import_from_excel
+    from app.services.user_mapping import map_result_to_users as _map
+
+    result = import_from_excel(xlsx, "golden", xlsx.name)
+    users, _ = _map(result)
+    return users
+
+
+def _user_key(u) -> str:
+    email = _norm(u.email)
+    if email:
+        return f"e:{email}"
+    ipcas = _norm(u.ipcas_code)
+    if ipcas:
+        return f"i:{ipcas}"
+    return f"n:{_norm(u.name)}_{_norm(u.cccd)}"
+
+
+def _field_value(u, field: str) -> str:
+    if field == "role":
+        roles = u.roles or normalize_roles(u.role or "")
+        return ";".join(sorted(roles))
+    if field == "name":
+        return (u.name or f"{u.last_name} {u.first_name}").strip()
+    return str(getattr(u, field, "") or "").strip()
+
+
+def _compare_to_golden(ocr_users: list, golden_users: list) -> dict:
+    golden_by_key = {_user_key(u): u for u in golden_users}
+    matched = 0
+    per_field: dict[str, dict[str, float | int]] = {
+        f: {"ok": 0, "total": 0, "rate": 0.0} for f in _GOLDEN_FIELDS
+    }
+    misses: list[dict] = []
+
+    for ou in ocr_users:
+        key = _user_key(ou)
+        gu = golden_by_key.get(key)
+        if gu is None:
+            # fuzzy: match by CCCD
+            cccd = re.sub(r"\D", "", ou.cccd or "")
+            for candidate in golden_users:
+                if cccd and re.sub(r"\D", "", candidate.cccd or "") == cccd:
+                    gu = candidate
+                    break
+        if gu is None:
+            misses.append({"ocr": key, "reason": "no_golden_match"})
+            continue
+        matched += 1
+        for field in _GOLDEN_FIELDS:
+            ov = _norm(_field_value(ou, field))
+            gv = _norm(_field_value(gu, field))
+            per_field[field]["total"] = int(per_field[field]["total"]) + 1
+            if field in ("cccd", "phone", "branch_code", "unit_code"):
+                ov = re.sub(r"\D", "", ov)
+                gv = re.sub(r"\D", "", gv)
+            if ov and gv and ov == gv:
+                per_field[field]["ok"] = int(per_field[field]["ok"]) + 1
+            elif ov == gv:
+                per_field[field]["ok"] = int(per_field[field]["ok"]) + 1
+
+    for field, m in per_field.items():
+        total = int(m["total"]) or 1
+        m["rate"] = round(int(m["ok"]) / total, 4)
+
+    return {
+        "golden_users": len(golden_users),
+        "ocr_users": len(ocr_users),
+        "matched": matched,
+        "unmatched": len(misses),
+        "fields": per_field,
+        "sample_misses": misses[:20],
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Benchmark SSO OCR columns")
     parser.add_argument("pdf", type=Path, help="SSO PDF path")
     parser.add_argument("--job-id", default="bench-sso", help="Temporary job id")
     parser.add_argument("--json", type=Path, default=None, help="Write metrics JSON")
+    parser.add_argument(
+        "--golden",
+        type=Path,
+        default=None,
+        help="Excel ground-truth (same SSO export layout) for per-column accuracy",
+    )
     args = parser.parse_args()
 
     if not args.pdf.exists():
@@ -106,16 +206,33 @@ def main() -> int:
 
     print(f"Pages: {result.total_pages}, time: {elapsed:.1f}s")
     print(f"Users: {len(users)}, multi-role: {multi_role}, low-conf cells: {low_conf_cells}")
-    print("Field rates:")
+    print("Field shape rates (self-check):")
     for name, m in metrics.items():
         print(f"  {name:12} {m['ok']}/{m['total']} ({m['rate']*100:.1f}%)")
     print(f"Warnings: {len(warnings)}")
+    for w in (result.warnings or [])[:10]:
+        print(f"  ! {w}")
     for u in users[:10]:
         roles = ";".join(u.roles) or normalize_roles(u.role_raw or u.role)
         print(
             f"  {u.ipcas_code:12} br={u.branch_code:5} {u.email:35} "
             f"cccd={u.cccd:12} roles={roles}"
         )
+
+    golden_cmp = None
+    if args.golden:
+        if not args.golden.exists():
+            print(f"Golden not found: {args.golden}")
+            return 4
+        golden_users = _load_golden_users(args.golden)
+        golden_cmp = _compare_to_golden(users, golden_users)
+        print("\nGolden comparison (OCR vs Excel):")
+        print(
+            f"  matched {golden_cmp['matched']}/{golden_cmp['ocr_users']} "
+            f"(golden={golden_cmp['golden_users']}, unmatched={golden_cmp['unmatched']})"
+        )
+        for name, m in golden_cmp["fields"].items():
+            print(f"  {name:12} {m['ok']}/{m['total']} ({m['rate']*100:.1f}%)")
 
     payload = {
         "pdf": str(args.pdf),
@@ -126,10 +243,12 @@ def main() -> int:
         "low_conf_cells": low_conf_cells,
         "fields": metrics,
         "warnings": warnings[:50],
+        "result_warnings": list(result.warnings or [])[:50],
         "models": {
             "pass1": settings.vietocr_model,
             "pass2": settings.vietocr_model_pass2,
         },
+        "golden": golden_cmp,
     }
     if args.json:
         args.json.write_text(
