@@ -86,6 +86,7 @@ Tất cả endpoint yêu cầu header `X-Service-Token: <shared-secret>` (trừ 
 
 | Method | Path | Body / Query | Response |
 |---|---|---|---|
+| `GET` | `/roles/users?clientId=banca-app` | — | `{users: [{id, username, roles}], total}` |
 | `GET` | `/users/:id/roles?clientId=banca-app` | — | `{roles: RoleRepresentation[]}` |
 | `POST` | `/users/:id/roles?clientId=...` | `string[]` (role names) | `{assigned, skipped}` |
 | `DELETE` | `/users/:id/roles?clientId=...` | `string[]` (role names) | `{removed, skipped}` |

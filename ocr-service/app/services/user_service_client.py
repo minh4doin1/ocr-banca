@@ -287,6 +287,16 @@ class UserServiceClient:
         )
         return resp.json()
 
+    def list_users_with_roles(
+        self, client_id: str | None = None
+    ) -> list[dict]:
+        """Lấy tất cả user có ít nhất 1 client role."""
+        cid = client_id or self.roles_client_id
+        resp = self._request(
+            "GET", "/roles/users", params={"clientId": cid}
+        )
+        return resp.json().get("users", [])
+
     # ── Health ──
 
     def health(self) -> bool:
