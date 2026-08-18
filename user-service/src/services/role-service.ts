@@ -56,6 +56,62 @@ async function resolveRoleRepresentation(
   return role as RoleRepresentation;
 }
 
+/**
+ * List tất cả role name thuộc client (vd banca-admin, banca-seller, …).
+ */
+export async function listClientRoles(
+  clientId: string = config.ROLES_CLIENT_ID,
+): Promise<RoleRepresentation[]> {
+  const clientUuid = await resolveClientUuid(clientId);
+  await kcClient.ensureAuth();
+  return withKeycloakErrors(() =>
+    kcClient.raw().clients.listRoles({
+      realm: config.KEYCLOAK_REALM,
+      id: clientUuid,
+    }),
+  ) as Promise<RoleRepresentation[]>;
+}
+
+/**
+ * Lấy tất cả user có ít nhất 1 client role trong client.
+ * Gọi findUsersWithRole cho từng role rồi dedupe theo user id.
+ */
+export async function listUsersWithAnyClientRole(
+  clientId: string = config.ROLES_CLIENT_ID,
+): Promise<Array<{ id: string; username: string; roles: string[] }>> {
+  const clientUuid = await resolveClientUuid(clientId);
+  await kcClient.ensureAuth();
+
+  const roles = await listClientRoles(clientId);
+
+  const userMap = new Map<string, { id: string; username: string; roles: string[] }>();
+
+  for (const role of roles) {
+    if (!role.name) continue;
+    const users = (await withKeycloakErrors(() =>
+      kcClient.raw().clients.findUsersWithRole({
+        realm: config.KEYCLOAK_REALM,
+        id: clientUuid,
+        roleName: role.name!,
+        first: 0,
+        max: 10000,
+      }),
+    )) as Array<{ id?: string; username?: string }>;
+
+    for (const u of users) {
+      if (!u.id || !u.username) continue;
+      const existing = userMap.get(u.id);
+      if (existing) {
+        existing.roles.push(role.name);
+      } else {
+        userMap.set(u.id, { id: u.id, username: u.username, roles: [role.name] });
+      }
+    }
+  }
+
+  return [...userMap.values()];
+}
+
 export async function getUserClientRoles(
   userId: string,
   clientId: string = config.ROLES_CLIENT_ID,

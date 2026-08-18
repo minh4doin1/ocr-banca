@@ -12,6 +12,7 @@ import { UserNotFoundError } from '../keycloak.js';
 import {
   assignClientRoles,
   getUserClientRoles,
+  listUsersWithAnyClientRole,
   removeClientRoles,
 } from '../services/role-service.js';
 
@@ -21,6 +22,13 @@ const ClientIdQuery = z.object({ clientId: z.string().optional() });
 
 export const roleRoutes: FastifyPluginAsync = async (app: FastifyInstance) => {
   app.addHook('preHandler', requireServiceAuth);
+
+  // ── GET /roles/users — list tất cả user có role trong client ──
+  app.get('/roles/users', async (req) => {
+    const { clientId } = ClientIdQuery.parse(req.query);
+    const users = await listUsersWithAnyClientRole(clientId);
+    return { users, total: users.length };
+  });
 
   // ── GET /users/:id/roles ──
   app.get('/users/:id/roles', async (req, reply) => {
