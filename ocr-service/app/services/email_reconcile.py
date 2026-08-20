@@ -21,12 +21,36 @@ def _email_local(email: str) -> str:
     return re.sub(r"[^a-z0-9._+-]", "", t)
 
 
+
+
+def _looks_like_hallucinated_email_local(local: str) -> bool:
+    """OCR email local dạng từ tiếng Anh dài (constructional, complication, …)."""
+    if not local or len(local) < 8:
+        return False
+    if not local.isascii():
+        return False
+    low = local.lower()
+    # Tiếng Việt không dấu trong email (lienphamphuong, mainguyenngoc…) — giữ lại
+    if re.search(r"(ph|ng|th|tr|nh|gi|kh|phu|huyn|uyen)", low):
+        return False
+    # Hậu tố tiếng Anh hay gặp khi VietOCR hallucinate trên cột email
+    if any(suf in low for suf in ("tion", "sion", "ment", "able", "ious", "ness", "ally", "ical")):
+        return True
+    # Từ dài toàn chữ cái latin không giống tên VN
+    if len(low) >= 12 and re.fullmatch(r"[a-z]+", low):
+        vowels = sum(c in "aeiou" for c in low)
+        if vowels >= 4:
+            return True
+    return False
+
 def _is_garbage_local(local: str) -> bool:
     if not local or len(local) < 3:
         return True
     if any(frag in local for frag in _DOMAIN_FRAGMENTS):
         return True
     if not re.fullmatch(r"[a-z][a-z0-9._-]{2,24}", local):
+        return True
+    if _looks_like_hallucinated_email_local(local):
         return True
     return False
 
@@ -89,7 +113,9 @@ def reconcile_agribank_email(
     if not ocr and ipcas_email:
         return ipcas_email, "ipcas"
     if not ipcas_email:
-        return ocr if ocr.endswith(_DOMAIN) else "", "ocr" if ocr else "empty"
+        if ocr.endswith(_DOMAIN) and ocr_local and not _is_garbage_local(ocr_local):
+            return ocr, "ocr"
+        return "", "empty"
 
     if ocr_local and ipcas_local and ocr_local == ipcas_local:
         return ocr if ocr.endswith(_DOMAIN) else f"{ocr_local}{_DOMAIN}", "ocr"
@@ -109,7 +135,7 @@ def reconcile_agribank_email(
     ):
         return f"{ocr_local}{_DOMAIN}", "ocr"
 
-    if _is_garbage_local(ocr_local):
+    if _is_garbage_local(ocr_local) or _looks_like_hallucinated_email_local(ocr_local):
         return ipcas_email, "ipcas_override"
 
     if ocr.endswith(_DOMAIN):

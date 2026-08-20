@@ -26,3 +26,6 @@ venv/
 venv-*/
 **/venv*/
 ocr-service/venv-vietocr-gpu/
+
+# Archives / local artifacts
+*.tar

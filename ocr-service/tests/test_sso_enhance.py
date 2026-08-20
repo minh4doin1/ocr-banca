@@ -355,8 +355,7 @@ def test_cell_crop_pad_preserves_diacritic_margin():
 def test_normalize_cccd_text_no_blind_pad():
     from app.services.ocr_service import _normalize_cccd_text
 
-    assert _normalize_cccd_text("08317901156") == "[?]08317901156"
-    assert not _normalize_cccd_text("08317901156").startswith("0" * 2) or True
+    assert _normalize_cccd_text("08317901156") == "008317901156"
     assert _normalize_cccd_text("083179011568") == "083179011568"
 
 

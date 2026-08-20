@@ -1,4 +1,4 @@
-"""
+﻿"""
 User Mapping — Chuyển kết quả OCR (bảng) sang danh sách KeycloakUserInput.
 """
 
@@ -464,9 +464,6 @@ def _is_sso_data_first_row(row: list[str]) -> bool:
         return True
     if len(row) < 5:
         return False
-    ipcas = (row[4] or "").strip().upper()
-    if ipcas.startswith("QSO"):
-        return True
     if len(row) < 8:
         return False
     name = (row[1] or "").strip()
@@ -518,15 +515,25 @@ def _sso_data_col_map(num_cols: int) -> dict[str, int]:
     return out
 
 
+def _normalize_ipcas_code(raw: str) -> str:
+    from app.services.ocr_service import _normalize_sso_ipcas
+
+    return _normalize_sso_ipcas(raw)
+
+
 def _extract_cccd_from_cell(raw: str) -> str:
     compact = re.sub(r"\s", "", raw or "")
+    if compact and re.fullmatch(r"[A-Za-z]{6,}", compact) and not re.search(r"\d", compact):
+        return ""
     m = re.search(r"\d{12}", compact)
     if m:
         return m.group(0)
     digits = re.sub(r"\D", "", compact)
     if len(digits) >= 12:
         return digits[:12]
-    return (raw or "").strip()
+    if len(digits) >= 9:
+        return digits
+    return ""
 
 
 def _resolve_col_map(
@@ -790,15 +797,50 @@ def map_table_to_users(
 
         username = _val("username")
         email = _val("email")
-        ipcas = _val("ipcas_code")
+        ipcas = _normalize_ipcas_code(_val("ipcas_code"))
 
+        ipcas_email = _derive_agribank_email(ipcas) if ipcas else ""
         reconciled_email, _email_src = reconcile_agribank_email(email, ipcas)
         if reconciled_email:
             email = reconciled_email
-        elif not email and ipcas:
-            email = _derive_agribank_email(ipcas)
+        elif ipcas_email:
+            email = ipcas_email
+        from app.services.email_reconcile import (
+            _email_local,
+            _is_garbage_local,
+            _looks_like_hallucinated_email_local,
+        )
+
+        ocr_local = _email_local(email)
+        if email and (
+            _is_garbage_local(ocr_local)
+            or _looks_like_hallucinated_email_local(ocr_local)
+            or "agribank" in ocr_local
+        ):
+            email = ipcas_email or ""
+        if ipcas_email and (
+            not email
+            or _is_garbage_local(_email_local(email))
+            or _looks_like_hallucinated_email_local(_email_local(email))
+        ):
+            from app.services.ocr_service import _is_gibberish_text as _ipcas_gib
+
+            if re.match(r"^(LAN|QSO)[A-Z0-9]{4,12}$", ipcas.upper()) and not _ipcas_gib(ipcas):
+                email = ipcas_email
         if not username:
-            username = email or _derive_agribank_email(ipcas)
+            username = email or ipcas_email
+        if not username and not email:
+            phone_digits = re.sub(r"\D", "", _val("phone"))
+            cccd_digits = re.sub(r"\D", "", _val("cccd"))
+            if ipcas_email:
+                username = ipcas_email
+                email = ipcas_email
+            elif _val("name").strip() and re.fullmatch(r"0\d{8,10}", phone_digits):
+                username = "user" + phone_digits + "@agribank.com.vn"
+                email = username
+            elif _val("name").strip() and len(cccd_digits) >= 9:
+                username = "cccd" + cccd_digits[-9:] + "@agribank.com.vn"
+                email = username
         if not username and not email:
             stt = _val("stt") or str(row_idx + 1)
             name_hint = _compose_name(_val("first_name"), _val("last_name"), _val("name"))

@@ -73,7 +73,7 @@ class Settings(BaseSettings):
     # Cột email (0-based); -1 = tự đoán theo layout SSO (thường cột 5)
     ocr_sso_email_col: int = -1
     ocr_sso_email_ipcas_priority: bool = True
-    ocr_sso_critical_col_upscale: float = 2.5
+    ocr_sso_critical_col_upscale: float = 3.0
     ocr_sso_role_fuzzy_threshold: float = 0.72
     ocr_sso_pass2_enabled: bool = True
 
@@ -311,6 +311,7 @@ class Settings(BaseSettings):
             return False
         port = parsed.port or 80
         return port == self.port
+
     @property
     def keycloak_default_required_actions_list(self) -> list[str]:
         """Parse default required actions from comma-separated string."""
