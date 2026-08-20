@@ -9,6 +9,7 @@ This is the core OCR engine that:
 
 from __future__ import annotations
 
+import contextvars
 import inspect
 import logging
 import os
@@ -36,7 +37,7 @@ if _sys.platform == "win32":
         pass
 
 from app.config import settings
-from app.models.schemas import CellData, PageResult, TableData
+from app.models.schemas import CellData, OcrFormHints, PageResult, TableData
 from app.services.gpu_runtime import setup_gpu_path, gpu_inference_lock
 from app.utils.image_utils import (
     deskew_image,
@@ -54,6 +55,32 @@ def consume_sso_postprocess_warnings() -> list[str]:
     out = list(_SSO_POSTPROCESS_WARNINGS)
     _SSO_POSTPROCESS_WARNINGS.clear()
     return out
+
+
+# Per-job form hints (layout / branch / first-user anchor) — set by table_service.
+_ocr_form_hints: contextvars.ContextVar[OcrFormHints | None] = contextvars.ContextVar(
+    "ocr_form_hints", default=None
+)
+
+
+def set_ocr_form_hints(hints: OcrFormHints | None):
+    """Activate form hints for the current OCR job (thread/context scoped)."""
+    return _ocr_form_hints.set(hints)
+
+
+def reset_ocr_form_hints(token) -> None:
+    _ocr_form_hints.reset(token)
+
+
+def get_ocr_form_hints() -> OcrFormHints | None:
+    return _ocr_form_hints.get()
+
+
+def _hint_prefer_cols(default: int = 10) -> int:
+    hints = get_ocr_form_hints()
+    if hints and hints.layout_cols in (9, 10):
+        return int(hints.layout_cols)
+    return default
 
 # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # GPU guard â€” hide CUDA from Paddle unless GPU is explicitly enabled.
@@ -2756,7 +2783,7 @@ def _normalize_sso_ipcas(text: str) -> str:
     folded = unicodedata.normalize("NFKD", t)
     folded = "".join(c for c in folded if not unicodedata.combining(c))
     compact = re.sub(r"\s", "", folded.upper())
-    if compact.isdigit() and len(compact) > 6:
+    if compact.isdigit() and len(compact) > 10:
         return ""
     best = ""
     if re.fullmatch(r"[A-Z][A-Z0-9]{3,15}", compact):
@@ -2771,8 +2798,11 @@ def _normalize_sso_ipcas(text: str) -> str:
             best = letters[0]
         elif re.fullmatch(r"[A-Z][A-Z0-9]{2,12}", compact):
             best = compact
+        elif re.search(r"[A-Z]", compact):
+            # Giữ token có chữ cái thay vì trả rỗng — user có thể sửa ở bước review
+            best = compact[:16]
         else:
-            return t
+            return ""
 
     if not best:
         return best
@@ -4115,7 +4145,7 @@ def _prepare_sso_grid_draft_opencv(
     page_number: int,
     *,
     already_deskewed: bool = False,
-    prefer_cols: int = 10,
+    prefer_cols: int | None = None,
 ) -> SsoGridDraft | None:
     """
     OpenCV-only SSO grid draft — no Paddle line detection / OneDNN.
@@ -4125,6 +4155,8 @@ def _prepare_sso_grid_draft_opencv(
     vertical morphology (tall kernel) erases short ruling lines above the
     signature block.
     """
+    prefer_cols = prefer_cols if prefer_cols in (9, 10) else _hint_prefer_cols(10)
+
     def _maybe_deskew(crop: np.ndarray) -> np.ndarray:
         if settings.ocr_sso_enhance and not already_deskewed:
             return deskew_image(crop)
@@ -4206,7 +4238,9 @@ def _prepare_sso_grid_draft(
     rows = _cluster_line_boxes_into_rows(line_boxes)
     header_y = _find_table_top_y(image, rows)
     sso_header = header_y is not None
-    prefer_cols = 10
+    prefer_cols = _hint_prefer_cols(10)
+    hints = get_ocr_form_hints()
+    forced_layout = bool(hints and hints.layout_cols in (9, 10))
 
     def _maybe_deskew(crop: np.ndarray) -> np.ndarray:
         if settings.ocr_sso_enhance and not already_deskewed:
@@ -4220,7 +4254,8 @@ def _prepare_sso_grid_draft(
                 continue
             texts = _recognize_row_boxes(image, row)
             if _score_sso_header_row(texts) >= 3:
-                prefer_cols = _sso_layout_from_header_text(" ".join(texts))
+                if not forced_layout:
+                    prefer_cols = _sso_layout_from_header_text(" ".join(texts))
                 break
         crop = _maybe_deskew(image[table_top:, :])
         grid = _detect_sso_grid_for_crop(crop, prefer_cols=prefer_cols)
@@ -4781,6 +4816,131 @@ def _sso_field_order(num_cols: int) -> list[str]:
     ]
 
 
+def _align_and_fill_with_form_hints(cells: list[CellData]) -> list[CellData]:
+    """Use user-declared first-row anchor to fix column shift and fill blanks."""
+    import re
+    from collections import defaultdict
+
+    hints = get_ocr_form_hints()
+    if not hints or not cells:
+        return cells
+
+    layout = hints.layout_cols if hints.layout_cols in (9, 10) else 10
+    field_cols = {
+        "ipcas_code": 4 if layout >= 10 else 3,
+        "cccd": 5 if layout >= 10 else 4,
+        "email": 6 if layout >= 10 else 5,
+        "name": 1,
+        "branch_code": 2,
+    }
+
+    by_row: dict[int, dict[int, CellData]] = defaultdict(dict)
+    for c in cells:
+        by_row[c.row][c.col] = c
+    if not by_row:
+        return cells
+
+    anchor_ipcas = _normalize_sso_ipcas(hints.anchor_ipcas or "")
+    anchor_cccd = re.sub(r"\D", "", hints.anchor_cccd or "")
+    anchor_email = (hints.anchor_email or "").strip().lower()
+    if anchor_email and "@" not in anchor_email:
+        anchor_email = f"{anchor_email}@agribank.com.vn"
+
+    # Detect column shift: find which col holds known CCCD / IPCAS on early rows
+    found_col: int | None = None
+    expected_col: int | None = None
+    for row in sorted(by_row)[:8]:
+        cols = by_row[row]
+        for col, cell in cols.items():
+            text = (cell.text or "").strip()
+            digits = re.sub(r"\D", "", text)
+            token = _normalize_sso_ipcas(text)
+            if anchor_cccd and len(anchor_cccd) >= 9 and len(digits) >= 9:
+                if digits == anchor_cccd or digits.endswith(anchor_cccd[-9:]) or anchor_cccd.endswith(digits[-9:]):
+                    found_col, expected_col = col, field_cols["cccd"]
+                    break
+            if anchor_ipcas and token and token == anchor_ipcas:
+                found_col, expected_col = col, field_cols["ipcas_code"]
+                break
+        if found_col is not None:
+            break
+
+    out = cells
+    if (
+        found_col is not None
+        and expected_col is not None
+        and found_col != expected_col
+        and abs(found_col - expected_col) <= 2
+    ):
+        delta = expected_col - found_col
+        # Dịch cả khối field từ Tên CN / IPCAS trở đi, không chỉ ô tìm thấy
+        block_start = 3 if layout >= 10 else 2
+        out = _apply_partial_column_shift(
+            cells,
+            from_col=min(block_start, found_col, expected_col),
+            shift=delta,
+            num_fields=layout,
+            # Hàng mẫu là dòng dữ liệu — không giữ nguyên như header OCR
+            header_rows=set(),
+        )
+        msg = f"Đã căn cột theo hàng mẫu (dịch {delta:+d})."
+        if msg not in _SSO_POSTPROCESS_WARNINGS:
+            _SSO_POSTPROCESS_WARNINGS.append(msg)
+        by_row = defaultdict(dict)
+        for c in out:
+            by_row[c.row][c.col] = c
+
+    # Fill blank fields on first data-like row from anchor
+    if not hints.has_anchor() and not (hints.branch_code or "").strip():
+        return out
+
+    data_rows = sorted(by_row)
+    if not data_rows:
+        return out
+    first = data_rows[0]
+    cols = by_row[first]
+    fills: list[tuple[int, str]] = []
+    if hints.anchor_name and not ((cols.get(1).text if cols.get(1) else "") or "").strip():
+        fills.append((1, hints.anchor_name.strip()))
+    bc = re.sub(r"\D", "", hints.branch_code or "")[:4]
+    if bc and not ((cols.get(2).text if cols.get(2) else "") or "").strip():
+        fills.append((2, bc))
+    if anchor_ipcas:
+        ip_cell = cols.get(field_cols["ipcas_code"])
+        cur = _normalize_sso_ipcas((ip_cell.text if ip_cell else "") or "")
+        cur_digits = re.sub(r"\D", "", (ip_cell.text if ip_cell else "") or "")
+        # Chỉ điền khi trống / nhiễu số — không ghi đè CCCD đang nằm nhầm cột
+        if not cur and len(cur_digits) < 9:
+            fills.append((field_cols["ipcas_code"], anchor_ipcas))
+    if len(anchor_cccd) >= 9:
+        cur_d = re.sub(
+            r"\D",
+            "",
+            (cols.get(field_cols["cccd"]).text if cols.get(field_cols["cccd"]) else "") or "",
+        )
+        if len(cur_d) < 9:
+            fills.append((field_cols["cccd"], anchor_cccd[:12]))
+    if anchor_email:
+        cur_e = ((cols.get(field_cols["email"]).text if cols.get(field_cols["email"]) else "") or "").strip()
+        if not cur_e or "agribank" not in cur_e.lower():
+            fills.append((field_cols["email"], anchor_email))
+
+    if not fills:
+        return out
+
+    by_key = {(c.row, c.col): c for c in out}
+    for col, text in fills:
+        key = (first, col)
+        if key in by_key:
+            by_key[key].text = text
+            by_key[key].confidence = max(by_key[key].confidence or 0.0, 0.99)
+        else:
+            by_key[key] = CellData(
+                row=first, col=col, text=text, confidence=0.99, bbox=[]
+            )
+    return sorted(by_key.values(), key=lambda c: (c.row, c.col))
+
+
 def _row_matches_left_shift_from_branch(cols: dict[int, CellData]) -> bool:
     """Mẫu lệch trái từ branch_name: col3=IPCAS, col4=CCCD, col6=phone@, col7=role."""
     import re
@@ -4989,6 +5149,14 @@ def _apply_branch_ipcas_prefix(cells: list[CellData]) -> list[CellData]:
         by_row[c.row][c.col] = c
 
     prefixes: list[str] = []
+    hints = get_ocr_form_hints()
+    if hints and (hints.branch_code or "").strip():
+        code4 = re.sub(r"\D", "", hints.branch_code)[:4]
+        if code4 in _BRANCH_IPCAS_PREFIX:
+            prefixes.append(_BRANCH_IPCAS_PREFIX[code4])
+        elif len(code4) == 4:
+            # Unknown branch — still try LAN for agribank forms when user set CN
+            prefixes.append("LAN")
     for row, cols in by_row.items():
         if row in header_rows:
             continue
@@ -5276,6 +5444,7 @@ def _postprocess_sso_cells(
     # After shift, fill branch_name from code→name map (shared across pages if given)
     renumbered = _fill_sso_branch_names(renumbered, branch_map)
     renumbered = _apply_branch_ipcas_prefix(renumbered)
+    renumbered = _align_and_fill_with_form_hints(renumbered)
     renumbered.sort(key=lambda c: (c.row, c.col))
 
     if any(

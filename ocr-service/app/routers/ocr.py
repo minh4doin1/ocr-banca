@@ -21,6 +21,7 @@ from app.models.schemas import (
     JobStatus,
     OcrEnvProfile,
     OcrEnvironmentsResponse,
+    OcrFormHints,
     OcrResult,
     OcrRuntimeConfig,
     OcrValidationResponse,
@@ -218,6 +219,7 @@ async def upload_pdf(
     remote_url: str = Form(default=""),
     remote_token: str = Form(default=""),
     template_id: str = Form(default=""),
+    ocr_hints: str = Form(default=""),
 ):
     """Upload a PDF file for OCR processing."""
 
@@ -293,6 +295,19 @@ async def upload_pdf(
     if mode == ProcessingMode.REMOTE:
         use_gpu_flag = True
 
+    parsed_hints: OcrFormHints | None = None
+    raw_hints = (ocr_hints or "").strip()
+    if raw_hints:
+        try:
+            import json as _json
+
+            parsed_hints = OcrFormHints.model_validate(_json.loads(raw_hints))
+        except Exception as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"ocr_hints không hợp lệ: {exc}",
+            ) from exc
+
     create_job(
         job_id,
         file.filename,
@@ -303,6 +318,7 @@ async def upload_pdf(
         remote_provider=remote_provider_enum,
         remote_url=remote_url,
         template_id=resolved_template,
+        ocr_hints=parsed_hints,
     )
     if mode == ProcessingMode.REMOTE:
         set_job_remote_token(job_id, remote_token)

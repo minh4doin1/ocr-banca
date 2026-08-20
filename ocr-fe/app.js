@@ -1,11 +1,11 @@
 /* ============================================================
-   Agribank Banca OCR â Client Application (Excel-flow)
+   Agribank Banca OCR — Client Application (Excel-flow)
    ============================================================ */
 
 const _devFePorts = new Set(['5173', '3000', '5500']);
 const ENV_STORAGE_KEY = 'ocr_keycloak_env_v1';
 const ENV_META_CACHE_KEY = 'ocr_keycloak_env_meta_v2';
-/** Chá» Vite FE má»i trá» localhost:8100; khi má» tá»« :8100/LAN/Tailscale â same-origin */
+/** Chỉ Vite FE mới trỏ localhost:8100; khi mở từ :8100/LAN/Tailscale → same-origin */
 const _viteApiBase = _devFePorts.has(window.location.port) ? 'http://localhost:8100' : '';
 
 let prodKeycloakReady = false;
@@ -16,12 +16,12 @@ function getActiveEnvId() {
     return activeEnvId;
 }
 
-/** Backend OCR â luÃ´n cÃ¹ng mÃ¡y Äang má» FE (khÃ´ng Äá»i khi chuyá»n KC DEV/PROD) */
+/** Backend OCR — luôn cùng máy đang mở FE (không đổi khi chuyển KC DEV/PROD) */
 function getApiBase() {
     return (_viteApiBase || '').replace(/\/$/, '');
 }
 
-/** Chá» Ã¡p dá»¥ng cho API táº¡o lÃ´ user / Keycloak */
+/** Chỉ áp dụng cho API tạo lô user / Keycloak */
 function getTargetEnvHeaders() {
     return { 'X-OCR-Target-Env': activeEnvId };
 }
@@ -46,7 +46,7 @@ function _writeEnvMeta(meta) {
 }
 
 async function loadEnvironmentProfiles() {
-    // XÃ³a cache cÅ© tá»«ng Ã©p api_base=localhost (gÃ¢y lá»i khi má» qua LAN/Tailscale)
+    // Xóa cache cũ từng ép api_base=localhost (gây lỗi khi mở qua LAN/Tailscale)
     try {
         localStorage.removeItem('ocr_keycloak_env_meta_v1');
         localStorage.removeItem('ocr_api_env_profiles_v1');
@@ -74,7 +74,7 @@ async function loadEnvironmentProfiles() {
             prod_label: prodKeycloakLabel,
         });
     } catch {
-        /* giá»¯ cache / máº·c Äá»nh */
+        /* giữ cache / mặc định */
     }
 }
 
@@ -88,20 +88,20 @@ function updateEnvUi() {
         badge.classList.remove('env-dev', 'env-prod', 'env-mismatch');
         badge.classList.add(isProd ? 'env-prod' : 'env-dev');
         badge.title = isProd
-            ? `Táº¡o lÃ´ user â Keycloak PROD (${prodKeycloakLabel || 'production'})`
-            : 'Táº¡o lÃ´ user â Keycloak DEV';
+            ? `Tạo lô user → Keycloak PROD (${prodKeycloakLabel || 'production'})`
+            : 'Tạo lô user → Keycloak DEV';
     }
     if (btn) {
         if (!isProd && !prodKeycloakReady) {
             btn.disabled = true;
-            btn.textContent = 'PROD chÆ°a cáº¥u hÃ¬nh';
-            btn.title = 'ThÃªm KEYCLOAK_PROD_* trong .env rá»i restart server';
+            btn.textContent = 'PROD chưa cấu hình';
+            btn.title = 'Thêm KEYCLOAK_PROD_* trong .env rồi restart server';
         } else {
             btn.disabled = false;
-            btn.textContent = isProd ? 'Chuyá»n KC DEV' : 'Chuyá»n KC PROD';
+            btn.textContent = isProd ? 'Chuyển KC DEV' : 'Chuyển KC PROD';
             btn.title = isProd
-                ? 'Táº¡o lÃ´ sáº½ gá»i Keycloak DEV'
-                : 'Táº¡o lÃ´ sáº½ gá»i Keycloak PROD (OCR váº«n cháº¡y trÃªn server hiá»n táº¡i)';
+                ? 'Tạo lô sẽ gọi Keycloak DEV'
+                : 'Tạo lô sẽ gọi Keycloak PROD (OCR vẫn chạy trên server hiện tại)';
         }
     }
 }
@@ -109,22 +109,22 @@ function updateEnvUi() {
 async function switchEnvironment() {
     const targetId = activeEnvId === 'dev' ? 'prod' : 'dev';
     if (targetId === 'prod' && !prodKeycloakReady) {
-        notify('warning', 'ChÆ°a cáº¥u hÃ¬nh Keycloak PROD', 'ThÃªm KEYCLOAK_PROD_BASE_URL + KEYCLOAK_PROD_CLIENT_SECRET trong .env.');
+        notify('warning', 'Chưa cấu hình Keycloak PROD', 'Thêm KEYCLOAK_PROD_BASE_URL + KEYCLOAK_PROD_CLIENT_SECRET trong .env.');
         return;
     }
     activeEnvId = targetId;
     localStorage.setItem(ENV_STORAGE_KEY, activeEnvId);
     updateEnvUi();
-    // KhÃ´ng gá»i láº¡i field-config / khÃ´ng Äá»i API base â trÃ¡nh lá»i káº¿t ná»i BE
+    // Không gọi lại field-config / không đổi API base — tránh lỗi kết nối BE
     const label = targetId === 'prod' ? 'Keycloak PROD' : 'Keycloak DEV';
-    notify('success', `ÄÃ£ chuyá»n sang ${label}`, 'OCR khÃ´ng Äá»i. Chá» bÆ°á»c Táº¡o lÃ´ user dÃ¹ng Keycloak má»i.', 5000);
+    notify('success', `Đã chuyển sang ${label}`, 'OCR không đổi. Chỉ bước Tạo lô user dùng Keycloak mới.', 5000);
 }
 
 window.getApiBase = getApiBase;
 window.getActiveEnvId = getActiveEnvId;
 window.switchEnvironment = switchEnvironment;
 
-// ââ State ââ
+// ── State ──
 let currentStep = 0;
 let selectedFile = null;
 let jobId = '';
@@ -137,7 +137,7 @@ let runtimeConfig = null;
 let uploadSource = 'pdf'; // 'pdf' | 'excel'
 const selectedExportPages = new Set();
 
-// ââ DOM refs ââ
+// ── DOM refs ──
 const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => document.querySelectorAll(sel);
 
@@ -323,7 +323,7 @@ function escapeAttr(str) {
     return String(str ?? '').replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
 }
 
-// ââ Init ââ
+// ── Init ──
 document.addEventListener('DOMContentLoaded', async () => {
     setupNotifyLog();
     await loadEnvironmentProfiles();
@@ -337,6 +337,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     await loadFieldConfig();
     await loadTemplates();
     setupUpload();
+    setupFormHints();
     setupProcessing();
     setupReviewNav();
     setupSuccessButtons();
@@ -353,8 +354,8 @@ async function loadRuntimeConfig() {
             runtimeConfig = await res.json();
             if (runtimeConfig.internal_gpu_configured) {
                 internalGpuLabel.textContent = runtimeConfig.internal_gpu_label
-                    ? `MÃ¡y chá»§ GPU: ${runtimeConfig.internal_gpu_label}`
-                    : 'MÃ¡y chá»§ GPU ná»i bá»';
+                    ? `Máy chủ GPU: ${runtimeConfig.internal_gpu_label}`
+                    : 'Máy chủ GPU nội bộ';
             } else {
                 chipInternalGpu.classList.add('disabled');
                 chipInternalGpu.querySelector('input').disabled = true;
@@ -409,7 +410,7 @@ function resetAll() {
     if (excelInput) excelInput.value = '';
     if (docxInput) docxInput.value = '';
     if (excelInputReupload) excelInputReupload.value = '';
-    if (fileNameLabel) fileNameLabel.textContent = 'ChÆ°a chá»n file';
+    if (fileNameLabel) fileNameLabel.textContent = 'Chưa chọn file';
     if (logConsole) logConsole.innerHTML = '';
     if (pageStatusGrid) pageStatusGrid.innerHTML = '';
     excelCompletePanel?.classList.add('hidden');
@@ -497,7 +498,7 @@ function setupUpload() {
     btnTestColab?.addEventListener('click', (e) => { e.preventDefault(); testWorker('colab'); });
     document.getElementById('btn-clear-file')?.addEventListener('click', (e) => {
         e.preventDefault();
-        if (confirm('XÃ³a file vÃ  lÃ m láº¡i tá»« Äáº§u?')) resetAll();
+        if (confirm('Xóa file và làm lại từ đầu?')) resetAll();
     });
 }
 
@@ -513,7 +514,7 @@ function setupProcessing() {
     btnDownloadPagesExcel?.addEventListener('click', () => {
         const pages = Array.from(selectedExportPages).sort((a, b) => a - b);
         if (!pages.length) {
-            notify('warn', 'ChÆ°a chá»n trang', 'Tick Ã­t nháº¥t má»t trang ÄÃ£ OCR xong.');
+            notify('warn', 'Chưa chọn trang', 'Tick ít nhất một trang đã OCR xong.');
             return;
         }
         downloadExcelPages(pages);
@@ -521,7 +522,7 @@ function setupProcessing() {
     btnDownloadPagesDocx?.addEventListener('click', () => {
         const pages = Array.from(selectedExportPages).sort((a, b) => a - b);
         if (!pages.length) {
-            notify('warn', 'ChÆ°a chá»n trang', 'Tick Ã­t nháº¥t má»t trang ÄÃ£ xong.');
+            notify('warn', 'Chưa chọn trang', 'Tick ít nhất một trang đã xong.');
             return;
         }
         downloadDocxPages(pages);
@@ -575,7 +576,7 @@ function getModeKind() {
 async function testWorker(provider) {
     const resultEl = provider === 'internal' ? internalHealthResult : colabHealthResult;
     resultEl.classList.remove('hidden', 'ok', 'err');
-    resultEl.textContent = 'Äang kiá»m tra...';
+    resultEl.textContent = 'Đang kiểm tra...';
     const params = new URLSearchParams({ provider });
     if (provider === 'colab') {
         params.set('url', colabUrlInput.value.trim());
@@ -586,14 +587,14 @@ async function testWorker(provider) {
         const data = await res.json();
         if (data.reachable && data.status === 'healthy') {
             resultEl.classList.add('ok');
-            resultEl.textContent = `â Worker online${data.use_gpu ? ' (GPU)' : ''}`;
+            resultEl.textContent = `✓ Worker online${data.use_gpu ? ' (GPU)' : ''}`;
         } else {
             resultEl.classList.add('err');
-            resultEl.textContent = `â ${data.detail || data.status || 'KhÃ´ng káº¿t ná»i ÄÆ°á»£c'}`;
+            resultEl.textContent = `✗ ${data.detail || data.status || 'Không kết nối được'}`;
         }
     } catch {
         resultEl.classList.add('err');
-        resultEl.textContent = 'â Lá»i káº¿t ná»i tá»i backend';
+        resultEl.textContent = '✗ Lỗi kết nối tới backend';
     }
 }
 
@@ -622,7 +623,7 @@ function syncModeUi() {
     }
 
     if (isLocal) deviceBadge.textContent = getUseGpu() ? 'Local GPU' : 'Local CPU';
-    else if (isInternal) deviceBadge.textContent = 'GPU ná»i bá»';
+    else if (isInternal) deviceBadge.textContent = 'GPU nội bộ';
     else if (isColab) deviceBadge.textContent = 'Colab GPU';
     else if (isApi) deviceBadge.textContent = 'API';
     else deviceBadge.textContent = mode.toUpperCase();
@@ -640,7 +641,7 @@ function getUseGpu() {
 
 function handleFile(file) {
     if (file.type !== 'application/pdf' && !file.name.toLowerCase().endsWith('.pdf')) {
-        notify('error', 'Chá» há» trá»£ file PDF');
+        notify('error', 'Chỉ hỗ trợ file PDF');
         return;
     }
     selectedFile = file;
@@ -658,7 +659,7 @@ function handleFile(file) {
 function handleExcelFile(file, targetJobId = '') {
     const name = (file?.name || '').toLowerCase();
     if (!(name.endsWith('.xlsx') || name.endsWith('.xlsm'))) {
-        notify('error', 'Chá» há» trá»£ Excel .xlsx/.xlsm');
+        notify('error', 'Chỉ hỗ trợ Excel .xlsx/.xlsm');
         return;
     }
     uploadExcel(file, targetJobId);
@@ -667,7 +668,7 @@ function handleExcelFile(file, targetJobId = '') {
 function handleDocxFile(file, targetJobId = '') {
     const name = (file?.name || '').toLowerCase();
     if (!name.endsWith('.docx')) {
-        notify('error', 'Chá» há» trá»£ Word .docx');
+        notify('error', 'Chỉ hỗ trợ Word .docx');
         return;
     }
     uploadDocx(file, targetJobId);
@@ -690,18 +691,18 @@ function routeUploadFile(file) {
         uploadSettings?.classList.add('hidden');
         handleDocxFile(file, '');
     } else {
-        notify('error', 'Äá»nh dáº¡ng khÃ´ng há» trá»£', 'Chá» cháº¥p nháº­n PDF, Word (.docx) hoáº·c Excel (.xlsx/.xlsm)');
+        notify('error', 'Định dạng không hỗ trợ', 'Chỉ chấp nhận PDF, Word (.docx) hoặc Excel (.xlsx/.xlsm)');
     }
 }
 
 async function uploadPdf(file) {
-    updateProgress(2, 'Äang upload file...');
+    updateProgress(2, 'Đang upload file...');
     const modeKind = getModeKind();
 
     if (modeKind.processing_mode === 'remote' && modeKind.remote_provider === 'colab') {
         const url = colabUrlInput.value.trim();
         if (!url) {
-            notify('error', 'Thiáº¿u URL Colab', 'Vui lÃ²ng nháº­p URL tunnel Colab.');
+            notify('error', 'Thiếu URL Colab', 'Vui lòng nhập URL tunnel Colab.');
             setStep(0);
             return;
         }
@@ -715,6 +716,8 @@ async function uploadPdf(file) {
         formData.append('processing_mode', modeKind.processing_mode);
         formData.append('use_gpu', getUseGpu() ? 'true' : 'false');
         formData.append('template_id', getSelectedTemplateId());
+        const hints = collectOcrFormHints();
+        if (hints) formData.append('ocr_hints', JSON.stringify(hints));
         if (modeKind.remote_provider) formData.append('remote_provider', modeKind.remote_provider);
         if (modeKind.remote_provider === 'colab') {
             formData.append('remote_url', colabUrlInput.value.trim());
@@ -734,25 +737,25 @@ async function uploadPdf(file) {
         jobId = data.job_id;
         uploadSource = 'pdf';
 
-        let subtitle = `Cháº¿ Äá» ${data.processing_mode.toUpperCase()}`;
-        if (data.remote_provider) subtitle += ` Â· ${data.remote_provider}`;
-        if (data.use_gpu) subtitle += ' Â· GPU';
+        let subtitle = `Chế độ ${data.processing_mode.toUpperCase()}`;
+        if (data.remote_provider) subtitle += ` · ${data.remote_provider}`;
+        if (data.use_gpu) subtitle += ' · GPU';
         processingSubtitle.textContent = subtitle;
 
-        appendLog({ level: 'info', message: `Upload thÃ nh cÃ´ng â Job ${jobId}`, timestamp: new Date().toISOString() });
+        appendLog({ level: 'info', message: `Upload thành công — Job ${jobId}`, timestamp: new Date().toISOString() });
         if (data.queue_position > 1) {
-            appendLog({ level: 'info', message: `Äang xáº¿p hÃ ng GPU â vá» trÃ­ ${data.queue_position}`, timestamp: new Date().toISOString() });
+            appendLog({ level: 'info', message: `Đang xếp hàng GPU — vị trí ${data.queue_position}`, timestamp: new Date().toISOString() });
         }
         startPolling();
     } catch (e) {
-        notify('error', 'Lá»i upload PDF', e.message || 'Kiá»m tra backend port 8100');
+        notify('error', 'Lỗi upload PDF', e.message || 'Kiểm tra backend port 8100');
         setStep(0);
     }
 }
 
 async function uploadExcel(file, targetJobId = '') {
     const isReupload = !!targetJobId;
-    notify('info', isReupload ? 'Äang náº¡p Excel ÄÃ£ sá»­a...' : 'Äang náº¡p Excel...', file.name);
+    notify('info', isReupload ? 'Đang nạp Excel đã sửa...' : 'Đang nạp Excel...', file.name);
 
     try {
         const formData = new FormData();
@@ -762,7 +765,7 @@ async function uploadExcel(file, targetJobId = '') {
 
         const res = await fetch(`${getApiBase()}/api/ocr/upload-excel`, { method: 'POST', body: formData });
         const data = await res.json().catch(() => ({}));
-        if (!res.ok) throw new Error(data.detail || 'Upload Excel tháº¥t báº¡i');
+        if (!res.ok) throw new Error(data.detail || 'Upload Excel thất bại');
 
         jobId = data.job_id;
         stopPolling();
@@ -787,14 +790,14 @@ async function uploadExcel(file, targetJobId = '') {
 
         await submitReview();
     } catch (e) {
-        notify('error', 'Lá»i náº¡p Excel', e.message || 'KhÃ´ng xÃ¡c Äá»nh');
+        notify('error', 'Lỗi nạp Excel', e.message || 'Không xác định');
         if (!isReupload) setStep(0);
     }
 }
 
 async function uploadDocx(file, targetJobId = '') {
     const isReupload = !!targetJobId;
-    notify('info', isReupload ? 'Äang náº¡p Word ÄÃ£ sá»­a...' : 'Äang náº¡p Word...', file.name);
+    notify('info', isReupload ? 'Đang nạp Word đã sửa...' : 'Đang nạp Word...', file.name);
 
     try {
         const formData = new FormData();
@@ -804,7 +807,7 @@ async function uploadDocx(file, targetJobId = '') {
 
         const res = await fetch(`${getApiBase()}/api/ocr/upload-docx`, { method: 'POST', body: formData });
         const data = await res.json().catch(() => ({}));
-        if (!res.ok) throw new Error(data.detail || 'Upload Word tháº¥t báº¡i');
+        if (!res.ok) throw new Error(data.detail || 'Upload Word thất bại');
 
         jobId = data.job_id;
         stopPolling();
@@ -812,14 +815,14 @@ async function uploadDocx(file, targetJobId = '') {
 
         if (!isReupload) {
             uploadSource = 'docx';
-            notify('success', 'Náº¡p Word thÃ nh cÃ´ng', `Job ${jobId} â bá» qua OCR, vÃ o bÆ°á»c kiá»m tra.`);
+            notify('success', 'Nạp Word thành công', `Job ${jobId} — bỏ qua OCR, vào bước kiểm tra.`);
         } else {
-            notify('success', 'ÄÃ£ cáº­p nháº­t tá»« Word', 'Dá»¯ liá»u ÄÃ£ ghi ÄÃ¨, Äang táº£i láº¡i review.');
+            notify('success', 'Đã cập nhật từ Word', 'Dữ liệu đã ghi đè, đang tải lại review.');
         }
 
         await submitReview();
     } catch (e) {
-        notify('error', 'Lá»i náº¡p Word', e.message || 'KhÃ´ng xÃ¡c Äá»nh');
+        notify('error', 'Lỗi nạp Word', e.message || 'Không xác định');
         if (!isReupload) setStep(0);
     }
 }
@@ -847,32 +850,32 @@ async function pollTick() {
 
         if (jobStatus.status === 'completed') {
             stopPolling();
-            updateProgress(100, 'HoÃ n táº¥t!');
-            processingTitle.textContent = 'OCR hoÃ n táº¥t';
-            processingSubtitle.textContent = `ÄÃ£ xá»­ lÃ½ ${totalPages} trang â táº£i Excel Äá» sá»­a`;
+            updateProgress(100, 'Hoàn tất!');
+            processingTitle.textContent = 'OCR hoàn tất';
+            processingSubtitle.textContent = `Đã xử lý ${totalPages} trang — tải Excel để sửa`;
             processingSpinner?.classList.add('hidden');
             partialExcelPanel?.classList.add('hidden');
             excelCompletePanel?.classList.remove('hidden');
-            notify('success', 'OCR hoÃ n táº¥t', 'Táº£i file Excel, sá»­a dá»¯ liá»u rá»i upload láº¡i.');
+            notify('success', 'OCR hoàn tất', 'Tải file Excel, sửa dữ liệu rồi upload lại.');
         } else if (jobStatus.status === 'failed') {
             stopPolling();
-            notify('error', 'Lá»i OCR', jobStatus.error_message || 'KhÃ´ng xÃ¡c Äá»nh');
+            notify('error', 'Lỗi OCR', jobStatus.error_message || 'Không xác định');
             setStep(0);
         }
     } catch {
         stopPolling();
-        notify('error', 'Máº¥t káº¿t ná»i', 'KhÃ´ng thá» káº¿t ná»i server OCR.');
+        notify('error', 'Mất kết nối', 'Không thể kết nối server OCR.');
         setStep(0);
     }
 }
 
 function updateProgressFromJob(job) {
     if (job.status === 'queued') {
-        updateProgress(0, `Äang chá» GPU (hÃ ng Äá»£i #${job.queue_position || '?'})â¦`);
+        updateProgress(0, `Đang chờ GPU (hàng đợi #${job.queue_position || '?'})…`);
         return;
     }
     if (job.status === 'pending') {
-        updateProgress(0, 'Äang khá»i táº¡oâ¦');
+        updateProgress(0, 'Đang khởi tạo…');
         return;
     }
     const total = job.total_pages || 0;
@@ -888,12 +891,12 @@ function updateProgressFromJob(job) {
             : 5;
     progressFill.style.width = `${pct}%`;
     progressText.textContent = `${pct}%`;
-    progressPages.textContent = `${completed} / ${total || 'â¦'} trang`;
+    progressPages.textContent = `${completed} / ${total || '…'} trang`;
     const activePage = processingPage?.page_number
         || (completed < total ? completed + 1 : total);
     processingTitle.textContent = job.status === 'completed'
-        ? 'OCR hoÃ n táº¥t'
-        : `Äang OCR trang ${activePage}/${total || 'â¦'}`;
+        ? 'OCR hoàn tất'
+        : `Đang OCR trang ${activePage}/${total || '…'}`;
 }
 
 function updateProgress(pct, text) {
@@ -928,8 +931,8 @@ function downloadExcelPages(pages) {
     window.open(url);
     const label = pages?.length
         ? `trang ${pages.join(', ')}`
-        : 'toÃ n bá»';
-    notify('info', 'Äang táº£i Excel', `Xuáº¥t ${label} â má» file vÃ  sá»­a trÆ°á»c khi upload láº¡i.`);
+        : 'toàn bộ';
+    notify('info', 'Đang tải Excel', `Xuất ${label} — mở file và sửa trước khi upload lại.`);
 }
 
 function downloadDocxPages(pages) {
@@ -941,8 +944,8 @@ function downloadDocxPages(pages) {
     window.open(url);
     const label = pages?.length
         ? `trang ${pages.join(', ')}`
-        : 'toÃ n bá»';
-    notify('info', 'Äang táº£i Word', `Xuáº¥t ${label} â má» file .docx vÃ  sá»­a hoáº·c náº¡p láº¡i qua Náº¡p Word.`);
+        : 'toàn bộ';
+    notify('info', 'Đang tải Word', `Xuất ${label} — mở file .docx và sửa hoặc nạp lại qua Nạp Word.`);
 }
 
 function syncPageExportDownloadBtn() {
@@ -951,8 +954,8 @@ function syncPageExportDownloadBtn() {
     if (btnDownloadPagesDocx) btnDownloadPagesDocx.disabled = count === 0;
     if (pageExportHint) {
         pageExportHint.textContent = count
-            ? `ÄÃ£ chá»n ${count} trang`
-            : 'Chá»n trang ÄÃ£ OCR xong bÃªn trÃªn';
+            ? `Đã chọn ${count} trang`
+            : 'Chọn trang đã OCR xong bên trên';
     }
 }
 
@@ -981,7 +984,7 @@ function renderPageExportPanel(pageStatuses) {
         const processing = ps.status === 'processing';
         const failed = ps.status === 'failed';
         const checked = done && selectedExportPages.has(ps.page_number);
-        const statusLabel = done ? 'ÄÃ£ xong' : processing ? 'Äang OCR' : failed ? 'Lá»i' : 'Chá»';
+        const statusLabel = done ? 'Đã xong' : processing ? 'Đang OCR' : failed ? 'Lỗi' : 'Chờ';
         const cls = done ? 'page-export-item done' : processing ? 'page-export-item processing' : 'page-export-item';
         return `<label class="${cls}">
             <input type="checkbox" class="page-export-cb" data-page="${ps.page_number}"
@@ -1037,6 +1040,100 @@ let editingTemplate = null;
 function getSelectedTemplateId() {
     const sel = document.getElementById('template-select');
     return (sel?.value || localStorage.getItem(TEMPLATE_STORAGE_KEY) || 'sso-agribank').trim();
+}
+
+const FORM_HINTS_STORAGE_KEY = 'ocr_form_hints_v1';
+
+function collectOcrFormHints() {
+    const layoutEl = document.querySelector('input[name="hint-layout"]:checked');
+    const layoutCols = parseInt(layoutEl?.value || '10', 10);
+    const branch = (document.getElementById('hint-branch-code')?.value || '').replace(/\D/g, '').slice(0, 4);
+    const name = (document.getElementById('hint-anchor-name')?.value || '').trim();
+    const ipcas = (document.getElementById('hint-anchor-ipcas')?.value || '').trim().toUpperCase().replace(/\s+/g, '');
+    const cccd = (document.getElementById('hint-anchor-cccd')?.value || '').replace(/\D/g, '');
+    const email = (document.getElementById('hint-anchor-email')?.value || '').trim().toLowerCase();
+
+    const hints = {
+        layout_cols: layoutCols === 9 ? 9 : 10,
+        branch_code: branch,
+        anchor_name: name,
+        anchor_ipcas: ipcas,
+        anchor_cccd: cccd,
+        anchor_email: email,
+    };
+    try {
+        localStorage.setItem(FORM_HINTS_STORAGE_KEY, JSON.stringify(hints));
+    } catch (_) { /* ignore */ }
+    return hints;
+}
+
+function updateFormHintsBadge() {
+    const badge = document.getElementById('form-hints-badge');
+    if (!badge) return;
+    const h = collectOcrFormHints();
+    const parts = [`${h.layout_cols} cột`];
+    if (h.branch_code) parts.push(`CN ${h.branch_code}`);
+    if (h.anchor_ipcas || h.anchor_cccd || h.anchor_email) parts.push('có hàng mẫu');
+    const ready = !!(h.branch_code || h.anchor_ipcas || h.anchor_cccd || h.anchor_email);
+    badge.textContent = ready ? parts.join(' · ') : `${h.layout_cols} cột · chưa khai báo thêm`;
+    badge.classList.toggle('is-ready', ready);
+}
+
+function setupFormHints() {
+    const card = document.getElementById('form-hints-card');
+    if (!card) return;
+
+    try {
+        const saved = JSON.parse(localStorage.getItem(FORM_HINTS_STORAGE_KEY) || 'null');
+        if (saved && typeof saved === 'object') {
+            const layout = String(saved.layout_cols === 9 ? 9 : 10);
+            const layoutRadio = document.querySelector(`input[name="hint-layout"][value="${layout}"]`);
+            if (layoutRadio) layoutRadio.checked = true;
+            const bc = String(saved.branch_code || '');
+            const preset =
+                bc === '6600' || bc === '3000' ? bc : bc ? 'other' : '';
+            const presetRadio = document.querySelector(
+                `input[name="hint-branch-preset"][value="${preset}"]`,
+            );
+            if (presetRadio) presetRadio.checked = true;
+            const branchInp = document.getElementById('hint-branch-code');
+            if (branchInp) {
+                branchInp.value = bc;
+                branchInp.disabled = preset === '';
+            }
+            if (saved.anchor_name) document.getElementById('hint-anchor-name').value = saved.anchor_name;
+            if (saved.anchor_ipcas) document.getElementById('hint-anchor-ipcas').value = saved.anchor_ipcas;
+            if (saved.anchor_cccd) document.getElementById('hint-anchor-cccd').value = saved.anchor_cccd;
+            if (saved.anchor_email) document.getElementById('hint-anchor-email').value = saved.anchor_email;
+            if (saved.anchor_ipcas || saved.anchor_cccd || saved.anchor_email || saved.anchor_name) {
+                const det = document.getElementById('form-hints-anchor');
+                if (det) det.open = true;
+            }
+        }
+    } catch (_) { /* ignore */ }
+
+    card.querySelectorAll('input').forEach((el) => {
+        el.addEventListener('change', () => {
+            if (el.name === 'hint-branch-preset') {
+                const branchInp = document.getElementById('hint-branch-code');
+                if (!branchInp) return;
+                if (el.value === '') {
+                    branchInp.value = '';
+                    branchInp.disabled = true;
+                } else if (el.value === 'other') {
+                    branchInp.disabled = false;
+                    if (branchInp.value === '6600' || branchInp.value === '3000') branchInp.value = '';
+                    branchInp.focus();
+                } else {
+                    branchInp.disabled = false;
+                    branchInp.value = el.value;
+                }
+            }
+            updateFormHintsBadge();
+        });
+        el.addEventListener('input', updateFormHintsBadge);
+    });
+    updateFormHintsBadge();
 }
 
 async function loadTemplates() {

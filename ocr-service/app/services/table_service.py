@@ -7,6 +7,7 @@ Manages the end-to-end flow:
 
 from __future__ import annotations
 
+import contextvars
 import json
 import logging
 import os
@@ -21,6 +22,7 @@ from app.models.schemas import (
     JobLogEntry,
     JobStatus,
     LogLevel,
+    OcrFormHints,
     OcrResult,
     PageResult,
     PageStatus,
@@ -41,6 +43,8 @@ from app.services.ocr_service import (
     prepare_page_draft,
     probe_local_gpu,
     process_page,
+    reset_ocr_form_hints,
+    set_ocr_form_hints,
 )
 from app.services.pdf_service import (
     convert_pdf_page,
@@ -190,6 +194,7 @@ def create_job(
     remote_provider: RemoteProvider | None = None,
     remote_url: str = "",
     template_id: str = "sso-agribank",
+    ocr_hints: "OcrFormHints | None" = None,
 ) -> JobInfo:
     """Create a new OCR job."""
     pdf_path = Path(pdf_path)
@@ -204,6 +209,7 @@ def create_job(
         remote_provider=remote_provider,
         remote_url=remote_url,
         template_id=template_id or "sso-agribank",
+        ocr_hints=ocr_hints,
         status=JobStatus.PENDING,
         total_pages=total_pages,
         created_at=datetime.now(),
@@ -410,12 +416,13 @@ def _process_local_pages_pipelined(
 
             rec_future: Future[PageResult] | None = None
             if pending_draft is not None and pending_path is not None:
-                rec_future = recognize_pool.submit(
-                    complete_draft_page,
-                    pending_path,
-                    pending_draft,
-                    use_gpu=use_gpu,
-                )
+                path_snap, draft_snap = pending_path, pending_draft
+                ctx = contextvars.copy_context()
+
+                def _recognize() -> PageResult:
+                    return complete_draft_page(path_snap, draft_snap, use_gpu=use_gpu)
+
+                rec_future = recognize_pool.submit(ctx.run, _recognize)
 
             img = load_page_image(image_path)
             current_draft = prepare_page_draft(img, i)
@@ -562,12 +569,18 @@ def process_job(
     if not job:
         raise ValueError(f"Job not found: {job_id}")
 
+    hints_token = set_ocr_form_hints(job.ocr_hints)
     try:
         begin_ocr_job()
         job.status = JobStatus.PROCESSING
         job.use_gpu = use_gpu
         job.updated_at = datetime.now()
 
+        if job.ocr_hints:
+            _append_log(
+                job,
+                f"Khai báo form: {job.ocr_hints.summary_line()}",
+            )
         device_label = "GPU" if use_gpu else "CPU"
         worker_label = os.environ.get("OCR_WORKER_LABEL", "").strip()
         if worker_label:
@@ -781,6 +794,7 @@ def process_job(
         _append_log(job, f"Lỗi xử lý: {e}", LogLevel.ERROR)
         raise
     finally:
+        reset_ocr_form_hints(hints_token)
         end_ocr_job()
 
 

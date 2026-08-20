@@ -161,6 +161,63 @@ function parseRolesText(text) {
         .filter(Boolean);
 }
 
+const IPCAS_RE = /^[A-Z][A-Z0-9]{3,15}$/;
+
+function normalizeIpcasInput(raw) {
+    return String(raw || '').trim().toUpperCase().replace(/\s+/g, '');
+}
+
+function deriveIpcasFromEmail(email) {
+    const local = normalizeIpcasInput((email || '').split('@')[0]);
+    if (!local || local.includes('USER') || local.startsWith('CCCD')) return '';
+    if (IPCAS_RE.test(local)) return local;
+    const m = local.match(/[A-Z][A-Z0-9]{3,15}/);
+    return m ? m[0] : '';
+}
+
+function suggestIpcasPrefix(branchCode) {
+    const bc = String(branchCode || '').replace(/\D/g, '');
+    if (bc.includes('6600')) return 'LAN';
+    if (bc.includes('3000')) return 'LANHBI';
+    return '';
+}
+
+function deriveIpcasForUsers(scope) {
+    let filled = 0;
+    let prefixed = 0;
+    enrichedUsers.forEach((u, idx) => {
+        if (!userInRowScope(idx)) return;
+        const errs = validateUserClient(u);
+        const missing = !normalizeIpcasInput(u.ipcas_code);
+        const hasErr = !!errs.ipcas_code;
+        if (scope === 'error' && !missing && !hasErr) return;
+
+        let ip = normalizeIpcasInput(u.ipcas_code);
+        if (!ip) ip = deriveIpcasFromEmail(u.email || u.username);
+        if (ip) {
+            const prefix = suggestIpcasPrefix(u.branch_code);
+            if (prefix && !ip.startsWith(prefix) && !ip.startsWith('LAN') && !ip.startsWith('QSO')) {
+                ip = prefix + ip.replace(/^(LAN|QSO)/, '');
+                prefixed += 1;
+            }
+            if (IPCAS_RE.test(ip)) {
+                u.ipcas_code = ip;
+                if (!String(u.email || '').trim() || errs.email) {
+                    u.email = `${ip.toLowerCase()}@agribank.com.vn`;
+                    u.username = u.email;
+                }
+                filled += 1;
+            }
+        }
+    });
+    renderBatchReviewTable(enrichedUsers);
+    notify(
+        'success',
+        'Đã suy IPCAS',
+        `${filled} hàng${prefixed ? ` (${prefixed} thêm tiền tố chi nhánh)` : ''} trong phạm vi đã chọn.`,
+    );
+}
+
 function validateCellByField(field, text, confidence, isHeader) {
     if (isHeader || field === 'stt') return '';
     if (!text?.trim()) {
@@ -172,6 +229,10 @@ function validateCellByField(field, text, confidence, isHeader) {
     if ((field === 'name' || field === 'first_name') && text && /\d/.test(text)) return 'Tên chứa chữ số';
     if (field === 'email' && text.includes('@') && !text.toLowerCase().endsWith('@agribank.com.vn')) {
         return 'Email phải thuộc @agribank.com.vn';
+    }
+    if (field === 'ipcas_code') {
+        const ip = normalizeIpcasInput(text);
+        if (ip && !IPCAS_RE.test(ip)) return 'IPCAS: chữ in hoa + số, 4–16 ký tự (vd. LANXHIEU)';
     }
     if (field === 'role') {
         const valid = (fieldConfig?.roles || []).map(r => r.value);
@@ -205,6 +266,10 @@ function validateUserClient(user, opts = {}) {
 
     if (user.cccd && !/^\d{12}$/.test(String(user.cccd).replace(/\s/g, ''))) errors.cccd = 'CCCD phải có 12 số';
     if (user.phone && !/^0\d{8,10}$/.test(String(user.phone).replace(/\s/g, ''))) errors.phone = 'SĐT không hợp lệ';
+    const ipcas = normalizeIpcasInput(user.ipcas_code);
+    if (ipcas && !IPCAS_RE.test(ipcas)) {
+        errors.ipcas_code = 'IPCAS không hợp lệ (vd. LANXHIEU)';
+    }
     const email = String(user.email || '').trim();
     if (email && !email.toLowerCase().endsWith('@agribank.com.vn')) {
         errors.email = 'Email phải thuộc @agribank.com.vn';
@@ -541,8 +606,11 @@ function renderBatchReviewTable(users) {
         const handler = () => {
             const i = +el.dataset.idx;
             const f = el.dataset.f;
-            enrichedUsers[i][f] = el.value;
-            if (f === 'email') enrichedUsers[i].username = el.value;
+            let val = el.value;
+            if (f === 'ipcas_code') val = normalizeIpcasInput(val);
+            enrichedUsers[i][f] = val;
+            if (f === 'email') enrichedUsers[i].username = val;
+            if (f === 'ipcas_code' && val) el.value = val;
             updateBatchSummary();
             const row = el.closest('tr');
             if (row) updateBatchRowState(row, enrichedUsers[i]);
@@ -575,8 +643,13 @@ function applyBulkBatchField(field, scope) {
     let value = '';
     if (field === 'branch_code') value = document.getElementById('bulk-branch-code')?.value?.trim() || '';
     else if (field === 'unit_code') value = document.getElementById('bulk-unit-code')?.value?.trim() || '';
+    else if (field === 'ipcas_code') value = normalizeIpcasInput(document.getElementById('bulk-ipcas-code')?.value);
     if (!value) {
         notify('warn', 'Thiếu giá trị', `Nhập ${fieldLabel(field)} trước khi áp dụng hàng loạt.`);
+        return;
+    }
+    if (field === 'ipcas_code' && !IPCAS_RE.test(value)) {
+        notify('warn', 'IPCAS không hợp lệ', 'Dùng chữ in hoa + số, 4–16 ký tự (vd. LANXHIEU).');
         return;
     }
     let applied = 0;
@@ -592,6 +665,13 @@ function applyBulkBatchField(field, scope) {
         } else {
             u[field] = value;
             if (field === 'email') u.username = value;
+            if (field === 'ipcas_code') {
+                u.ipcas_code = value;
+                if (!String(u.email || '').trim()) {
+                    u.email = `${value.toLowerCase()}@agribank.com.vn`;
+                    u.username = u.email;
+                }
+            }
         }
         applied += 1;
     });
@@ -1225,6 +1305,9 @@ function setupReviewPage() {
             renderBatchReviewTable(enrichedUsers);
             notify('success', 'Enrich lại thành công', `${enrichedUsers.length} user`);
         } catch (e) { notify('error', 'Enrich thất bại', e.message); }
+    });
+    document.getElementById('btn-derive-ipcas-email')?.addEventListener('click', () => {
+        deriveIpcasForUsers('all');
     });
     document.querySelectorAll('[data-bulk]').forEach(btn => {
         btn.addEventListener('click', () => applyBulkBatchField(btn.dataset.bulk, btn.dataset.scope));

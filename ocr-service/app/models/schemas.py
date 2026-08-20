@@ -177,6 +177,41 @@ class OcrResult(BaseModel):
     updated_at: datetime = Field(default_factory=datetime.now)
 
 
+class OcrFormHints(BaseModel):
+    """User-declared form layout before OCR — boosts column alignment accuracy."""
+
+    layout_cols: int = Field(
+        default=10,
+        ge=9,
+        le=10,
+        description="Expected SSO column count: 10 (Mẫu 01 mới) or 9 (mẫu cũ)",
+    )
+    branch_code: str = Field(
+        default="",
+        description="Mã chi nhánh 4 số (vd 6600) — dùng prefix IPCAS",
+    )
+    anchor_name: str = Field(default="", description="Họ tên user đầu tiên (tuỳ chọn)")
+    anchor_ipcas: str = Field(default="", description="IPCAS user đầu tiên")
+    anchor_cccd: str = Field(default="", description="CCCD user đầu tiên")
+    anchor_email: str = Field(default="", description="Email user đầu tiên")
+
+    def has_anchor(self) -> bool:
+        return bool(
+            (self.anchor_ipcas or "").strip()
+            or (self.anchor_cccd or "").strip()
+            or (self.anchor_email or "").strip()
+        )
+
+    def summary_line(self) -> str:
+        parts = [f"{self.layout_cols} cột"]
+        bc = (self.branch_code or "").strip()
+        if bc:
+            parts.append(f"CN {bc}")
+        if self.has_anchor():
+            parts.append("có hàng mẫu")
+        return " · ".join(parts)
+
+
 class JobInfo(BaseModel):
     """Job status information returned to client."""
 
@@ -191,6 +226,10 @@ class JobInfo(BaseModel):
     template_id: str = Field(
         default="sso-agribank",
         description="Template profile used for mapping/export/actions",
+    )
+    ocr_hints: OcrFormHints | None = Field(
+        default=None,
+        description="Khai báo layout / hàng mẫu trước OCR",
     )
     status: JobStatus
     total_pages: int = 0

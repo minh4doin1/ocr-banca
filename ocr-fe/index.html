@@ -131,6 +131,72 @@
 
                     <p class="excel-direct-hint">Đã có file Excel hoặc Word (.docx) chuẩn? Bấm <strong>Nạp Excel</strong> / <strong>Nạp Word</strong> để bỏ qua OCR và vào thẳng bước kiểm tra — dữ liệu đọc trực tiếp nên chính xác hơn OCR.</p>
 
+                    <section class="form-hints-card" id="form-hints-card" aria-labelledby="form-hints-title">
+                        <div class="form-hints-header">
+                            <div>
+                                <h3 id="form-hints-title">Khai báo form trước OCR</h3>
+                                <p class="form-hints-sub">Giúp hệ thống khóa đúng số cột &amp; căn IPCAS — giảm mất dữ liệu. Bỏ trống vẫn chạy được.</p>
+                            </div>
+                            <span class="form-hints-badge" id="form-hints-badge">Chưa khai báo</span>
+                        </div>
+
+                        <div class="form-hints-block">
+                            <span class="option-label">1. Bố cục cột</span>
+                            <div class="radio-group form-hints-layout">
+                                <label class="radio-chip layout-chip">
+                                    <input type="radio" name="hint-layout" value="10" checked>
+                                    <span>
+                                        <strong>10 cột</strong>
+                                        <small>Mẫu 01/SSO mới · có Tên chi nhánh</small>
+                                    </span>
+                                </label>
+                                <label class="radio-chip layout-chip">
+                                    <input type="radio" name="hint-layout" value="9">
+                                    <span>
+                                        <strong>9 cột</strong>
+                                        <small>Mẫu cũ · Phòng/Đơn vị gộp</small>
+                                    </span>
+                                </label>
+                            </div>
+                        </div>
+
+                        <div class="form-hints-block">
+                            <span class="option-label">2. Mã chi nhánh (prefix IPCAS)</span>
+                            <div class="form-hints-branch-row">
+                                <div class="radio-group" id="hint-branch-presets">
+                                    <label class="radio-chip">
+                                        <input type="radio" name="hint-branch-preset" value="6600" checked>
+                                        <span>6600 → LAN…</span>
+                                    </label>
+                                    <label class="radio-chip">
+                                        <input type="radio" name="hint-branch-preset" value="3000">
+                                        <span>3000 → LANHBI…</span>
+                                    </label>
+                                    <label class="radio-chip">
+                                        <input type="radio" name="hint-branch-preset" value="other">
+                                        <span>Khác</span>
+                                    </label>
+                                    <label class="radio-chip">
+                                        <input type="radio" name="hint-branch-preset" value="">
+                                        <span>Không biết</span>
+                                    </label>
+                                </div>
+                                <input type="text" id="hint-branch-code" class="text-input mono form-hints-branch-inp" maxlength="6" placeholder="vd. 6600" value="6600" inputmode="numeric">
+                            </div>
+                        </div>
+
+                        <details class="form-hints-anchor" id="form-hints-anchor">
+                            <summary>3. Hàng mẫu — user đầu tiên trên bảng <em>(khuyến nghị)</em></summary>
+                            <p class="form-hints-anchor-hint">Điền đúng 1 dòng đầu trong PDF. Hệ thống dùng để căn cột &amp; điền ô trống.</p>
+                            <div class="form-hints-anchor-grid">
+                                <label>Họ tên<input type="text" id="hint-anchor-name" class="text-input" placeholder="Võ Hoàng Xuân Hiếu" autocomplete="off"></label>
+                                <label>User IPCAS<input type="text" id="hint-anchor-ipcas" class="text-input mono" placeholder="LANXHIEU" style="text-transform:uppercase" autocomplete="off"></label>
+                                <label>Số CCCD<input type="text" id="hint-anchor-cccd" class="text-input mono" placeholder="080195008150" inputmode="numeric" autocomplete="off"></label>
+                                <label>Email<input type="text" id="hint-anchor-email" class="text-input mono" placeholder="lanxhieu@agribank.com.vn" autocomplete="off"></label>
+                            </div>
+                        </details>
+                    </section>
+
                     <div class="option-group template-select-group" id="template-select-group">
                         <span class="option-label">Template xử lý</span>
                         <div class="template-select-row">
@@ -343,7 +409,7 @@
                 <div class="review-header">
                     <div>
                         <h2>Kiểm tra & Map dữ liệu</h2>
-                        <p class="text-muted review-subtitle" id="review-subtitle">Rà soát lần cuối trước khi tạo lô user Keycloak</p>
+                        <p class="text-muted review-subtitle" id="review-subtitle">Rà soát lần cuối trước khi tạo lô user Keycloak. Cột <strong>IPCAS</strong> có thể sửa trực tiếp hoặc dùng <em>Suy IPCAS từ email</em> / áp hàng loạt.</p>
                         <div class="provision-mode-toggle" role="radiogroup" aria-label="Chế độ xử lý lô">
                             <label class="radio-chip">
                                 <input type="radio" name="provision-mode" value="create_or_update" checked>
@@ -408,6 +474,7 @@
                         </div>
                     </div>
                     <div class="review-toolbar-right">
+                        <button type="button" class="btn btn-outline btn-sm" id="btn-derive-ipcas-email" title="Điền IPCAS trống từ phần trước @ trong email">Suy IPCAS từ email</button>
                         <button type="button" class="btn btn-outline btn-sm" id="btn-toggle-bulk">Áp dụng hàng loạt</button>
                         <button type="button" class="btn btn-outline btn-sm" id="btn-batch-re-enrich">Enrich lại</button>
                     </div>
@@ -429,6 +496,14 @@
                                 <input type="text" id="bulk-unit-code" class="bulk-inp" placeholder="82204001">
                                 <button type="button" class="btn btn-xs btn-outline" data-bulk="unit_code" data-scope="all">Tất cả</button>
                                 <button type="button" class="btn btn-xs btn-ghost" data-bulk="unit_code" data-scope="error">Dòng lỗi</button>
+                            </div>
+                        </label>
+                        <label class="review-bulk-item">
+                            <span>User IPCAS</span>
+                            <div class="review-bulk-row">
+                                <input type="text" id="bulk-ipcas-code" class="bulk-inp mono" placeholder="LANXHIEU" style="text-transform:uppercase">
+                                <button type="button" class="btn btn-xs btn-outline" data-bulk="ipcas_code" data-scope="all">Tất cả</button>
+                                <button type="button" class="btn btn-xs btn-ghost" data-bulk="ipcas_code" data-scope="error">Dòng lỗi</button>
                             </div>
                         </label>
                         <label class="review-bulk-item review-bulk-roles">
